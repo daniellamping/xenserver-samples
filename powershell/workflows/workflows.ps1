@@ -1370,7 +1370,8 @@ function Invoke-ReadMetrics {
     $hm = Get-XenHostMetrics -Ref $xenHost.metrics.opaque_ref
     Write-Host ("Host $($xenHost.name_label): " +
         "$([long]($hm.memory_total / 1MB)) MiB total, " +
-        "$([long]($hm.memory_free / 1MB)) MiB free, live = $($hm.live)")
+        "$([long](($xenHost | Invoke-XenHost -XenAction ComputeFreeMemory -PassThru) / 1MB)) MiB free, " +
+        "live = $($hm.live)")
 
     $vm = Get-XenVM |
         Where-Object { -not $_.is_a_template -and -not $_.is_control_domain -and $_.power_state -eq 'Running' } |

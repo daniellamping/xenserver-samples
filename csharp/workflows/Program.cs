@@ -15,6 +15,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -1139,7 +1140,7 @@ internal static class Program
         var hm = Host.get_metrics(session, hostRef.opaque_ref).opaque_ref;
         Console.WriteLine($"Host {host.name_label}: " +
             $"{Host_metrics.get_memory_total(session, hm) / MiB} MiB total, " +
-            $"{Host_metrics.get_memory_free(session, hm) / MiB} MiB free, " +
+            $"{Host.compute_free_memory(session, hostRef.opaque_ref) / MiB} MiB free, " +
             $"live = {Host_metrics.get_live(session, hm)}");
 
         var vm = VM.get_all_records(session).First(kv => !kv.Value.is_a_template
@@ -1543,7 +1544,11 @@ internal static class Program
                 var parts = legends[k].Split(':');
                 if (parts[1] == "host" && parts[3] == "pvsaccelerator_space_utilization")
                 {
-                    var v = values[k].GetDouble();
+                    // A host sends each value as a string ("0.0", or "NaN" for a gap in the series).
+                    var v = values[k].ValueKind == JsonValueKind.String
+                        ? double.Parse(values[k].GetString()!, CultureInfo.InvariantCulture)
+                        : values[k].GetDouble();
+                    if (double.IsNaN(v)) continue;
                     if (!peak.TryGetValue(parts[2], out var cur) || v > cur) peak[parts[2]] = v;
                 }
             }

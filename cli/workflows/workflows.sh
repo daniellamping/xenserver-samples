@@ -27,12 +27,21 @@ host=${_hp%%:*}
 # A real host serves the CLI over TLS on 443, which is xe's default, so a URL with no port (or :443) needs
 # no -p. xe uses TLS only on 443, so a test endpoint on any other port serves the CLI over plain HTTP on
 # the next port up.
-xe_port=()
-if [ "$_hp" != "$host" ] && [ "${_hp##*:}" != 443 ]; then xe_port=(-p $((${_hp##*:} + 1))); fi
+xe_opts=()
+if [ "$_hp" != "$host" ] && [ "${_hp##*:}" != 443 ]; then xe_opts=(-p $((${_hp##*:} + 1))); fi
+# The Windows xe.exe asks before trusting a certificate it has not seen, such as a host's self-signed one,
+# and fails when there is no console to answer; accept it, as the SDK examples do. The Linux xe does not
+# ask, and does not take these options.
+case "${XE_EXE:-xe}" in *.exe | *.EXE) xe_opts+=(-no-warn-new-certificates -no-warn-certificates) ;; esac
 
 # --- connect ---
 # The one place the connection details live: every example just calls `xe <command> ...`.
-xe() { "${XE_EXE:-xe}" -s "$host" "${xe_port[@]}" -u "$user" -pw "$pass" "$@"; }
+xe() { "${XE_EXE:-xe}" -s "$host" "${xe_opts[@]}" -u "$user" -pw "$pass" "$@"; }
+
+# A pool member refuses every command with HOST_IS_SLAVE, naming the coordinator's address; send
+# everything there instead (assuming the coordinator is up), as XenCenter does when you add a member server.
+_probe=$(xe pool-list --minimal 2>&1) || true
+if [[ $_probe =~ (Master|Coordinator)\ IP\ address:\ ([0-9A-Fa-f.:]+) ]]; then host=${BASH_REMATCH[2]}; fi
 
 # Bash helpers for `--minimal` (comma-separated) output, so no cut/tr/wc/grep processes are spawned:
 first_csv()  { echo "${1%%,*}"; }                       # first element of a comma-separated list
@@ -49,7 +58,7 @@ w_connect_inventory() {
     echo "Connected to pool: $(xe pool-list params=name-label --minimal)"
     echo "Hosts: $(xe host-list params=name-label --minimal)"
     echo "VMs:"
-    xe vm-list params=name-label,power-state
+    xe vm-list is-control-domain=false params=name-label,power-state
     echo "OK: connect-inventory"
 }
 # Run it:
@@ -252,6 +261,7 @@ w_create_network() {
     # is a property of the network rather than of any one interface on it.
     xe network-param-set uuid=$net MTU=9000
     echo "MTU now:         $(xe network-param-get uuid=$net param-name=MTU)"
+    xe network-destroy uuid=$net
     echo "OK: create-network"
 }
 
@@ -260,7 +270,7 @@ w_edit_vm_properties() {
     vm=$(vm_uuid web-01)
     original=$(xe vm-param-get uuid=$vm param-name=name-description)
     xe vm-param-set uuid=$vm name-description="Edited by the xe example"
-    xe vm-param-add uuid=$vm param-name=other-config param-key=xe_example param-value=true
+    xe vm-param-add uuid=$vm param-name=other-config xe_example=true
     echo "New description: $(xe vm-param-get uuid=$vm param-name=name-description)"
     echo "other-config[xe_example] = $(xe vm-param-get uuid=$vm param-name=other-config param-key=xe_example)"
     xe vm-param-set uuid=$vm name-description="$original"
@@ -510,11 +520,10 @@ w_gpu_inventory() {
 # --- 28. Read host & VM metrics ---
 w_read_metrics() {
     h=$(first_host)
-    hm=$(xe host-param-get uuid=$h param-name=metrics)
-    echo "Host $(xe host-param-get uuid=$h param-name=name-label): free memory $(xe host-metrics-param-get uuid=$hm param-name=memory-free), live=$(xe host-metrics-param-get uuid=$hm param-name=live)"
+    # On the CLI, a host's and a VM's metrics read as parameters of the host and VM themselves.
+    echo "Host $(xe host-param-get uuid=$h param-name=name-label): free memory $(xe host-compute-free-memory uuid=$h), live=$(xe host-param-get uuid=$h param-name=host-metrics-live)"
     vm=$(vm_uuid web-01)
-    vmm=$(xe vm-param-get uuid=$vm param-name=metrics)
-    echo "VM web-01: $(xe vm-metrics-param-get uuid=$vmm param-name=VCPUs-number) vCPU(s)"
+    echo "VM web-01: $(xe vm-param-get uuid=$vm param-name=VCPUs-number) vCPU(s)"
     echo "OK: read-metrics"
 }
 
@@ -577,13 +586,18 @@ w_pool_properties() {
 w_sr_usage() {
     echo "Storage:"
     xe sr-list params=name-label,physical-size,physical-utilisation
-    sr=$(shared_sr)
+    # Scan the first SR that has any capacity (the DVD and removable-media SRs have none).
+    for sr in $(each_csv "$(xe sr-list --minimal)"); do
+        [ "$(xe sr-param-get uuid=$sr param-name=physical-size)" -gt 0 ] && break
+    done
     xe sr-scan uuid=$sr
 
     # Read caching keeps recently-read blocks in the host's memory. It is switched off per SR by
     # setting o_direct, which asks the storage layer to bypass the cache entirely.
-    xe sr-param-remove uuid=$sr param-name=other-config param-key=o_direct
-    xe sr-param-add uuid=$sr param-name=other-config param-key=o_direct param-value=true
+    # Clear any earlier setting first: adding a key the map already holds is an error, and so is removing
+    # one it doesn't, hence the || true.
+    xe sr-param-remove uuid=$sr param-name=other-config param-key=o_direct >/dev/null 2>&1 || true
+    xe sr-param-add uuid=$sr param-name=other-config o_direct=true
     o_direct=$(xe sr-param-get uuid=$sr param-name=other-config param-key=o_direct)
     echo "  read caching on $(xe sr-param-get uuid=$sr param-name=name-label): $([ "$o_direct" = "true" ] && echo off || echo on)"
     xe sr-param-remove uuid=$sr param-name=other-config param-key=o_direct
@@ -707,7 +721,7 @@ w_rrd_metrics() {
     hosts=$(xe host-list --minimal)
     for h in ${hosts//,/ }; do
         name=$(xe host-param-get uuid=$h param-name=name-label)
-        util=$(xe host-data-source-query host-uuid=$h data-source=pvsaccelerator_space_utilization)
+        util=$(xe host-data-source-query uuid=$h data-source=pvsaccelerator_space_utilization)
         echo "  $name: current PVS cache utilisation ${util%.*}%"
     done
     echo "OK: rrd-metrics"

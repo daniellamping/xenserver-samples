@@ -1432,7 +1432,7 @@ func readMetrics(url, user, password string) {
 	hm, err := xenapi.Host.GetMetrics(session, hostRef)
 	check(err)
 	total, _ := xenapi.HostMetrics.GetMemoryTotal(session, hm)
-	free, _ := xenapi.HostMetrics.GetMemoryFree(session, hm)
+	free, _ := xenapi.Host.ComputeFreeMemory(session, hostRef)
 	live, _ := xenapi.HostMetrics.GetLive(session, hm)
 	fmt.Printf("Host %s: %d MiB total, %d MiB free, live = %v\n",
 		hostName, total/MiB, free/MiB, live)
@@ -1930,7 +1930,7 @@ func rrdMetrics(url, user, password string) {
 			Legend []string `json:"legend"`
 		} `json:"meta"`
 		Data []struct {
-			Values []float64 `json:"values"`
+			Values []any `json:"values"`
 		} `json:"data"`
 	}
 	check(json.NewDecoder(resp.Body).Decode(&rrd))
@@ -1939,8 +1939,19 @@ func rrdMetrics(url, user, password string) {
 	for _, point := range rrd.Data {
 		for k, legend := range rrd.Meta.Legend {
 			parts := strings.Split(legend, ":")
-			if parts[1] == "host" && parts[3] == "pvsaccelerator_space_utilization" && point.Values[k] > peak[parts[2]] {
-				peak[parts[2]] = point.Values[k]
+			if parts[1] != "host" || parts[3] != "pvsaccelerator_space_utilization" {
+				continue
+			}
+			// A host sends each value as a string ("0.0", or "NaN" for a gap in the series).
+			var v float64
+			switch x := point.Values[k].(type) {
+			case string:
+				v, _ = strconv.ParseFloat(x, 64)
+			case float64:
+				v = x
+			}
+			if v > peak[parts[2]] {
+				peak[parts[2]] = v
 			}
 		}
 	}
@@ -3963,8 +3974,19 @@ func rawLogin(url, user, password string) string {
 	defer resp.Body.Close()
 	var r struct {
 		Result string `json:"result"`
+		Error  *struct {
+			Message string   `json:"message"`
+			Data    []string `json:"data"`
+		} `json:"error"`
 	}
 	check(json.NewDecoder(resp.Body).Decode(&r))
+	if r.Error != nil {
+		// A pool member names the coordinator's address; log in there instead, as connect does.
+		if r.Error.Message == xenapi.ErrorHostIsSlave && len(r.Error.Data) > 0 {
+			return rawLogin("https://"+r.Error.Data[0], user, password)
+		}
+		panic(fmt.Sprintf("login failed: %s %v", r.Error.Message, r.Error.Data))
+	}
 	return r.Result
 }
 

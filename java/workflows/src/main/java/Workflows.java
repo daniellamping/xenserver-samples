@@ -1194,7 +1194,7 @@ public class Workflows {
         HostMetrics hm = he.getKey().getMetrics(conn);
         System.out.println("Host " + he.getValue().nameLabel + ": "
                 + hm.getMemoryTotal(conn) / MiB + " MiB total, "
-                + hm.getMemoryFree(conn) / MiB + " MiB free, "
+                + he.getKey().computeFreeMemory(conn) / MiB + " MiB free, "
                 + "live = " + hm.getLive(conn));
 
         VM vm = null;

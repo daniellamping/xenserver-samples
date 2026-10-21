@@ -1100,7 +1100,7 @@ def read_metrics(url, username, password):
     print("Host %s: %d MiB total, %d MiB free, live = %s"
           % (host["name_label"],
              int(session.xenapi.host_metrics.get_memory_total(hm)) // MIB,
-             int(session.xenapi.host_metrics.get_memory_free(hm)) // MIB,
+             int(session.xenapi.host.compute_free_memory(host_ref)) // MIB,
              session.xenapi.host_metrics.get_live(hm)))
 
     vm = next(ref for ref, r in session.xenapi.VM.get_all_records().items()
