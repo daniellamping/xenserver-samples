@@ -548,6 +548,7 @@ public class Workflows {
         System.out.println("Established event token after initial snapshot.");
 
         VM vm = vmByName(conn, vmName);
+        String original = vm.getNameDescription(conn);
         vm.setNameDescription(conn, "changed-to-trigger-event");
 
         batch = Event.from(conn, classes, token, 5.0);
@@ -558,6 +559,7 @@ public class Workflows {
             System.out.println("  - " + ev.operation + " " + ev.clazz);
         }
 
+        vm.setNameDescription(conn, original); // put it back
         System.out.println("OK: events");
         Session.logout(conn);
     }

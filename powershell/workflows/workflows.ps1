@@ -615,12 +615,14 @@ function Invoke-Events {
     $vm = Get-XenVM -Name $VmName |
         Where-Object { -not $_.is_a_template -and -not $_.is_control_domain } | Select-Object -First 1
     if (-not $vm) { throw "No VM named '$VmName' was found." }
+    $original = $vm.name_description
     $vm | Set-XenVM -NameDescription "changed-to-trigger-event"
 
     $batch = Get-XenEventBatch -Session $session -Classes VM -Token $token -Timeout 5.0
     Write-Host "Received $(@($batch.events).Count) event(s) after the change."
     $batch.events | Select-Object -First 3 | ForEach-Object { Write-Host "  - $($_.operation) $($_.class)" }
 
+    $vm | Set-XenVM -NameDescription $original   # put it back
     Write-Host "OK: events"
     $session | Disconnect-XenServer
 }

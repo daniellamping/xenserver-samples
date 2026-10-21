@@ -587,6 +587,8 @@ func events(url, user, password, vmName string) {
 	fmt.Println("Established event token after initial snapshot.")
 
 	vmRef := vmByName(session, vmName)
+	original, err := xenapi.VM.GetNameDescription(session, vmRef)
+	check(err)
 	check(xenapi.VM.SetNameDescription(session, vmRef, "changed-to-trigger-event"))
 
 	batch, err = xenapi.Event.From(session, classes, token, 5.0)
@@ -599,6 +601,7 @@ func events(url, user, password, vmName string) {
 		fmt.Printf("  - %s %s\n", ev.Operation, ev.Class)
 	}
 
+	check(xenapi.VM.SetNameDescription(session, vmRef, original)) // put it back
 	fmt.Println("OK: events")
 	session.Logout()
 }

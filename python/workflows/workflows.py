@@ -478,6 +478,7 @@ def events(url, username, password, vm_name):
 
     # Make a change, then poll for it.
     vm_ref = vm_by_name(session, vm_name)
+    original = session.xenapi.VM.get_name_description(vm_ref)
     session.xenapi.VM.set_name_description(vm_ref, "changed-to-trigger-event")
 
     batch = event_from(["VM"], token, 5.0)
@@ -485,6 +486,7 @@ def events(url, username, password, vm_name):
     for ev in batch["events"][:3]:
         print("  - %s %s" % (ev["operation"], ev["class"]))
 
+    session.xenapi.VM.set_name_description(vm_ref, original)  # put it back
     print("OK: events")
     session.xenapi.session.logout()
 # Run it:

@@ -96,7 +96,7 @@ w_manage_vm_disks() {
     for b in ${vbds//,/ }; do
         if [ "$(xe vbd-param-get uuid=$b param-name=type)" = "Disk" ]; then vbd=$b; break; fi
     done
-    vdi=$(xe vbd-param-get uuid=$vbd param-name=VDI)
+    vdi=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid)
     echo "Disk attached:  $(xe vbd-param-get uuid=$vbd param-name=currently-attached)"
 
     # Deactivate: the disk stays with the VM, it is just no longer live.
@@ -215,16 +215,16 @@ w_snapshot_schedule() {
 # --- Manage VM groups -----------------------------------------------------------------
 w_manage_vm_groups() {
     vm=$(vm_uuid web-01)
-    # anti_affinity asks the pool to keep the group's members on different hosts.
-    group=$(xe vm-group-create name-label=xe-example-group placement=anti_affinity)
+    # anti-affinity asks the pool to keep the group's members on different hosts.
+    group=$(xe vm-group-create name-label=xe-example-group placement=anti-affinity)
     echo "Created group:  $group"
 
     # Membership is written from the VM side, and read back from the group side.
     xe vm-param-set uuid=$vm groups=$group
-    echo "Group members:  $(count_csv "$(xe vm-group-param-get uuid=$group param-name=VMs)")"
+    echo "Group members:  $(count_csv "$(xe vm-group-param-get uuid=$group param-name=vm-uuids)")"
 
     xe vm-param-set uuid=$vm groups=
-    echo "After removal:  $(count_csv "$(xe vm-group-param-get uuid=$group param-name=VMs)")"
+    echo "After removal:  $(count_csv "$(xe vm-group-param-get uuid=$group param-name=vm-uuids)")"
 
     xe vm-group-destroy uuid=$group
     echo "OK: manage-vm-groups"
@@ -382,6 +382,7 @@ w_tags_and_folders() {
     echo "VM folder: $(xe vm-param-get uuid=$vm param-name=other-config param-key=folder)"
     xe vm-param-remove uuid=$vm param-name=tags param-key=web
     xe host-param-remove uuid=$h param-name=tags param-key=gold
+    xe vm-param-remove uuid=$vm param-name=other-config param-key=folder
     echo "OK: tags-and-folders"
 }
 
@@ -417,7 +418,7 @@ w_storage_migrate() {
     vm=$(xe vm-install template="Rocky Linux 8" new-name-label=xe-example-storagemigrate)
     vdi=""; vbds=$(xe vm-param-get uuid=$vm param-name=VBDs --minimal)
     for vbd in ${vbds//,/ }; do
-        if [ "$(xe vbd-param-get uuid=$vbd param-name=type)" = "Disk" ]; then vdi=$(xe vbd-param-get uuid=$vbd param-name=VDI); break; fi
+        if [ "$(xe vbd-param-get uuid=$vbd param-name=type)" = "Disk" ]; then vdi=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid); break; fi
     done
     source=$(xe vdi-param-get uuid=$vdi param-name=SR)
     echo "Disk is on SR: $(xe sr-param-get uuid=$source param-name=name-label)"
@@ -628,7 +629,7 @@ w_vbd_inventory() {
     vbds=$(xe vm-param-get uuid=$vm param-name=VBDs --minimal)
     for vbd in ${vbds//,/ }; do
         if [ "$(xe vbd-param-get uuid=$vbd param-name=type)" = "Disk" ]; then
-            vdi=$(xe vbd-param-get uuid=$vbd param-name=VDI)
+            vdi=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid)
             echo "  - device $(xe vbd-param-get uuid=$vbd param-name=userdevice): $(xe vdi-param-get uuid=$vdi param-name=virtual-size) bytes"
         fi
     done

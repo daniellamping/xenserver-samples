@@ -486,6 +486,7 @@ internal static class Program
         Console.WriteLine("Established event token after initial snapshot.");
 
         var vmRef = VmByName(session, vmName);
+        var original = VM.get_name_description(session, vmRef);
         VM.set_name_description(session, vmRef, "changed-to-trigger-event");
 
         batch = (EventBatch)Event.from(session, classes, token, 5.0);
@@ -493,6 +494,7 @@ internal static class Program
         foreach (var ev in batch.events.Take(3))
             Console.WriteLine($"  - {ev.operation} {ev.class_}");
 
+        VM.set_name_description(session, vmRef, original); // put it back
         Console.WriteLine("OK: events");
         session.logout();
     }
