@@ -92,7 +92,7 @@ public class Workflows {
         } catch (Types.HostIsSlave e) {
             // A pool member names the coordinator's address; reconnect there (assuming the coordinator
             // is up), exactly as XenCenter does when you add a member server.
-            return login(http, "https://" + e.coordinatorIPAddress, user, password);
+            return login(http, "https://" + e.masterIPAddress, user, password);
         }
     }
 
