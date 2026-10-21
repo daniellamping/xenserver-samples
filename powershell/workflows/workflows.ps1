@@ -11,8 +11,8 @@
     idiom, and a second pool is driven through the same cmdlets with -SessionOpaqueRef. Everything goes
     through the module's cmdlets - there are no raw XenAPI .NET static method calls. The one thing the
     module ships no cmdlet for is the event API, so the events example calls its JSON-RPC endpoint with
-    Invoke-RestMethod (still pure PowerShell - the module has already established trust for the server's
-    certificate).
+    Invoke-RestMethod (still pure PowerShell - Connect-Example has already established trust for the
+    server's certificate).
 
     The examples are deliberately self-contained: every function takes the connection details (and any
     object it operates on) as parameters, opens its own session, does its work and disconnects. Nothing
@@ -63,6 +63,13 @@ function Connect-Example {
         [Parameter(Mandatory = $true)][string]$UserName,
         [Parameter(Mandatory = $true)][string]$Password
     )
+    # Accepting the certificate in Connect-XenServer covers the module's cmdlets, and on Windows PowerShell
+    # 5.1 Invoke-RestMethod/Invoke-WebRequest as well. PowerShell 7's web cmdlets keep their own trust, so
+    # extend the same acceptance to them for the examples that talk to the host over plain HTTP(S).
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        $global:PSDefaultParameterValues['Invoke-RestMethod:SkipCertificateCheck'] = $true
+        $global:PSDefaultParameterValues['Invoke-WebRequest:SkipCertificateCheck'] = $true
+    }
     try {
         return Connect-XenServer -Url $Url -UserName $UserName -Password $Password `
             -NoWarnCertificates -NoWarnNewCertificates -SetDefaultSession -PassThru
@@ -79,8 +86,8 @@ function Connect-Example {
 
 function Invoke-XenMethod {
     # A thin JSON-RPC caller for the handful of XenAPI methods the module ships no cmdlet for (see
-    # Get-XenEventBatch above for the same pattern). Pure PowerShell — the module has already trusted
-    # the server's certificate during Connect, so no extra TLS setup is needed.
+    # Get-XenEventBatch above for the same pattern). Pure PowerShell — Connect-Example has already trusted
+    # the server's certificate, so no extra TLS setup is needed.
     param(
         [Parameter(Mandatory = $true)]$Session,
         [Parameter(Mandatory = $true)][string]$Method,
@@ -97,8 +104,8 @@ function Invoke-XenMethod {
 
 function Get-XenEventBatch {
     # The XenServer PowerShell module ships no event cmdlet, so this thin wrapper calls the JSON-RPC
-    # event.from method directly with Invoke-RestMethod (the module has already trusted the server's
-    # certificate during Connect, so no extra TLS setup is needed). An empty token returns the current
+    # event.from method directly with Invoke-RestMethod (Connect-Example has already trusted the server's
+    # certificate, so no extra TLS setup is needed). An empty token returns the current
     # snapshot plus a token to watch from; passing that token back long-polls for changes.
     param(
         [Parameter(Mandatory = $true)]$Session,
@@ -491,7 +498,7 @@ function Invoke-SnapshotRevert {
 
     # A client shows a thumbnail of what was on screen when the snapshot was taken. It is an HTTP
     # transfer alongside the API, not an API call, so the session id travels in the query string. Still
-    # pure PowerShell: the module has already trusted the server's certificate during Connect.
+    # pure PowerShell: Connect-Example has already trusted the server's certificate.
     $thumb = Invoke-WebRequest -UseBasicParsing `
         -Uri "$Url/vncsnapshot?session_id=$($session.opaque_ref)&ref=$($snap.opaque_ref)"
     Write-Host "Thumbnail:      $($thumb.Content.Length) bytes of PNG"
@@ -2567,8 +2574,8 @@ function Invoke-ExportImportVm {
     Write-Host "Exporting $($vm.name_label)"
 
     # Export and import are HTTP transfers alongside the API rather than API calls, so the session id
-    # travels in the query string. Still pure PowerShell: the module has already trusted the server's
-    # certificate during Connect.
+    # travels in the query string. Still pure PowerShell: Connect-Example has already trusted the
+    # server's certificate.
     # A unique file, not a fixed name: an export is a real file on disk and two of them running at
     # once would otherwise fight over it.
     $path = Join-Path ([IO.Path]::GetTempPath()) "sdk-example-export-$([guid]::NewGuid().Guid).xva"
@@ -2727,8 +2734,8 @@ function Invoke-BackupHostConfig {
     Write-Host "Backing up $($vmHost.name_label)"
 
     # Backup and restore are HTTP transfers alongside the API rather than API calls, so the session id
-    # travels in the query string. Still pure PowerShell: the module has already trusted the server's
-    # certificate during Connect.
+    # travels in the query string. Still pure PowerShell: Connect-Example has already trusted the
+    # server's certificate.
     $path = Join-Path ([IO.Path]::GetTempPath()) "sdk-example-host-$([guid]::NewGuid().Guid).backup"
     Invoke-WebRequest -UseBasicParsing -OutFile $path `
         -Uri "$Url/host_backup?session_id=$($session.opaque_ref)&ref=$($vmHost.opaque_ref)"
@@ -2911,7 +2918,7 @@ function Invoke-ServerStatusReport {
     }
 
     # The download is an HTTP transfer alongside the API, so the session id travels in the query string.
-    # Still pure PowerShell: the module has already trusted the server's certificate during Connect.
+    # Still pure PowerShell: Connect-Example has already trusted the server's certificate.
     $whole = Get-StatusReportSize -Url $Url -Session $session -Entries $keys
     Write-Host ("everything ({0} sections): {1} bytes" -f $keys.Count, $whole)
 

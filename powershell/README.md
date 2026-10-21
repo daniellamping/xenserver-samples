@@ -3,12 +3,13 @@
 ## Workflow examples
 
 [`workflows/`](workflows) holds all 91 workflow examples ([the full list](../README.md#workflow-examples)) in one script, `workflows.ps1`,
-written with the SDK module's cmdlets. Copy `XenServerPowerShell/PowerShell_51/XenServerPSModule` from
-the SDK into a folder on `$env:PSModulePath`, then:
+written with the SDK module's cmdlets. Copy the `XenServerPSModule` folder for your PowerShell from
+the SDK into a folder on `$env:PSModulePath`: `XenServerPowerShell/PowerShell_7` for PowerShell 7
+(`pwsh`), or `XenServerPowerShell/PowerShell_51` for Windows PowerShell 5.1 (`powershell`). Then:
 
 ```
 cd workflows
-powershell -File workflows.ps1 connect-inventory https://xenserver root <password>
+pwsh -File workflows.ps1 connect-inventory https://xenserver root <password>
 ```
 
 Each workflow is also a self-contained function you can copy into your own code; see the `Run it:` line under each.

@@ -1704,7 +1704,7 @@ func vbdInventory(url, user, password, vmName string) {
 			continue
 		}
 		vdi, _ := xenapi.VBD.GetVDI(session, vbdRef)
-		size := 0
+		var size int64
 		if vdi != xenapi.VDIRef("OpaqueRef:NULL") {
 			virtualSize, _ := xenapi.VDI.GetVirtualSize(session, vdi)
 			size = virtualSize / GiB
@@ -1833,7 +1833,9 @@ func crossPoolCopyVM(url, user, password, destURL, vmName string) {
 		vifMap[vif] = destNets[0]
 	}
 
-	_, err = xenapi.VM.MigrateSend(source, vm, receiver, false, vdiMap, vifMap,
+	// MigrateSend8 is the 8-argument form every pool version accepts; MigrateSend itself adds vdi_format_map,
+	// which hosts older than the SDK reject.
+	_, err = xenapi.VM.MigrateSend8(source, vm, receiver, false, vdiMap, vifMap,
 		map[string]string{"copy": "true"}, map[xenapi.VGPURef]xenapi.GPUGroupRef{})
 	check(err)
 	fmt.Printf("Sent '%s' to the destination pool (copy); source still present: %v\n",
@@ -2932,7 +2934,7 @@ func failureCode(err error) string {
 	return err.Error()
 }
 
-func gib(size int) string {
+func gib(size int64) string {
 	return fmt.Sprintf("%.1f GiB", float64(size)/(1024*1024*1024))
 }
 
@@ -3671,7 +3673,7 @@ func manageCrashDumps(url, user, password string) {
 
 	name, _ := xenapi.Host.GetNameLabel(session, host)
 	fmt.Printf("%s has %d crash dump(s)\n", name, len(dumps))
-	var total int
+	var total int64
 	for _, dump := range dumps {
 		record, err := xenapi.HostCrashdump.GetRecord(session, dump)
 		check(err)
@@ -3690,7 +3692,7 @@ func manageCrashDumps(url, user, password string) {
 	fmt.Println("OK: manage-crash-dumps")
 }
 
-func mib(size int) string { return fmt.Sprintf("%d MiB", size/(1024*1024)) }
+func mib(size int64) string { return fmt.Sprintf("%d MiB", size/(1024*1024)) }
 
 // Run it:
 //   manageCrashDumps("https://xenserver", "root", password)
