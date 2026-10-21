@@ -3,10 +3,11 @@
 ## Workflow examples
 
 [`workflows/`](workflows) holds all 91 workflow examples ([the full list](../README.md#workflow-examples)) in one program, `Program.cs`.
-It references the [XenServer.NET](https://www.nuget.org/packages/XenServer.NET) NuGet package, so the
-.NET 8 SDK is all you need:
+It references the XenServer.NET NuGet package, which the SDK ships in its `XenServer.NET` folder. Add
+that folder as a package source once, then build and run it with the .NET 8 SDK:
 
 ```
+dotnet nuget add source <path-to-SDK>/XenServer.NET -n xenserver-sdk
 cd workflows
 dotnet run -- connect-inventory https://xenserver root <password>
 ```

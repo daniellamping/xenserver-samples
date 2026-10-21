@@ -9,8 +9,10 @@
     <Description>XenCenter-style workflow examples for the XenServer.NET SDK.</Description>
     <Company>XenServer</Company>
     <Copyright>Copyright (c) Cloud Software Group, Inc.</Copyright>
+    <!-- The SDK release to build against; override with -p:XenServerSdkVersion=... -->
+    <XenServerSdkVersion>26.16.1</XenServerSdkVersion>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="XenServer.NET" Version="[26.21.1,)" />
+    <PackageReference Include="XenServer.NET" Version="[$(XenServerSdkVersion)]" />
   </ItemGroup>
 </Project>

@@ -1,6 +1,6 @@
 module github.com/xenserver/xenserver-samples/go/workflows
 
-go 1.27.1
+go 1.22.2
 
 require go/xenapi v0.0.0
 
