@@ -1,5 +1,18 @@
 # XenServer SDK for Go usage examples
 
+## Workflow examples
+
+[`workflows/`](workflows) holds all 91 workflow examples ([the full list](../README.md#workflow-examples)) in one program, `main.go`.
+It uses the same `goSDK` directory as the other Go samples (see [Dependencies](#dependencies)): copy
+`XenServerGo/src` from the SDK into `go/goSDK`, then:
+
+```
+cd workflows
+go run . connect-inventory https://xenserver root <password>
+```
+
+Each workflow is also a self-contained function you can copy into your own code; see the `Run it:` line under each.
+
 ## Overview
 
 The following simple examples are included in this repository:

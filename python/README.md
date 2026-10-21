@@ -1,5 +1,19 @@
 # XenAPI.py usage examples
 
+## Workflow examples
+
+[`workflows/`](workflows) holds all 91 workflow examples ([the full list](../README.md#workflow-examples)) in one script, `workflows.py`.
+It needs Python 3 and the SDK's `XenAPI` module, either from PyPI or by copying
+`XenServerPython/XenAPI.py` from the SDK next to the script:
+
+```
+cd workflows
+pip install -r requirements.txt
+python workflows.py connect-inventory https://xenserver root <password>
+```
+
+Each workflow is also a self-contained function you can copy into your own code; see the `Run it:` line under each.
+
 ## Overview
 
 The following Python examples are included in this repository:

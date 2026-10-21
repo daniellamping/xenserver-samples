@@ -1,5 +1,18 @@
 # XenServer.NET Usage Examples
 
+## Workflow examples
+
+[`workflows/`](workflows) holds all 91 workflow examples ([the full list](../README.md#workflow-examples)) in one program, `Program.cs`.
+It references the [XenServer.NET](https://www.nuget.org/packages/XenServer.NET) NuGet package, so the
+.NET 8 SDK is all you need:
+
+```
+cd workflows
+dotnet run -- connect-inventory https://xenserver root <password>
+```
+
+Each workflow is also a self-contained function you can copy into your own code; see the `Run it:` line under each.
+
 ## Overview
 
 The XenServer.NET examples provide practical demonstrations of interacting with XenServer infrastructure using the XenServer.NET SDK. These examples are written as a Microsoft Visual Studio solution and are designed to showcase various functionalities and features of the XenServer platform.

@@ -4,6 +4,20 @@ This folder contains of a number of test programs that can be used as pedagogica
 examples accompanying XenServerJava (com.xenserver.xen-api). They are
 structured as a Maven project.
 
+## Workflow examples
+
+[`workflows/`](workflows) holds all 91 workflow examples ([the full list](../README.md#workflow-examples)) in one class, `Workflows.java`,
+as a Maven project. The SDK jar is not published to Maven Central, so install it into your local
+repository first. The jar carries its own POM, which supplies its coordinates and dependencies:
+
+```
+mvn install:install-file -Dfile=xen-api-<version>.jar
+cd workflows
+mvn compile exec:java -Dxenapi.version=<version> -Dexec.args="connect-inventory https://xenserver root <password>"
+```
+
+Each workflow is also a self-contained function you can copy into your own code; see the `Run it:` line under each.
+
 ## Overview
 
 Running the main file `RunTests` runs a series of examples included in the 
