@@ -10,22 +10,30 @@
 // what lets this one file run any of them from the command line.
 //
 // Usage:
-//   go run . <workflow> <url> <username> <password>
 //
-//   <workflow>  any workflow id from the dispatcher (see also README.md)
+//	go run . <workflow> <url> <username> <password>
+//
+//	<workflow>  any workflow id from the dispatcher (see also README.md)
 package main
 
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"math/big"
 	"math/bits"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -121,6 +129,207 @@ func srByName(session *xenapi.Session, name string, shared bool) xenapi.SRRef {
 	panic(fmt.Sprintf("no SR named %q was found", name))
 }
 
+// detachAndForgetSR detaches an SR from every host, then forgets it: XenCenter's Detach followed by
+// Forget. SR.Forget refuses an SR that is still attached (SR_HAS_PBD), so unplug its PBDs first.
+// Forgetting drops the pool's record of the SR but leaves the data on the storage itself.
+func detachAndForgetSR(session *xenapi.Session, sr xenapi.SRRef) {
+	pbds, err := xenapi.SR.GetPBDs(session, sr)
+	check(err)
+	for _, pbd := range pbds {
+		attached, err := xenapi.PBD.GetCurrentlyAttached(session, pbd)
+		check(err)
+		if attached {
+			check(xenapi.PBD.Unplug(session, pbd))
+		}
+	}
+	check(xenapi.SR.Forget(session, sr))
+}
+
+// provision is VM.Provision, after filling in the SR for every disk the template describes. A template's
+// other_config["disks"] names each disk's SR as sr="" (empty); a real host takes that literally and
+// VM.Provision fails with UUID_INVALID, so point the disks at the pool's default SR first - exactly what
+// `xe vm-install` does before calling VM.provision itself.
+func provision(session *xenapi.Session, vm xenapi.VMRef) {
+	otherConfig, err := xenapi.VM.GetOtherConfig(session, vm)
+	check(err)
+	if disks, ok := otherConfig["disks"]; ok && strings.Contains(disks, `sr=""`) {
+		pools, err := xenapi.Pool.GetAll(session)
+		check(err)
+		defaultSR, err := xenapi.Pool.GetDefaultSR(session, pools[0])
+		check(err)
+		srUUID, err := xenapi.SR.GetUUID(session, defaultSR)
+		check(err)
+		check(xenapi.VM.RemoveFromOtherConfig(session, vm, "disks"))
+		check(xenapi.VM.AddToOtherConfig(session, vm, "disks", strings.ReplaceAll(disks, `sr=""`, `sr="`+srUUID+`"`)))
+	}
+	check(xenapi.VM.Provision(session, vm))
+}
+
+// copyOfGuest makes a throwaway VM with a working guest OS: a copy of an existing VM that has one.
+//
+// Suspend, checkpoint, live migration and clean shutdown all need the guest's cooperation: on a
+// running VM with no PV drivers xapi refuses them up front with VM_LACKS_FEATURE (a VM freshly
+// cloned from a template has no OS at all). So copy a VM that does have an OS and PV drivers,
+// without disturbing it: snapshot it (fine while it runs), clone the snapshot - a clone of a
+// snapshot is a template - and provision that into an ordinary VM. The snapshot is only needed for
+// the clone, so it goes again straight away.
+func copyOfGuest(session *xenapi.Session, sourceVMName, newVMName string) xenapi.VMRef {
+	source := vmByName(session, sourceVMName)
+	snapshot, err := xenapi.VM.Snapshot(session, source, newVMName+"-source", nil)
+	check(err)
+	vm, err := xenapi.VM.Clone(session, snapshot, newVMName)
+	check(err)
+	provision(session, vm)
+	destroyVMAndDisks(session, snapshot)
+	return vm
+}
+
+// waitForGuestAgent waits, after VM.Start, until the guest's PV drivers have reported in.
+//
+// xapi only offers the guest-dependent operations once the guest says it can do them, and
+// allowed_operations is where it says so: wait for clean_shutdown to appear there (the same check
+// that refuses it with VM_LACKS_FEATURE beforehand). A booting OS takes a while.
+func waitForGuestAgent(session *xenapi.Session, vm xenapi.VMRef) {
+	const timeout = 300 * time.Second
+	const interval = 2 * time.Second
+	deadline := time.Now().Add(timeout)
+	for {
+		ops, err := xenapi.VM.GetAllowedOperations(session, vm)
+		check(err)
+		for _, op := range ops {
+			if op == xenapi.VMOperationsCleanShutdown {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			panic(fmt.Sprintf("the guest's PV drivers did not report in within %s; does the source "+
+				"VM have a guest OS with PV drivers (XenServer VM Tools)?", timeout))
+		}
+		time.Sleep(interval)
+	}
+}
+
+// probeForFailure runs SR.probe's deliberately-incomplete discovery call and returns the XML
+// fragment its failure carries describing what it found. The New SR wizard (and XenRT) discover
+// iSCSI/HBA LUNs by asking with an incomplete device-config on purpose: the backend can't create
+// anything from it yet, so it fails with an error whose params carry an XML fragment describing
+// what it found. A probe that unexpectedly succeeds means the device-config was already complete -
+// not the discovery prompt this helper is looking for. Never fall back to SR.create instead: on
+// real storage a create that unexpectedly succeeds formats the LUN.
+func probeForFailure(session *xenapi.Session, host xenapi.HostRef, deviceConfig map[string]string, smType string) string {
+	_, err := xenapi.SR.Probe(session, host, deviceConfig, smType, map[string]string{})
+	if err == nil {
+		panic(fmt.Sprintf("SR.probe for %s succeeded without asking for more information; "+
+			"check the target address", smType))
+	}
+	if xml := xmlFromFailure(err); xml != "" {
+		return xml
+	}
+	panic(err)
+}
+
+// xmlFromFailure pulls the XML fragment out of a XenAPI failure's text. The Go binding renders an
+// API error as a formatted string ending "... data [<code> <param> <param> ...]" (see
+// coordinatorFromSlaveError) rather than keeping the params as separate values, so splitting on
+// whitespace would break up the XML itself wherever it contains one. The XML fragment is always
+// the last parameter in these errors, so take everything from the first "<" onward instead.
+func xmlFromFailure(err error) string {
+	msg := err.Error()
+	i := strings.Index(msg, "data [")
+	if i < 0 {
+		return ""
+	}
+	inner := strings.TrimSuffix(msg[i+len("data ["):], "]")
+	if j := strings.Index(inner, "<"); j >= 0 {
+		return inner[j:]
+	}
+	return ""
+}
+
+// selfSignedCertPEM generates a throwaway self-signed certificate and private key (PEM), the way
+// XenRT provisions one for its own certificate tests. Go's standard library crypto/x509 and
+// crypto/rsa need no external tool for this, unlike some other languages here.
+func selfSignedCertPEM() (certPEM, keyPEM string) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	check(err)
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "sdk-example"},
+		NotBefore:    time.Now().Add(-24 * time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	check(err)
+	certPEM = string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	keyPEM = string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
+	return
+}
+
+// reconnectAfterMasterChange waits out a pool-wide xapi restart (pool.DesignateNewMaster) and
+// reconnects. Mirrors XenRT's own wait after this call: the connection does not survive a
+// pool-wide xapi restart, so retry rather than assuming the session is still good.
+func reconnectAfterMasterChange(url, user, password string) (session *xenapi.Session) {
+	deadline := time.Now().Add(600 * time.Second)
+	var lastErr any
+	for time.Now().Before(deadline) {
+		reconnected := func() (ok bool) {
+			defer func() {
+				if r := recover(); r != nil {
+					lastErr = r
+					ok = false
+				}
+			}()
+			session = connect(url, user, password)
+			return true
+		}()
+		if reconnected {
+			return session
+		}
+		time.Sleep(5 * time.Second)
+	}
+	panic(fmt.Sprintf("the pool did not come back after the master change: %v", lastErr))
+}
+
+// waitForHostLive polls host_metrics.live until it matches, rather than issuing the next power
+// command immediately - real out-of-band power control has no retry of its own, so a tool that
+// doesn't wait can issue a second command while the first is still in flight. Short default
+// timeouts are fine for a demo; real tooling (XenRT's own waitForEnabled) waits up to 900s.
+func waitForHostLive(session *xenapi.Session, host xenapi.HostRef, want bool) {
+	deadline := time.Now().Add(60 * time.Second)
+	for hostLive(session, host) != want {
+		if time.Now().After(deadline) {
+			panic(fmt.Sprintf("host did not reach live=%t in time", want))
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// hostURL rebuilds a URL for a different host's own address, keeping the original scheme and port
+// (a host's management "address" field carries no port of its own). Needed anywhere a workflow
+// does raw HTTP against a SPECIFIC host rather than the pool's connection URL.
+func hostURL(rawURL, address string) string {
+	u, err := url.Parse(rawURL)
+	check(err)
+	host := address
+	if port := u.Port(); port != "" {
+		host = address + ":" + port
+	}
+	return u.Scheme + "://" + host
+}
+
+// moveDisksToSR relocates every one of a (not-yet-started) VM's disks onto the given SR, the same
+// VDI.PoolMigrate call storage-migrate already demonstrates.
+func moveDisksToSR(session *xenapi.Session, vm xenapi.VMRef, sr xenapi.SRRef) {
+	for _, vdi := range diskVdis(session, vm) {
+		current, err := xenapi.VDI.GetSR(session, vdi)
+		check(err)
+		if current != sr {
+			_, err := xenapi.VDI.PoolMigrate(session, vdi, sr, map[string]string{})
+			check(err)
+		}
+	}
+}
+
 // --- 1. Connect & inventory ------------------------------------------------------------
 func connectInventory(url, user, password string) {
 	session := connect(url, user, password)
@@ -168,11 +377,11 @@ func createVM(url, user, password, templateName, newVMName string) {
 	uuid, _ := xenapi.VM.GetUUID(session, vmRef)
 	fmt.Printf("Cloned new VM: %s\n", uuid)
 
-	check(xenapi.VM.Provision(session, vmRef))
+	provision(session, vmRef)
 	isTemplate, _ := xenapi.VM.GetIsATemplate(session, vmRef)
 	fmt.Printf("Provisioned. is_a_template = %v\n", isTemplate)
 
-	check(xenapi.VM.Destroy(session, vmRef))
+	destroyVMAndDisks(session, vmRef)
 	fmt.Println("Cleaned up the example VM.")
 
 	fmt.Println("OK: create-vm")
@@ -183,12 +392,16 @@ func createVM(url, user, password, templateName, newVMName string) {
 //   createVM("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-vm")
 
 // --- 3. VM power lifecycle -------------------------------------------------------------
-func vmLifecycle(url, user, password, templateName, newVMName string) {
+// vmLifecycle takes a throwaway copy of a VM with a guest OS through start -> suspend -> resume ->
+// clean shutdown, and deletes it again.
+//
+// Suspend and clean shutdown need the guest's cooperation (VM_LACKS_FEATURE without PV drivers),
+// so the copy is made from sourceVM, a VM with a guest OS and PV drivers, and the example waits
+// for the guest to report in after starting. Suspend also needs a suspend-image SR (the VM's own,
+// else the pool's, else the host's); check one is actually configured before trying.
+func vmLifecycle(url, user, password, sourceVM, newVMName string) {
 	session := connect(url, user, password)
-	// Power operations are destructive, so work on a throwaway VM cloned from the template.
-	vmRef, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
-	check(err)
-	check(xenapi.VM.Provision(session, vmRef))
+	vmRef := copyOfGuest(session, sourceVM, newVMName)
 
 	state := func() xenapi.VMPowerState {
 		s, _ := xenapi.VM.GetPowerState(session, vmRef)
@@ -197,6 +410,7 @@ func vmLifecycle(url, user, password, templateName, newVMName string) {
 
 	fmt.Printf("Initial power state: %s\n", state())
 	check(xenapi.VM.Start(session, vmRef, false, true))
+	waitForGuestAgent(session, vmRef)
 	fmt.Printf("After start:    %s\n", state())
 
 	// The emulated hardware (the device model) can be restarted under a running guest without
@@ -204,38 +418,88 @@ func vmLifecycle(url, user, password, templateName, newVMName string) {
 	check(xenapi.VM.RestartDeviceModels(session, vmRef))
 	fmt.Printf("Device models restarted; still %s\n", state())
 
-	check(xenapi.VM.Suspend(session, vmRef))
-	fmt.Printf("After suspend:  %s\n", state())
-	check(xenapi.VM.Resume(session, vmRef, false, true))
-	fmt.Printf("After resume:   %s\n", state())
+	// Suspend needs a suspend-image SR (the VM's own, else the pool's, else the host's); check
+	// one is actually configured before trying, rather than assuming it is (VM_NO_SUSPEND_SR
+	// otherwise on a real host).
+	if hasSuspendSR(session, vmRef) {
+		check(xenapi.VM.Suspend(session, vmRef))
+		fmt.Printf("After suspend:  %s\n", state())
+		check(xenapi.VM.Resume(session, vmRef, false, true))
+		waitForGuestAgent(session, vmRef) // the PV drivers reconnect after a resume
+		fmt.Printf("After resume:   %s\n", state())
+	} else {
+		fmt.Println("Skipping suspend/resume: no suspend-image SR is configured for this VM/pool/host")
+	}
+
+	// A clean shutdown asks the guest OS to shut itself down, as pressing the power button would -
+	// possible here because the copy has a guest OS with PV drivers.
 	check(xenapi.VM.CleanShutdown(session, vmRef))
 	fmt.Printf("After shutdown: %s\n", state())
 
-	check(xenapi.VM.Destroy(session, vmRef))
+	destroyVMAndDisks(session, vmRef)
 	fmt.Println("OK: vm-lifecycle")
 	session.Logout()
 }
 
+// hasSuspendSR reports whether VM.Suspend has a suspend-image SR to use: the VM's own, else the
+// pool's, else the resident host's - the same fallback order xapi's choose_suspend_sr uses.
+func hasSuspendSR(session *xenapi.Session, vm xenapi.VMRef) bool {
+	if sr, err := xenapi.VM.GetSuspendSR(session, vm); err == nil && sr != "" && sr != "OpaqueRef:NULL" {
+		return true
+	}
+	pools, err := xenapi.Pool.GetAll(session)
+	check(err)
+	if sr, err := xenapi.Pool.GetSuspendImageSR(session, pools[0]); err == nil && sr != "" && sr != "OpaqueRef:NULL" {
+		return true
+	}
+	host, err := xenapi.Pool.GetMaster(session, pools[0])
+	check(err)
+	sr, err := xenapi.Host.GetSuspendImageSr(session, host)
+	return err == nil && sr != "" && sr != "OpaqueRef:NULL"
+}
+
 // Run it:
-//   vmLifecycle("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-lifecycle")
+//   vmLifecycle("https://xenserver", "root", password, "web-01", "sdk-example-lifecycle")
 
 // --- 4. Manage VM disks: Deactivate / Resize / Activate ------------------------------
-func manageVMDisks(url, user, password, vmName string) {
+// A real VM's root/boot disk is unpluggable=false (only non-system disks from VM.Provision default
+// to unpluggable), and the VM has to be Running for VBD.Unplug to be legal at all
+// (VM_BAD_POWER_STATE otherwise on a halted VM). So this works on a NEW data disk added to a
+// throwaway VM of its own, matching XenCenter's own "deactivate" action, which only ever targets
+// additional disks. No shrink demonstration: real SR backends refuse one outright
+// (SR_BACKEND_FAILURE_79).
+func manageVMDisks(url, user, password, templateName, srName, newVMName string) {
+	const GiB = 1024 * 1024 * 1024
 	session := connect(url, user, password)
-	vmRef := vmByName(session, vmName)
+	vmRef, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
+	check(err)
+	provision(session, vmRef)
+	check(xenapi.VM.Start(session, vmRef, false, true))
 
-	// The VM's first real disk (a CD drive is a VBD too, hence the type filter).
-	vbds, err := xenapi.VM.GetVBDs(session, vmRef)
+	srRef := srByName(session, srName, false)
+	vdiRef, err := xenapi.VDI.Create(session, xenapi.VDIRecord{
+		NameLabel:   "sdk-example-data-disk",
+		SR:          srRef,
+		VirtualSize: 4 * GiB,
+		Type:        xenapi.VdiTypeUser,
+		Sharable:    false,
+		ReadOnly:    false,
+		OtherConfig: map[string]string{},
+	})
 	check(err)
-	var vbdRef xenapi.VBDRef
-	for _, v := range vbds {
-		if kind, _ := xenapi.VBD.GetType(session, v); kind == xenapi.VbdTypeDisk {
-			vbdRef = v
-			break
-		}
-	}
-	vdiRef, err := xenapi.VBD.GetVDI(session, vbdRef)
+	devices, err := xenapi.VM.GetAllowedVBDDevices(session, vmRef)
 	check(err)
+	vbdRef, err := xenapi.VBD.Create(session, xenapi.VBDRecord{
+		VM: vmRef, VDI: vdiRef, Userdevice: devices[0],
+		Mode: xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
+		// A Go record sends every field, so say so explicitly: a VBD created with unpluggable=false
+		// can't be hot-unplugged (VBD_NOT_UNPLUGGABLE). xapi's own default, when the field is left
+		// out, is true.
+		Unpluggable: true,
+		OtherConfig: map[string]string{}, QosAlgorithmParams: map[string]string{},
+	})
+	check(err)
+	check(xenapi.VBD.Plug(session, vbdRef))
 	attached, _ := xenapi.VBD.GetCurrentlyAttached(session, vbdRef)
 	fmt.Printf("Disk attached:  %t\n", attached)
 
@@ -260,6 +524,9 @@ func manageVMDisks(url, user, password, vmName string) {
 	check(xenapi.VDI.ResizeOnline(session, vdiRef, grownOnline))
 	final, _ := xenapi.VDI.GetVirtualSize(session, vdiRef)
 	fmt.Printf("Grown online:   %d bytes\n", final)
+
+	check(xenapi.VM.HardShutdown(session, vmRef))
+	destroyVMAndDisks(session, vmRef)
 	fmt.Println("OK: manage-vm-disks")
 	session.Logout()
 }
@@ -271,12 +538,21 @@ func dismissAlerts(url, user, password string) {
 	check(err)
 	fmt.Printf("Alerts:         %d\n", len(messages))
 
-	for ref, m := range messages {
+	if len(messages) == 0 {
+		fmt.Println("No alerts to dismiss.")
+	} else {
+		// Sorted, for a deterministic choice of which one to dismiss.
+		refs := make([]string, 0, len(messages))
+		for ref := range messages {
+			refs = append(refs, string(ref))
+		}
+		sort.Strings(refs)
+		ref := xenapi.MessageRef(refs[0])
+		m := messages[ref]
 		fmt.Printf("Dismissing:     %s (priority %d)\n", m.Name, m.Priority)
 		check(xenapi.Message.Destroy(session, ref))
 		left, _ := xenapi.Message.GetAllRecords(session)
 		fmt.Printf("Alerts left:    %d\n", len(left))
-		break
 	}
 	fmt.Println("OK: dismiss-alerts")
 	session.Logout()
@@ -290,10 +566,10 @@ func hostPowerOn(url, user, password string) {
 	hostRef := hosts[0]
 
 	// Mode and config travel together: the config carries the credentials the mode needs.
-	check(xenapi.Host.SetPowerOnMode(session, hostRef, "iLO", map[string]string{
-		"power_on_ip":   "192.0.2.9",
-		"power_on_user": "poweradmin",
-	}))
+	// "wake-on-lan" is a real, still-supported mode and needs no credentials; the legacy "iLO"/
+	// "DRAC" modes were removed from the real power-on plugin and fail the moment host.power_on is
+	// actually called ("{mode} script has been removed").
+	check(xenapi.Host.SetPowerOnMode(session, hostRef, "wake-on-lan", map[string]string{}))
 	mode, _ := xenapi.Host.GetPowerOnMode(session, hostRef)
 	fmt.Printf("Power-on mode:  %s\n", mode)
 	cfg, _ := xenapi.Host.GetPowerOnConfig(session, hostRef)
@@ -314,10 +590,28 @@ func rotatePoolSecret(url, user, password string) {
 	name, _ := xenapi.Pool.GetNameLabel(session, pools[0])
 	fmt.Printf("Pool:           %s\n", name)
 
-	// A pool-wide operation; existing sessions survive it.
-	check(xenapi.Pool.RotateSecret(session))
-	after, _ := xenapi.Pool.GetAll(session)
-	fmt.Printf("Rotated. Still connected: %t\n", len(after) == 1)
+	// xapi checks its own preconditions before rotating - HA must be disabled, every host must be
+	// live, no rolling pool upgrade may be in progress, and the pool must be licensed for it - and
+	// raises a clear error naming which one failed rather than silently refusing. Report that
+	// explanation instead of letting the failure speak for itself; the point here is demonstrating
+	// the precondition handling, not requiring the rotation to succeed.
+	explanations := map[string]string{
+		xenapi.ErrorHaIsEnabled:               "HA is enabled on this pool; disable it first.",
+		xenapi.ErrorCannotContactHost:         "a host in the pool is not reachable.",
+		xenapi.ErrorNotSupportedDuringUpgrade: "a rolling pool upgrade is in progress.",
+		xenapi.ErrorLicenceRestriction:        "this edition is not licensed for pool secret rotation.",
+	}
+	if err := xenapi.Pool.RotateSecret(session); err != nil {
+		code := failureCode(err)
+		explanation, ok := explanations[code]
+		if !ok {
+			explanation = "see the error for detail"
+		}
+		fmt.Printf("Could not rotate the pool secret: %s (%s)\n", code, explanation)
+	} else {
+		after, _ := xenapi.Pool.GetAll(session)
+		fmt.Printf("Rotated. Still connected: %t\n", len(after) == 1)
+	}
 	fmt.Println("OK: rotate-pool-secret")
 	session.Logout()
 }
@@ -337,12 +631,15 @@ func changeRootPassword(url, user, password string) {
 	check(err)
 	fmt.Printf("Session still usable: %t\n", len(pools) == 1)
 
-	// Supplying the wrong current password is the failure worth handling.
-	if err := session.ChangePassword("definitely-not-it", "irrelevant"); err != nil {
-		fmt.Printf("Wrong old password rejected: %s\n", err)
-	} else {
-		fmt.Println("unexpected: the wrong old password was accepted")
-	}
+	// session.change_password on a ROOT session ignores old_pwd entirely (CA-13567, confirmed in
+	// xapi_session.ml) - any string would also be accepted, so there is no "wrong old password is
+	// rejected" failure to demonstrate here. The real gate is upstream of that: only a session
+	// authenticated as the local superuser may call this at all. The Go binding keeps its session
+	// id private, so check that the same way the RRD/export examples obtain one of their own.
+	sid := rawLogin(url, user, password)
+	isSuperuser := rawRPC(url, "session.get_is_local_superuser", sid, sid)
+	fmt.Printf("Allowed because session.is_local_superuser = %s\n", isSuperuser)
+	rawRPC(url, "session.logout", sid)
 
 	check(session.ChangePassword(temporary, password))
 	fmt.Println("Password restored.")
@@ -355,21 +652,45 @@ func manageCertificates(url, user, password string) {
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
+	pools, err := xenapi.Pool.GetAll(session)
+	check(err)
+	poolRef := pools[0]
+
+	// A real, generated self-signed certificate, not a placeholder string: xapi decodes whatever is
+	// handed to install_trusted_certificate/install_server_certificate as PEM and rejects anything
+	// that isn't a well-formed certificate (INVALID_VALUE).
+	certPEM, keyPEM := selfSignedCertPEM()
 
 	certs, _ := xenapi.Certificate.GetAll(session)
 	fmt.Printf("Certificates:   %d\n", len(certs))
 
-	// A CA certificate is pool-wide; a server certificate belongs to one host.
-	// Both take the certificate by NAME rather than by pool ref - they are inherently pool-wide.
-	check(xenapi.Pool.InstallCaCertificate(session, "sdk-example-ca",
-		"-----BEGIN CERTIFICATE-----sdk-example-----END CERTIFICATE-----"))
+	// ca=true: trusted as a root to verify a chain, not pinned as one specific leaf certificate.
+	// purpose=[]: general pool trust. install_trusted_certificate is the current API (the
+	// deprecated install_ca_certificate/uninstall_ca_certificate pair took a name instead) and
+	// returns nothing, so find the new record by diffing the set.
+	before := map[xenapi.CertificateRef]bool{}
+	for _, ref := range certs {
+		before[ref] = true
+	}
+	check(xenapi.Pool.InstallTrustedCertificate(session, poolRef, true, certPEM, []xenapi.CertificatePurpose{}))
 	certs, _ = xenapi.Certificate.GetAll(session)
 	fmt.Printf("After CA add:   %d\n", len(certs))
+	var certRef xenapi.CertificateRef
+	for _, ref := range certs {
+		if !before[ref] {
+			certRef = ref
+			break
+		}
+	}
 
+	// Actually replace the host's own TLS identity with a real certificate (beyond CA trust), then
+	// reset it back to a fresh self-signed one, as before.
+	check(xenapi.Host.InstallServerCertificate(session, hosts[0], certPEM, keyPEM, ""))
+	fmt.Println("Host certificate replaced with a real, generated certificate.")
 	check(xenapi.Host.ResetServerCertificate(session, hosts[0]))
 	fmt.Println("Host certificate reset (a fresh self-signed identity).")
 
-	check(xenapi.Pool.UninstallCaCertificate(session, "sdk-example-ca", false))
+	check(xenapi.Pool.UninstallTrustedCertificate(session, poolRef, certRef))
 	certs, _ = xenapi.Certificate.GetAll(session)
 	fmt.Printf("After CA remove:%d\n", len(certs))
 
@@ -377,12 +698,10 @@ func manageCertificates(url, user, password string) {
 	// present to each other. Turning it on is a one-way door from here - there is no matching disable,
 	// because a pool that could be talked out of verifying would not be verifying - so the call is
 	// idempotent and safe to repeat.
-	pools, err := xenapi.Pool.GetAll(session)
-	check(err)
-	verifying, _ := xenapi.Pool.GetTLSVerificationEnabled(session, pools[0])
+	verifying, _ := xenapi.Pool.GetTLSVerificationEnabled(session, poolRef)
 	fmt.Printf("TLS verification: %t\n", verifying)
 	check(xenapi.Pool.EnableTLSVerification(session))
-	verifying, _ = xenapi.Pool.GetTLSVerificationEnabled(session, pools[0])
+	verifying, _ = xenapi.Pool.GetTLSVerificationEnabled(session, poolRef)
 	fmt.Printf("  after enabling: %t\n", verifying)
 	fmt.Println("OK: manage-certificates")
 	session.Logout()
@@ -411,16 +730,35 @@ func snapshotSchedule(url, user, password, vmName, scheduleName string) {
 	members, _ := xenapi.VMSS.GetVMs(session, vmssRef)
 	fmt.Printf("Members:          %d\n", len(members))
 
-	// Run it three times against a retention of two: the oldest is pruned away.
+	// Run it three times against a retention of two: the oldest is pruned away. Compare against the
+	// snapshots the VM already had, so only the schedule's own are counted (and tidied up below).
+	existing, err := xenapi.VM.GetSnapshots(session, vmRef)
+	check(err)
+	before := map[xenapi.VMRef]bool{}
+	for _, s := range existing {
+		before[s] = true
+	}
 	for i := 0; i < 3; i++ {
 		_, err = xenapi.VMSS.SnapshotNow(session, vmssRef)
 		check(err)
 	}
-	snaps, _ := xenapi.VM.GetSnapshots(session, vmRef)
-	fmt.Printf("Snapshots kept:   %d (retention 2)\n", len(snaps))
+	snaps, err := xenapi.VM.GetSnapshots(session, vmRef)
+	check(err)
+	var kept []xenapi.VMRef
+	for _, s := range snaps {
+		if !before[s] {
+			kept = append(kept, s)
+		}
+	}
+	fmt.Printf("Snapshots kept:   %d (retention 2)\n", len(kept))
 
+	// Tidy up: a schedule with VMs still on it cannot be destroyed (VMSS_HAS_VM), so take the VM off it
+	// first. Destroying the schedule leaves the snapshots it took, so destroy those too, with their disks.
 	check(xenapi.VM.SetSnapshotSchedule(session, vmRef, "OpaqueRef:NULL"))
 	check(xenapi.VMSS.Destroy(session, vmssRef))
+	for _, s := range kept {
+		destroyVMAndDisks(session, s)
+	}
 	fmt.Println("OK: snapshot-schedule")
 	session.Logout()
 }
@@ -452,10 +790,8 @@ func manageVMGroups(url, user, password, vmName, groupName string) {
 		fmt.Printf("  %s\n", name)
 	}
 
-	check(xenapi.VM.SetGroups(session, vmRef, []xenapi.VMGroupRef{}))
-	after, _ := xenapi.VMGroup.GetVMs(session, groupRef)
-	fmt.Printf("After removal:  %d member(s)\n", len(after))
-
+	// VM_group.destroy already clears the group from every member VM's groups field - no need to
+	// remove membership ourselves first.
 	check(xenapi.VMGroup.Destroy(session, groupRef))
 	fmt.Println("OK: manage-vm-groups")
 	session.Logout()
@@ -467,29 +803,50 @@ func snapshotRevert(url, user, password, vmName, snapshotName string) {
 	vmRef := vmByName(session, vmName)
 	name, _ := xenapi.VM.GetNameLabel(session, vmRef)
 	fmt.Printf("Snapshotting VM: %s\n", name)
+	wasRunning := false
+	if state, _ := xenapi.VM.GetPowerState(session, vmRef); state == xenapi.VMPowerStateRunning {
+		wasRunning = true
+	}
 
 	snapRef, err := xenapi.VM.Snapshot(session, vmRef, snapshotName, nil)
 	check(err)
 	uuid, _ := xenapi.VM.GetUUID(session, snapRef)
 	fmt.Printf("Created snapshot: %s\n", uuid)
 
+	// A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the VM's
+	// console at that moment. It is an HTTP transfer alongside the API, not an API call, so the session id
+	// travels in the query string. Only a running VM has a console to capture: the server answers HTTP 500
+	// for a halted VM, and for the snapshot record itself. The Go binding keeps its own session private,
+	// so obtain one of our own the same way the RRD/export examples do.
+	if state, _ := xenapi.VM.GetPowerState(session, vmRef); state == xenapi.VMPowerStateRunning {
+		sid := rawLogin(url, user, password)
+		resp, err := insecureClient().Get(fmt.Sprintf("%s/vncsnapshot?session_id=%s&ref=%s", url, sid, vmRef))
+		check(err)
+		thumb, err := io.ReadAll(resp.Body)
+		check(err)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			panic(fmt.Sprintf("vncsnapshot: %s", resp.Status))
+		}
+		fmt.Printf("Thumbnail:      %d bytes of PNG\n", len(thumb))
+	} else {
+		fmt.Println("Thumbnail:      none (the VM is not running, so it has no console)")
+	}
+
 	check(xenapi.VM.Revert(session, snapRef))
 	fmt.Println("Reverted VM to the snapshot.")
 
-	// A client shows a thumbnail of what was on screen when the snapshot was taken. It is an HTTP
-	// transfer alongside the API, not an API call, so the session id travels in the query string. The Go
-	// binding keeps its own session private, so obtain one of our own the same way the RRD/export
-	// examples do.
-	sid := rawLogin(url, user, password)
-	resp, err := insecureClient().Get(fmt.Sprintf("%s/vncsnapshot?session_id=%s&ref=%s", url, sid, snapRef))
-	check(err)
-	thumb, err := io.ReadAll(resp.Body)
-	check(err)
-	resp.Body.Close()
-	fmt.Printf("Thumbnail:      %d bytes of PNG\n", len(thumb))
+	// Reverting to a plain snapshot always leaves the VM Halted (xapi hard-shuts-down a running VM
+	// before reverting it), even if it was Running a moment ago - restart it if that is how we
+	// found it, so the workflow actually restores what it changed.
+	if wasRunning {
+		check(xenapi.VM.Start(session, vmRef, false, true))
+		fmt.Println("Restarted the VM (it was running before the revert).")
+	}
 
-	// A snapshot is itself a (special) VM record; destroy it to clean up.
-	check(xenapi.VM.Destroy(session, snapRef))
+	// A snapshot is itself a (special) VM record, with its own snapshot disks; destroy both to clean up
+	// (the source VM's disks are untouched - they are not the snapshot's).
+	destroyVMAndDisks(session, snapRef)
 	fmt.Println("OK: snapshot-revert")
 	session.Logout()
 }
@@ -520,7 +877,7 @@ func createNfsSR(url, user, password, nfsServer, nfsPath, srName string) {
 	uuid, _ := xenapi.SR.GetUUID(session, srRef)
 	fmt.Printf("Created SR: %s\n", uuid)
 
-	check(xenapi.SR.Forget(session, srRef))
+	detachAndForgetSR(session, srRef)
 	fmt.Println("OK: create-nfs-sr")
 	session.Logout()
 }
@@ -694,9 +1051,15 @@ func newVMWizard(url, user, password, templateName, newVMName string) {
 	}
 	vifDevices, err := xenapi.VM.GetAllowedVIFDevices(session, vm)
 	check(err)
+	// A Go record sends every field, enums included, and a real host rejects an empty enum value
+	// (INTERNAL_ERROR "Unknown tag/contents"), so set the enums to the defaults xapi applies when
+	// they are left out.
 	_, err = xenapi.VIF.Create(session, xenapi.VIFRecord{
 		VM: vm, Network: netRef, Device: vifDevices[0], MAC: "", MTU: 1500,
 		OtherConfig: map[string]string{}, QosAlgorithmParams: map[string]string{},
+		LockingMode:           xenapi.VifLockingModeNetworkDefault,
+		Ipv4ConfigurationMode: xenapi.VifIpv4ConfigurationModeNone,
+		Ipv6ConfigurationMode: xenapi.VifIpv6ConfigurationModeNone,
 	})
 	check(err)
 	fmt.Printf("Networking:    NIC on %s\n", netName)
@@ -727,13 +1090,17 @@ func newVMWizard(url, user, password, templateName, newVMName string) {
 //   newVMWizard("https://xenserver", "root", password, "Rocky Linux 8", "wizard-vm")
 
 // --- 10. Live migrate a VM -------------------------------------------------------------
-func liveMigrate(url, user, password, templateName, newVMName string) {
+// liveMigrate live-migrates a running VM to another host in the pool, with no downtime. Moves a
+// throwaway copy of sourceVM, a VM with a guest OS and PV drivers: live migration needs the
+// guest's cooperation (VM_LACKS_FEATURE without PV drivers). Only the VM's memory moves, so the
+// destination host has to see its disks already: a disk on local storage refuses with
+// VM_REQUIRES_SR. Put the copy's disks on the shared SR srName first.
+func liveMigrate(url, user, password, sourceVM, srName, newVMName string) {
 	session := connect(url, user, password)
-	// Start a throwaway VM so there is something running to migrate.
-	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
-	check(err)
-	check(xenapi.VM.Provision(session, vm))
+	vm := copyOfGuest(session, sourceVM, newVMName)
+	moveDisksToSR(session, vm, srByName(session, srName, true))
 	check(xenapi.VM.Start(session, vm, false, true))
+	waitForGuestAgent(session, vm)
 
 	sourceHost, err := xenapi.VM.GetResidentOn(session, vm)
 	check(err)
@@ -763,16 +1130,20 @@ func liveMigrate(url, user, password, templateName, newVMName string) {
 
 	// Tidy up so the example is repeatable.
 	check(xenapi.VM.HardShutdown(session, vm))
-	check(xenapi.VM.Destroy(session, vm))
+	destroyVMAndDisks(session, vm)
 	fmt.Println("OK: live-migrate")
 	session.Logout()
 }
 
 // Run it:
-//   liveMigrate("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-migrate")
+//   liveMigrate("https://xenserver", "root", password, "web-01", "Shared NFS", "sdk-example-migrate")
 
 // --- 11. Enter & exit maintenance mode -------------------------------------------------
-func hostMaintenance(url, user, password, templateName, newVMName string) {
+// hostMaintenance disables a host, evacuates its running guests to another host, then re-enables
+// it. Pins a throwaway copy of sourceVM to the host so evacuation has work to do. Evacuation
+// live-migrates the guest, which needs its cooperation (VM_LACKS_FEATURE without PV drivers), so
+// sourceVM must have a guest OS with PV drivers.
+func hostMaintenance(url, user, password, sourceVM, srName, newVMName string) {
 	session := connect(url, user, password)
 	// Choose a host that is not the pool coordinator, so the coordinator can receive its guests.
 	pools, err := xenapi.Pool.GetAllRecords(session)
@@ -795,11 +1166,15 @@ func hostMaintenance(url, user, password, templateName, newVMName string) {
 	fmt.Printf("Maintenance host: %s\n", hostName)
 
 	// Pin a running VM to that host so evacuation has something to move.
-	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
-	check(err)
-	check(xenapi.VM.Provision(session, vm))
+	vm := copyOfGuest(session, sourceVM, newVMName)
+	// Evacuation needs somewhere else in the pool that can actually see the VM's disk - a VM whose
+	// only disk is on local (non-shared) storage can't be evacuated at all (VM_REQUIRES_SR), and a
+	// pool's installation-time default SR is commonly local storage. Put the pinned VM's disk on a
+	// shared SR explicitly rather than trusting whatever the pool default happens to be.
+	moveDisksToSR(session, vm, srByName(session, srName, true))
 	check(xenapi.VM.SetAffinity(session, vm, hostRef))
 	check(xenapi.VM.Start(session, vm, false, true))
+	waitForGuestAgent(session, vm)
 	on, _ := xenapi.VM.GetResidentOn(session, vm)
 	onName, _ := xenapi.Host.GetNameLabel(session, on)
 	fmt.Printf("Guest resident on:%s\n", onName)
@@ -820,13 +1195,13 @@ func hostMaintenance(url, user, password, templateName, newVMName string) {
 
 	// Tidy up so the example is repeatable.
 	check(xenapi.VM.HardShutdown(session, vm))
-	check(xenapi.VM.Destroy(session, vm))
+	destroyVMAndDisks(session, vm)
 	fmt.Println("OK: host-maintenance")
 	session.Logout()
 }
 
 // Run it:
-//   hostMaintenance("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-maint")
+//   hostMaintenance("https://xenserver", "root", password, "web-01", "Shared NFS", "sdk-example-maint")
 
 // --- 12. Configure high availability ---------------------------------------------------
 func configureHa(url, user, password, heartbeatSRName string) {
@@ -899,6 +1274,15 @@ func copyVM(url, user, password, vmName, srName, copyName string) {
 	srcLabel, _ := xenapi.VM.GetNameLabel(session, source)
 	fmt.Printf("Copying '%s' to SR: %s\n", srcLabel, srLabel)
 
+	// VM.Copy (like VM.Clone) requires a Halted source - VM_BAD_POWER_STATE otherwise - so shut a
+	// running source down first and start it back up again afterwards, rather than assuming it is
+	// already halted.
+	wasRunning := false
+	if state, _ := xenapi.VM.GetPowerState(session, source); state == xenapi.VMPowerStateRunning {
+		wasRunning = true
+		check(xenapi.VM.CleanShutdown(session, source))
+	}
+
 	copyRef, err := xenapi.VM.Copy(session, source, copyName, srRef)
 	check(err)
 	uuid, _ := xenapi.VM.GetUUID(session, copyRef)
@@ -907,22 +1291,12 @@ func copyVM(url, user, password, vmName, srName, copyName string) {
 	fmt.Printf("Copied VM:     %s\n", uuid)
 	fmt.Printf("Copy has %d VBD(s), is_a_template = %v\n", len(vbds), isTemplate)
 
+	if wasRunning {
+		check(xenapi.VM.Start(session, source, false, true))
+	}
+
 	// Tidy up: destroy the copy and its disks, leaving the source VM intact.
-	var copyVdis []xenapi.VDIRef
-	for _, vbd := range vbds {
-		t, _ := xenapi.VBD.GetType(session, vbd)
-		if t != xenapi.VbdTypeDisk {
-			continue
-		}
-		vdi, _ := xenapi.VBD.GetVDI(session, vbd)
-		if vdi != xenapi.VDIRef("OpaqueRef:NULL") {
-			copyVdis = append(copyVdis, vdi)
-		}
-	}
-	check(xenapi.VM.Destroy(session, copyRef))
-	for _, vdi := range copyVdis {
-		check(xenapi.VDI.Destroy(session, vdi))
-	}
+	destroyVMAndDisks(session, copyRef)
 	fmt.Println("Cleaned up the copied VM (left the source intact).")
 	fmt.Println("OK: copy-vm")
 	session.Logout()
@@ -943,7 +1317,7 @@ func createVMWithVgpu(url, user, password, templateName, newVMName string) {
 	// Provision a fresh VM from the template to attach the vGPU to.
 	vmRef, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
 	check(err)
-	check(xenapi.VM.Provision(session, vmRef))
+	provision(session, vmRef)
 
 	// Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty. Same call as
 	// XenCenter's New VM wizard GPU page and the VM Properties GPU page.
@@ -960,7 +1334,7 @@ func createVMWithVgpu(url, user, password, templateName, newVMName string) {
 
 	// Tidy up so the example is repeatable.
 	check(xenapi.VGPU.Destroy(session, vgpuRef))
-	check(xenapi.VM.Destroy(session, vmRef))
+	destroyVMAndDisks(session, vmRef)
 	fmt.Println("Cleaned up the example VM and its vGPU.")
 
 	fmt.Println("OK: create-vm-with-vgpu")
@@ -1022,8 +1396,11 @@ func tagsAndFolders(url, user, password, vmName string) {
 // --- 16. Configure updates (CDN) ------------------------------------------------------
 func configureUpdates(url, user, password string) {
 	session := connect(url, user, password)
+	// update=true: without it this introduces only a base package mirror, not an actual UPDATE
+	// repository - pool.sync_updates needs one with update=true enabled (NO_REPOSITORY_ENABLED
+	// otherwise), which is exactly what apply-update and rolling-pool-update rely on.
 	repo, err := xenapi.Repository.Introduce(session, "sdk-cdn", "SDK example repository",
-		"https://cdn.example/base", "https://cdn.example/source", false, "")
+		"https://cdn.example/base", "https://cdn.example/source", true, "")
 	check(err)
 	name, _ := xenapi.Repository.GetNameLabel(session, repo)
 	fmt.Printf("Introduced repository: %s\n", name)
@@ -1031,6 +1408,9 @@ func configureUpdates(url, user, password string) {
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
 	pool := pools[0]
+	// Remember the pool's own repositories, to put them back afterwards.
+	previous, perr := xenapi.Pool.GetRepositories(session, pool)
+	check(perr)
 	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{repo}))
 	check(xenapi.Pool.SetUpdateSyncEnabled(session, pool, true))
 	repos, _ := xenapi.Pool.GetRepositories(session, pool)
@@ -1039,7 +1419,7 @@ func configureUpdates(url, user, password string) {
 
 	// Tidy up so the example is repeatable.
 	check(xenapi.Pool.SetUpdateSyncEnabled(session, pool, false))
-	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{}))
+	check(xenapi.Pool.SetRepositories(session, pool, previous))
 	check(xenapi.Repository.Forget(session, repo))
 	fmt.Println("OK: configure-updates")
 	session.Logout()
@@ -1068,6 +1448,24 @@ func diskVdis(session *xenapi.Session, vmRef xenapi.VMRef) []xenapi.VDIRef {
 	return vdis
 }
 
+// destroyVMAndDisks destroys a VM (or snapshot, or template) an example made, and the disks it owns.
+// VM.Destroy removes only the VM record and leaves its disks behind, so collect them first and destroy
+// them afterwards - exactly what deleteVM does by hand.
+func destroyVMAndDisks(session *xenapi.Session, vm xenapi.VMRef) {
+	vdis := diskVdis(session, vm)
+	// A checkpoint (or a suspended VM) also owns a suspend image holding its memory, which no VBD
+	// points at: destroy that as well.
+	suspendVDI, err := xenapi.VM.GetSuspendVDI(session, vm)
+	check(err)
+	if suspendVDI != "OpaqueRef:NULL" {
+		vdis = append(vdis, suspendVDI)
+	}
+	check(xenapi.VM.Destroy(session, vm))
+	for _, vdi := range vdis {
+		check(xenapi.VDI.Destroy(session, vdi))
+	}
+}
+
 // --- 17. Clone a VM (fast, copy-on-write) ------------------------------------------------
 func cloneVM(url, user, password, vmName, cloneName string) {
 	session := connect(url, user, password)
@@ -1083,11 +1481,7 @@ func cloneVM(url, user, password, vmName, cloneName string) {
 	fmt.Printf("Clone has %d VBD(s)\n", len(vbds))
 
 	// Tidy up: destroy the clone and its (owned) disks.
-	vdis := diskVdis(session, clone)
-	check(xenapi.VM.Destroy(session, clone))
-	for _, vdi := range vdis {
-		check(xenapi.VDI.Destroy(session, vdi))
-	}
+	destroyVMAndDisks(session, clone)
 	fmt.Println("OK: clone-vm")
 	session.Logout()
 }
@@ -1102,7 +1496,7 @@ func deleteVM(url, user, password, templateName, newVMName string) {
 	// owned VDIs are destroyed explicitly afterward - exactly what XenCenter's Delete VM does.
 	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
 	check(err)
-	check(xenapi.VM.Provision(session, vm))
+	provision(session, vm)
 	uuid, _ := xenapi.VM.GetUUID(session, vm)
 	vdis := diskVdis(session, vm)
 	fmt.Printf("Deleting VM %s with %d disk(s)\n", uuid, len(vdis))
@@ -1130,53 +1524,96 @@ func deleteVM(url, user, password, templateName, newVMName string) {
 //   deleteVM("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-delete")
 
 // --- 19. Storage live-migration (move a disk to another SR) ------------------------------
-func storageMigrate(url, user, password, templateName, newVMName string) {
+// storageMigrate relocates a running VM's disk to a different SR without stopping it (live
+// storage migration) with VDI.PoolMigrate.
+//
+// Moving a running VM's disk needs the guest's cooperation (VM_LACKS_FEATURE without PV drivers),
+// so this works on a throwaway copy of sourceVM, a VM with a guest OS and PV drivers. (A halted
+// VM's disk moves too, without the guest; what VDI.PoolMigrate always needs is a VM to move the
+// disk for - a VDI no VBD points at fails VDI_NEEDS_VM_FOR_MIGRATE.)
+func storageMigrate(url, user, password, sourceVM, newVMName string) {
 	session := connect(url, user, password)
-	// Provision a VM so it has a disk to relocate, note the disk's current SR.
-	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
-	check(err)
-	check(xenapi.VM.Provision(session, vm))
+	vm := copyOfGuest(session, sourceVM, newVMName)
+	check(xenapi.VM.Start(session, vm, false, true))
+	waitForGuestAgent(session, vm)
 	vdi := diskVdis(session, vm)[0]
 	sourceSr, err := xenapi.VDI.GetSR(session, vdi)
 	check(err)
 	srcSrName, _ := xenapi.SR.GetNameLabel(session, sourceSr)
 	fmt.Printf("Disk is on SR: %s\n", srcSrName)
 
-	// Pick a different SR that can hold a VDI and move the disk there (live storage migration).
+	// Pick a different SR that holds disks and that the VM's host can reach (an attached PBD there).
+	host, err := xenapi.VM.GetResidentOn(session, vm)
+	check(err)
 	srs, err := xenapi.SR.GetAllRecords(session)
 	check(err)
 	var destSr xenapi.SRRef
+	found := false
 	for ref, sr := range srs {
-		if ref != sourceSr && sr.Type != "iso" && sr.Type != "udev" {
-			destSr = ref
+		if ref == sourceSr || sr.ContentType == "iso" || sr.Type == "iso" || sr.Type == "udev" {
+			continue
+		}
+		for _, pbdRef := range sr.PBDs {
+			pbdHost, err := xenapi.PBD.GetHost(session, pbdRef)
+			check(err)
+			attached, err := xenapi.PBD.GetCurrentlyAttached(session, pbdRef)
+			check(err)
+			if pbdHost == host && attached {
+				destSr, found = ref, true
+				break
+			}
+		}
+		if found {
 			break
 		}
 	}
-	_, err = xenapi.VDI.PoolMigrate(session, vdi, destSr, map[string]string{})
+	if !found {
+		panic("no destination SR reachable from the VM's resident host was found")
+	}
+
+	// PoolMigrate returns the disk's new VDI: the copy on the destination SR replaces the original.
+	vdi, err = xenapi.VDI.PoolMigrate(session, vdi, destSr, map[string]string{})
 	check(err)
 
 	nowOn, _ := xenapi.VDI.GetSR(session, vdi)
 	nowName, _ := xenapi.SR.GetNameLabel(session, nowOn)
 	fmt.Printf("Disk moved to:  %s\n", nowName)
 
-	// Tidy up.
-	check(xenapi.VM.Destroy(session, vm))
-	check(xenapi.VDI.Destroy(session, vdi))
+	// Tidy up: the VM and the disks it now owns.
+	check(xenapi.VM.HardShutdown(session, vm))
+	destroyVMAndDisks(session, vm)
 	fmt.Println("OK: storage-migrate")
 	session.Logout()
 }
 
 // Run it:
-//   storageMigrate("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-storagemigrate")
+//   storageMigrate("https://xenserver", "root", password, "web-01", "sdk-example-storagemigrate")
 
 // --- 20. Apply updates from the CDN -----------------------------------------------------
+// pool.sync_updates needs at least one repository with update=true enabled
+// (NO_REPOSITORY_ENABLED otherwise) - introduce and attach a throwaway one, and forget it again
+// afterwards. Applying a batch whose mandatory guidance needs an evacuation fails with
+// HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are moved off first; handle that
+// rather than assuming an update batch never asks for one.
 func applyUpdate(url, user, password string) {
 	session := connect(url, user, password)
-	// Sync the pool's update metadata from the CDN; the returned hash identifies the synced set.
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
 	pool := pools[0]
-	hash, err := xenapi.Pool.SyncUpdates(session, pool, false, "", "", "", "")
+	repo, err := xenapi.Repository.Introduce(session, "sdk-cdn", "SDK example repository",
+		"https://cdn.example/base", "https://cdn.example/source", true, "")
+	check(err)
+	// Remember the pool's own repositories, to put them back afterwards.
+	previous, perr := xenapi.Pool.GetRepositories(session, pool)
+	check(perr)
+	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{repo}))
+	defer func() {
+		check(xenapi.Pool.SetRepositories(session, pool, previous))
+		check(xenapi.Repository.Forget(session, repo))
+	}()
+
+	// Sync the pool's update metadata; the returned hash identifies the synced set.
+	hash, err := xenapi.Pool.SyncUpdates5(session, pool, false, "", "")
 	check(err)
 	fmt.Printf("Synced updates; hash length %d\n", len(hash))
 
@@ -1185,26 +1622,56 @@ func applyUpdate(url, user, password string) {
 	hosts, err := xenapi.Host.GetAllRecords(session)
 	check(err)
 	for hostRef, host := range hosts {
-		_, err := xenapi.Host.ApplyUpdates(session, hostRef, hash)
-		check(err)
+		if _, err := xenapi.Host.ApplyUpdates(session, hostRef, hash); err != nil {
+			if failureCode(err) != xenapi.ErrorHostEvacuationIsRequired {
+				panic(err)
+			}
+			fmt.Printf("  %s: needs evacuating first; evacuating and retrying\n", host.NameLabel)
+			check(xenapi.Host.Disable(session, hostRef, false))
+			check(xenapi.Host.Evacuate2(session, hostRef))
+			_, err := xenapi.Host.ApplyUpdates(session, hostRef, hash)
+			check(err)
+			check(xenapi.Host.Enable(session, hostRef))
+		}
 		guidance, _ := xenapi.Host.GetPendingGuidances(session, hostRef)
 		fmt.Printf("  %s: applied; pending guidance = %v\n", host.NameLabel, guidance)
+		// Modern xapi (>=23.18.0) doesn't reboot a host for you: it only records pending_guidances,
+		// so only reboot (or restart the toolstack) when the applied batch actually asks for it.
+		switch {
+		case containsGuidance(guidance, xenapi.UpdateGuidancesRebootHost):
+			check(xenapi.Host.Reboot(session, hostRef))
+		case containsGuidance(guidance, xenapi.UpdateGuidancesRestartToolstack):
+			check(xenapi.Host.RestartAgent(session, hostRef))
+		}
 	}
 	fmt.Println("OK: apply-update")
 	session.Logout()
+}
+
+// containsGuidance reports whether a host's pending_guidances includes the named one.
+func containsGuidance(guidance []xenapi.UpdateGuidances, want xenapi.UpdateGuidances) bool {
+	for _, g := range guidance {
+		if g == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Run it:
 //   applyUpdate("https://xenserver", "root", password)
 
 // --- 21. Checkpoint & revert ------------------------------------------------------------
-func checkpointVM(url, user, password, templateName, newVMName string) {
+// checkpointVM checkpoints a throwaway copy of a VM with a guest OS, then reverts it back to that
+// checkpoint. A checkpoint captures disk AND memory (unlike a plain snapshot), so the VM must be
+// running. Checkpointing needs the guest's cooperation (VM_LACKS_FEATURE without PV drivers),
+// hence a copy of sourceVM - a VM with a guest OS and PV drivers - rather than an OS-less template
+// clone.
+func checkpointVM(url, user, password, sourceVM, newVMName string) {
 	session := connect(url, user, password)
-	// A checkpoint captures disk AND memory (unlike a plain snapshot), so the VM must be running.
-	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
-	check(err)
-	check(xenapi.VM.Provision(session, vm))
+	vm := copyOfGuest(session, sourceVM, newVMName)
 	check(xenapi.VM.Start(session, vm, false, true))
+	waitForGuestAgent(session, vm)
 
 	checkpoint, err := xenapi.VM.Checkpoint(session, vm, "sdk-example-checkpoint-1")
 	check(err)
@@ -1214,21 +1681,25 @@ func checkpointVM(url, user, password, templateName, newVMName string) {
 	fmt.Printf("is_a_snapshot = %v\n", isSnapshot)
 
 	check(xenapi.VM.Revert(session, checkpoint))
-	fmt.Println("Reverted the VM to the checkpoint.")
-
-	// Tidy up.
-	check(xenapi.VM.Destroy(session, checkpoint))
+	// A checkpoint's own power_state is always Suspended (it captures memory as well as disk), and
+	// VM.Revert restores exactly that - so the VM is Suspended here, not Running as it was before
+	// the checkpoint, with a suspend_VDI holding the checkpoint's memory image. VM.Resume clears
+	// that: destroying a Suspended VM directly (as a bare "if Running: hard_shutdown" guard would,
+	// since the VM is never Running here) leaves that suspend_VDI behind as a storage leak.
 	ps, _ := xenapi.VM.GetPowerState(session, vm)
-	if ps == xenapi.VMPowerStateRunning {
-		check(xenapi.VM.HardShutdown(session, vm))
-	}
-	check(xenapi.VM.Destroy(session, vm))
+	fmt.Printf("Reverted the VM to the checkpoint; power state now: %s\n", ps)
+	check(xenapi.VM.Resume(session, vm, false, true))
+
+	// Tidy up. The checkpoint owns its own snapshot disks, separate from the VM's.
+	destroyVMAndDisks(session, checkpoint)
+	check(xenapi.VM.HardShutdown(session, vm))
+	destroyVMAndDisks(session, vm)
 	fmt.Println("OK: checkpoint-vm")
 	session.Logout()
 }
 
 // Run it:
-//   checkpointVM("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-checkpoint")
+//   checkpointVM("https://xenserver", "root", password, "web-01", "sdk-example-checkpoint")
 
 // --- 22. Attach a new disk to a VM ------------------------------------------------------
 func attachDisk(url, user, password, templateName, srName, newVMName string) {
@@ -1237,7 +1708,7 @@ func attachDisk(url, user, password, templateName, srName, newVMName string) {
 	session := connect(url, user, password)
 	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
 	check(err)
-	check(xenapi.VM.Provision(session, vm))
+	provision(session, vm)
 	srRef := srByName(session, srName, false)
 
 	// Create a fresh VDI on the SR and attach it as a new VBD (a new virtual disk).
@@ -1265,13 +1736,9 @@ func attachDisk(url, user, password, templateName, srName, newVMName string) {
 	vbds, _ := xenapi.VM.GetVBDs(session, vm)
 	fmt.Printf("VM now has %d VBD(s)\n", len(vbds))
 
-	// Tidy up: gather the owned disks first, then destroy the VM (which removes its VBDs), then
-	// destroy the disks (VM.Destroy leaves VDIs behind).
-	owned := diskVdis(session, vm)
-	check(xenapi.VM.Destroy(session, vm))
-	for _, d := range owned {
-		check(xenapi.VDI.Destroy(session, d))
-	}
+	// Tidy up: destroy the VM (which removes its VBDs) and then its disks (VM.Destroy leaves VDIs
+	// behind), including the one just attached.
+	destroyVMAndDisks(session, vm)
 	fmt.Println("OK: attach-disk")
 	session.Logout()
 }
@@ -1483,17 +1950,19 @@ func vmBootConfig(url, user, password, templateName, newVMName string) {
 	session := connect(url, user, password)
 	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
 	check(err)
-	check(xenapi.VM.Provision(session, vm))
+	provision(session, vm)
 
 	check(xenapi.VM.SetVCPUsMax(session, vm, 4))
 	check(xenapi.VM.SetVCPUsAtStartup(session, vm, 2))
 
 	// Boot mode: firmware ("bios"/"uefi") lives in HVM_boot_params; Secure Boot in
-	// platform["secureboot"]. Switch to UEFI Secure Boot (as the New VM wizard does for a
-	// UEFI-capable template) and read it back.
+	// platform["secureboot"]. "auto" (not a hard-coded "true") is the real xe/XenCenter convention:
+	// xapi resolves it against whether the pool actually holds Secure Boot certificates, at
+	// VM.start time - a hard "true" would claim Secure Boot is on even on a template that was never
+	// set up for it, since set_platform does no validation of its own.
 	check(xenapi.VM.SetHVMBootParams(session, vm, map[string]string{"order": "cdn", "firmware": "uefi"}))
 	platform, _ := xenapi.VM.GetPlatform(session, vm)
-	platform["secureboot"] = "true"
+	platform["secureboot"] = "auto"
 	check(xenapi.VM.SetPlatform(session, vm, platform))
 	atStartup, _ := xenapi.VM.GetVCPUsAtStartup(session, vm)
 	max, _ := xenapi.VM.GetVCPUsMax(session, vm)
@@ -1501,9 +1970,10 @@ func vmBootConfig(url, user, password, templateName, newVMName string) {
 	bootParams, _ := xenapi.VM.GetHVMBootParams(session, vm)
 	fmt.Printf("Boot order: %s\n", bootParams["order"])
 	platform, _ = xenapi.VM.GetPlatform(session, vm)
-	fmt.Printf("Boot mode: firmware=%s, secureboot=%s\n", bootParams["firmware"], platform["secureboot"])
+	fmt.Printf("Boot mode: firmware=%s, secureboot=%s (resolved against pool certificates at boot)\n",
+		bootParams["firmware"], platform["secureboot"])
 
-	check(xenapi.VM.Destroy(session, vm))
+	destroyVMAndDisks(session, vm)
 	fmt.Println("OK: vm-boot-config")
 	session.Logout()
 }
@@ -1649,7 +2119,7 @@ func manageVif(url, user, password, templateName, newVMName string) {
 	session := connect(url, user, password)
 	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
 	check(err)
-	check(xenapi.VM.Provision(session, vm))
+	provision(session, vm)
 	nets, err := xenapi.Network.GetAll(session)
 	check(err)
 	netRef := nets[0]
@@ -1657,16 +2127,22 @@ func manageVif(url, user, password, templateName, newVMName string) {
 	check(err)
 	device := devices[0]
 
+	// A Go record sends every field, enums included, and a real host rejects an empty enum value
+	// (INTERNAL_ERROR "Unknown tag/contents"), so set the enums to the defaults xapi applies when
+	// they are left out.
 	vif, err := xenapi.VIF.Create(session, xenapi.VIFRecord{
 		VM: vm, Network: netRef, Device: device, MAC: "", MTU: 1500,
 		OtherConfig: map[string]string{}, QosAlgorithmParams: map[string]string{},
+		LockingMode:           xenapi.VifLockingModeNetworkDefault,
+		Ipv4ConfigurationMode: xenapi.VifIpv4ConfigurationModeNone,
+		Ipv6ConfigurationMode: xenapi.VifIpv6ConfigurationModeNone,
 	})
 	check(err)
 	vifs, _ := xenapi.VM.GetVIFs(session, vm)
 	fmt.Printf("Attached a VIF on device %s; VM now has %d NIC(s)\n", device, len(vifs))
 
 	check(xenapi.VIF.Destroy(session, vif))
-	check(xenapi.VM.Destroy(session, vm))
+	destroyVMAndDisks(session, vm)
 	fmt.Println("OK: manage-vif")
 	session.Logout()
 }
@@ -1743,7 +2219,7 @@ func convertToTemplate(url, user, password, templateName, newVMName string) {
 	session := connect(url, user, password)
 	vm, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
 	check(err)
-	check(xenapi.VM.Provision(session, vm)) // now a real (halted) VM
+	provision(session, vm) // now a real (halted) VM
 	isTemplate, _ := xenapi.VM.GetIsATemplate(session, vm)
 	fmt.Printf("is_a_template after provision: %v\n", isTemplate)
 
@@ -1752,7 +2228,7 @@ func convertToTemplate(url, user, password, templateName, newVMName string) {
 	isTemplate, _ = xenapi.VM.GetIsATemplate(session, vm)
 	fmt.Printf("is_a_template after convert:  %v\n", isTemplate)
 
-	check(xenapi.VM.Destroy(session, vm))
+	destroyVMAndDisks(session, vm)
 	fmt.Println("OK: convert-to-template")
 	session.Logout()
 }
@@ -1776,16 +2252,33 @@ func findByUUID(url, user, password, vmName string) {
 }
 
 // --- 41. Rolling pool update ---------------------------------------------------------
+// rollingPoolUpdate needs an enabled update repository the same way apply-update does - introduce
+// and attach a throwaway one, forget it again afterwards. Modern xapi (>=23.18.0) doesn't reboot a
+// host for you: it only records pending_guidances, so only reboot (or restart the toolstack) when
+// the applied batch actually asks for it.
 func rollingPoolUpdate(url, user, password string) {
 	session := connect(url, user, password)
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
-	hash, err := xenapi.Pool.SyncUpdates(session, pools[0], false, "", "", "", "")
+	pool := pools[0]
+	repo, err := xenapi.Repository.Introduce(session, "sdk-cdn", "SDK example repository",
+		"https://cdn.example/base", "https://cdn.example/source", true, "")
+	check(err)
+	// Remember the pool's own repositories, to put them back afterwards.
+	previous, perr := xenapi.Pool.GetRepositories(session, pool)
+	check(perr)
+	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{repo}))
+	defer func() {
+		check(xenapi.Pool.SetRepositories(session, pool, previous))
+		check(xenapi.Repository.Forget(session, repo))
+	}()
+
+	hash, err := xenapi.Pool.SyncUpdates5(session, pool, false, "", "")
 	check(err)
 	fmt.Printf("Synced updates; hash length %d\n", len(hash))
 
 	// The rolling pattern behind XenCenter's automated Install Updates:
-	// disable -> evacuate -> apply -> reboot -> re-enable, one host at a time.
+	// disable -> evacuate -> apply -> reboot (only if asked) -> re-enable, one host at a time.
 	hosts, err := xenapi.Host.GetAllRecords(session)
 	check(err)
 	for hostRef, host := range hosts {
@@ -1796,7 +2289,12 @@ func rollingPoolUpdate(url, user, password string) {
 		check(err) // apply the synced updates
 		guidance, _ := xenapi.Host.GetPendingGuidances(session, hostRef)
 		fmt.Printf("  applied; pending guidance = %v\n", guidance)
-		check(xenapi.Host.Reboot(session, hostRef)) // reboot into the updated software
+		switch {
+		case containsGuidance(guidance, xenapi.UpdateGuidancesRebootHost):
+			check(xenapi.Host.Reboot(session, hostRef)) // reboot into the updated software
+		case containsGuidance(guidance, xenapi.UpdateGuidancesRestartToolstack):
+			check(xenapi.Host.RestartAgent(session, hostRef))
+		}
 		check(xenapi.Host.Enable(session, hostRef)) // return the host to service
 	}
 	fmt.Println("OK: rolling-pool-update")
@@ -1850,7 +2348,6 @@ func crossPoolCopyVM(url, user, password, destURL, vmName string) {
 
 // Run it:
 //   findByUUID("https://xenserver", "root", password, "web-01")
-
 
 // Maps the <workflow> argument to the matching self-contained function above, supplying the concrete
 // objects each one operates on. In your own code you would call these functions directly (see the
@@ -1953,7 +2450,13 @@ func rrdMetrics(url, user, password string) {
 			case float64:
 				v = x
 			}
-			if v > peak[parts[2]] {
+			if v != v { // NaN: a gap in the series, not a real sample - never let it stick
+				continue
+			}
+			// A plain `v > peak[key]` relies on a zero-valued map default, so a real 0.0 reading
+			// (the common, unconfigured-PVS case) would never get inserted and the whole per-host
+			// loop would silently print nothing - track presence explicitly instead.
+			if cur, ok := peak[parts[2]]; !ok || v > cur {
 				peak[parts[2]] = v
 			}
 		}
@@ -2007,7 +2510,8 @@ func reclaimSpace(url, user, password string) {
 		map[string]string{"sr_uuid": sr.UUID})
 	check(err)
 	fmt.Printf("  reclaimed freed space on %s: %s\n", sr.NameLabel, result)
-	if result != "true" {
+	// Compare case-insensitively: a real host's trim plugin answers "True" (capitalised).
+	if strings.ToLower(strings.TrimSpace(result)) != "true" {
 		panic("trim plugin returned " + result)
 	}
 	fmt.Println("OK: reclaim-space")
@@ -2015,63 +2519,88 @@ func reclaimSpace(url, user, password string) {
 }
 
 // --- 46. Get a VM's IP address --------------------------------------------------------
-func vmIpAddress(url, user, password string) {
+// A VM that has only just started may not have reported in yet (no guest_metrics at all, or an
+// empty networks map) - retry for a while rather than giving up on the first look, the way XenRT's
+// own IP-discovery helpers do. The CLI version of this example already does this; timeoutStr and
+// intervalStr bring the SDK languages in line with it (seconds, as decimal strings).
+func vmIpAddress(url, user, password, timeoutStr, intervalStr string) {
+	timeout, err := strconv.Atoi(timeoutStr)
+	check(err)
+	interval, err := strconv.Atoi(intervalStr)
+	check(err)
 	session := connect(url, user, password)
 
-	// A running guest reports its IP in VM_guest_metrics.networks, keyed "<vif device>/ip".
-	vms, err := xenapi.VM.GetAllRecords(session)
-	check(err)
-	var vm xenapi.VMRecord
-	found := false
-	for _, r := range vms {
-		if r.PowerState == xenapi.VMPowerStateRunning && !r.IsATemplate && !r.IsControlDomain &&
-			r.GuestMetrics != xenapi.VMGuestMetricsRef("OpaqueRef:NULL") {
-			vm, found = r, true
+	deadline := time.Now().Add(time.Duration(timeout) * time.Second)
+	for {
+		// A running guest reports its IP in VM_guest_metrics.networks, keyed "<vif device>/ip".
+		vms, err := xenapi.VM.GetAllRecords(session)
+		check(err)
+		var vm xenapi.VMRecord
+		found := false
+		for _, r := range vms {
+			if r.PowerState == xenapi.VMPowerStateRunning && !r.IsATemplate && !r.IsControlDomain &&
+				r.GuestMetrics != xenapi.VMGuestMetricsRef("OpaqueRef:NULL") {
+				vm, found = r, true
+				break
+			}
+		}
+		var ip string
+		if found {
+			gm, err := xenapi.VMGuestMetrics.GetRecord(session, vm.GuestMetrics)
+			check(err)
+			ip = gm.Networks["0/ip"]
+		}
+		if ip != "" {
+			fmt.Printf("  %s: %s\n", vm.NameLabel, ip)
 			break
 		}
+		if time.Now().After(deadline) {
+			panic(fmt.Sprintf("no running guest reported an IP address within %ds", timeout))
+		}
+		time.Sleep(time.Duration(interval) * time.Second)
 	}
-	if !found {
-		panic("no running guest VM found")
-	}
-
-	gm, err := xenapi.VMGuestMetrics.GetRecord(session, vm.GuestMetrics)
-	check(err)
-	ip, ok := gm.Networks["0/ip"]
-	if !ok {
-		ip = "(no address reported)"
-	}
-	fmt.Printf("  %s: %s\n", vm.NameLabel, ip)
 	fmt.Println("OK: vm-ip-address")
 	session.Logout()
 }
 
 // --- 47. Manage Active Directory users ------------------------------------------------
-func manageAdUsers(url, user, password string) {
+// manageAdUsers joins AD, adds a user as a subject with an RBAC role, reads it back, then tidies
+// up. Needs a real, reachable AD domain controller - EnableExternalAuth fails at the very first
+// call (DNS/LDAP/Kerberos) without one, so domain/adminUser/adminPassword have to identify a real
+// domain to join. newUser is the account to grant a role to; its subject identity is looked up
+// against the directory just joined, so it has to be a real account there too. The simulator
+// models a single-user, domain-less fake directory (hence the empty domain default) - override
+// every one of these on a real pool.
+func manageAdUsers(url, user, password, domain, adminUser, adminPassword, newUser string) {
 	session := connect(url, user, password)
 
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
 	pool := pools[0]
 	check(xenapi.Pool.EnableExternalAuth(session, pool,
-		map[string]string{"user": "administrator", "pass": "secret", "ldaps": "false"}, "citrix.local", "AD"))
-	fmt.Println("Joined domain: citrix.local")
+		map[string]string{"user": adminUser, "pass": adminPassword, "ldaps": "false"}, domain, "AD"))
+	if domain != "" {
+		fmt.Printf("Joined domain: %s\n", domain)
+	} else {
+		fmt.Println("Joined domain: (none - simulator's fake directory)")
+	}
 
-	sid, err := xenapi.Auth.GetSubjectIdentifier(session, "alice@citrix.local")
+	subjectName := newUser
+	if domain != "" {
+		subjectName = newUser + "@" + domain
+	}
+	sid, err := xenapi.Auth.GetSubjectIdentifier(session, subjectName)
 	check(err)
 	info, err := xenapi.Auth.GetSubjectInformationFromIdentifier(session, sid)
 	check(err)
 	subject, err := xenapi.Subject.Create(session, xenapi.SubjectRecord{SubjectIdentifier: sid, OtherConfig: info})
 	check(err)
 
-	roles, err := xenapi.Role.GetAllRecords(session)
+	// role.get_by_name_label is simpler/more idiomatic than filtering get_all_records, and matches
+	// what `xe subject-role-add role-name=` does server-side.
+	roleRefs, err := xenapi.Role.GetByNameLabel(session, "pool-admin")
 	check(err)
-	var admin xenapi.RoleRef
-	for ref, r := range roles {
-		if r.NameLabel == "pool-admin" && len(r.Subroles) > 0 {
-			admin = ref
-			break
-		}
-	}
+	admin := roleRefs[0]
 	check(xenapi.Subject.AddToRoles(session, subject, admin))
 	assigned, err := xenapi.Subject.GetRoles(session, subject)
 	check(err)
@@ -2098,93 +2627,181 @@ func manageAdUsers(url, user, password string) {
 	session.Logout()
 }
 
+// firstXMLElement scans an XML document for the first element named tag, at any depth (the root
+// element name and nesting both vary by host/backend - the probe helpers below must not assume
+// either), and returns a map of its immediate child elements' tag name to text content.
+func firstXMLElement(xmlText, tag string) map[string]string {
+	decoder := xml.NewDecoder(strings.NewReader(xmlText))
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			panic(fmt.Sprintf("no <%s> element found in: %s", tag, xmlText))
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok || start.Name.Local != tag {
+			continue
+		}
+		var raw struct {
+			Fields []struct {
+				XMLName xml.Name
+				Value   string `xml:",chardata"`
+			} `xml:",any"`
+		}
+		check(decoder.DecodeElement(&raw, &start))
+		fields := map[string]string{}
+		for _, f := range raw.Fields {
+			fields[f.XMLName.Local] = f.Value
+		}
+		return fields
+	}
+}
+
+// chooseTargetIQN picks the IQN from an iSCSI discovery probe's XML: the caller's, if named (it must
+// be one the target offers), else the first. An array usually offers many targets - one per LUN,
+// often belonging to different users - so on shared storage always name yours: SR.create formats
+// the LUN behind it.
+func chooseTargetIQN(xmlText, target, targetIQN string) string {
+	var offered []string
+	decoder := xml.NewDecoder(strings.NewReader(xmlText))
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			break
+		}
+		if start, ok := tok.(xml.StartElement); ok && start.Name.Local == "TargetIQN" {
+			var iqn string
+			check(decoder.DecodeElement(&iqn, &start))
+			offered = append(offered, strings.TrimSpace(iqn))
+		}
+	}
+	if len(offered) == 0 {
+		panic(fmt.Sprintf("target %s offered no IQNs: %s", target, xmlText))
+	}
+	if targetIQN == "" {
+		return offered[0]
+	}
+	for _, iqn := range offered {
+		if iqn == targetIQN {
+			return iqn
+		}
+	}
+	panic(fmt.Sprintf("target %s does not offer IQN %s", target, targetIQN))
+}
+
 // --- 48. Create an iSCSI SR -----------------------------------------------------------
-func createIscsiSr(url, user, password string) {
+// Connect an SR to a LUN on the iSCSI target, discovering the IQN and the LUN the way the New SR
+// wizard and XenRT do: a device-config that's missing a piece makes the backend fail on purpose,
+// and the failure carries an XML fragment listing what it needs next.
+//
+// SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target: pass
+// targetIQN to name yours (see chooseTargetIQN).
+func createIscsiSr(url, user, password, target, port, chapUser, chapPassword, targetIQN, srName string) {
 	const GiB = 1024 * 1024 * 1024
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
-	dc := map[string]string{
-		"target":    "192.0.2.30",
-		"targetIQN": "iqn.2009-01.com.xenpretender:target-0",
-		"SCSIid":    "360a980004265656d5f4a2d63764e5734",
+	host := hosts[0]
+	dc := map[string]string{"target": target}
+	if port != "" {
+		dc["port"] = port
 	}
-	sr, err := xenapi.SR.Create(session, hosts[0], dc, 0, "sdk-iscsi-sr",
+	if chapUser != "" {
+		dc["chapuser"] = chapUser
+		dc["chappassword"] = chapPassword
+	}
+
+	// First failing probe: target only -> the backend lists the IQNs it offers.
+	dc["targetIQN"] = chooseTargetIQN(probeForFailure(session, host, dc, "lvmoiscsi"), target, targetIQN)
+	fmt.Printf("Discovered IQN: %s\n", dc["targetIQN"])
+
+	// Second failing probe: +targetIQN -> the backend lists the LUNs behind it. Real create also
+	// carries LUNid, which XenRT's own LUN-preparation helper always includes when known; fall
+	// back to the first LUN's list index (0) if the backend doesn't report one.
+	lun := firstXMLElement(probeForFailure(session, host, dc, "lvmoiscsi"), "LUN")
+	dc["SCSIid"] = lun["SCSIid"]
+	if id := lun["LUNid"]; id != "" {
+		dc["LUNid"] = id
+	} else {
+		dc["LUNid"] = "0"
+	}
+	fmt.Printf("Discovered LUN %s (SCSIid %s)\n", dc["LUNid"], dc["SCSIid"])
+
+	sr, err := xenapi.SR.Create(session, host, dc, 0, srName,
 		"iSCSI SR created by the SDK example", "lvmoiscsi", "user", true, map[string]string{})
 	check(err)
 	size, _ := xenapi.SR.GetPhysicalSize(session, sr)
 	uuid, _ := xenapi.SR.GetUUID(session, sr)
 	fmt.Printf("Created SR: %s (%d GiB)\n", uuid, size/GiB)
-	check(xenapi.SR.Forget(session, sr))
+	detachAndForgetSR(session, sr)
 	fmt.Println("OK: create-iscsi-sr")
 	session.Logout()
 }
 
 // --- 49. Create an SMB SR -------------------------------------------------------------
-func createSmbSr(url, user, password string) {
+// Connect a shared SR to an SMB/CIFS file share. The password travels as a Secret, not plaintext
+// device-config - the way XenRT and XenCenter both do it, and the only form seen in real captured
+// sr-create calls for this SR type.
+func createSmbSr(url, user, password, server, share, smbUsername, smbPassword, srName string) {
 	const GiB = 1024 * 1024 * 1024
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
+	host := hosts[0]
+
+	secret, err := xenapi.Secret.Create(session, xenapi.SecretRecord{
+		Value: smbPassword, OtherConfig: map[string]string{},
+	})
+	check(err)
+	secretUUID, err := xenapi.Secret.GetUUID(session, secret)
+	check(err)
 	dc := map[string]string{
-		"server":     "192.0.2.40",
-		"serverpath": "/vmstore",
-		"username":   "Administrator",
-		"password":   "Password1",
+		"server": server, "serverpath": share, "username": smbUsername,
+		"password_secret": secretUUID,
 	}
-	sr, err := xenapi.SR.Create(session, hosts[0], dc, 0, "sdk-smb-sr",
+	sr, err := xenapi.SR.Create(session, host, dc, 0, srName,
 		"SMB SR created by the SDK example", "smb", "user", true, map[string]string{})
 	check(err)
 	size, _ := xenapi.SR.GetPhysicalSize(session, sr)
 	uuid, _ := xenapi.SR.GetUUID(session, sr)
 	fmt.Printf("Created SR: %s (%d GiB)\n", uuid, size/GiB)
-	check(xenapi.SR.Forget(session, sr))
+	detachAndForgetSR(session, sr)
+	check(xenapi.Secret.Destroy(session, secret))
 	fmt.Println("OK: create-smb-sr")
 	session.Logout()
 }
 
 // --- 50. Create an HBA SR -------------------------------------------------------------
-func createHbaSr(url, user, password string) {
+// Connect a shared SR to a fibre-channel (HBA) LUN, discovering it the way the New SR wizard does:
+// probing with no SCSIid fails on purpose and lists every LUN the backend can see. The failure's
+// XML root element name and error code both vary by host/simulator build, so parse by tag name
+// BlockDevice wherever it occurs.
+//
+// SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
+func createHbaSr(url, user, password, srName string) {
 	const GiB = 1024 * 1024 * 1024
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
-	dc := map[string]string{"SCSIid": "360a980004265656d5f4a2d63764e5736"}
-	sr, err := xenapi.SR.Create(session, hosts[0], dc, 0, "sdk-hba-sr",
+	host := hosts[0]
+
+	device := firstXMLElement(probeForFailure(session, host, map[string]string{}, "lvmohba"), "BlockDevice")
+	fmt.Printf("Discovered LUN: SCSIid %s on %s\n", device["SCSIid"], device["path"])
+
+	// SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
+	// for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+	dc := map[string]string{"SCSIid": device["SCSIid"]}
+	sr, err := xenapi.SR.Create(session, host, dc, 0, srName,
 		"HBA SR created by the SDK example", "lvmohba", "user", true, map[string]string{})
 	check(err)
 	size, _ := xenapi.SR.GetPhysicalSize(session, sr)
 	uuid, _ := xenapi.SR.GetUUID(session, sr)
 	fmt.Printf("Created SR: %s (%d GiB)\n", uuid, size/GiB)
-	check(xenapi.SR.Forget(session, sr))
+	detachAndForgetSR(session, sr)
 	fmt.Println("OK: create-hba-sr")
 	session.Logout()
 }
 
-// --- 51. Create a GFS2 SR -------------------------------------------------------------
-func createGfs2Sr(url, user, password string) {
-	const GiB = 1024 * 1024 * 1024
-	session := connect(url, user, password)
-	hosts, err := xenapi.Host.GetAll(session)
-	check(err)
-	dc := map[string]string{
-		"provider":  "iscsi",
-		"target":    "192.0.2.30",
-		"targetIQN": "iqn.2009-01.com.xenpretender:target-0",
-		"SCSIid":    "360a980004265656d5f4a2d63764e5735",
-	}
-	sr, err := xenapi.SR.Create(session, hosts[0], dc, 0, "sdk-gfs2-sr",
-		"GFS2 SR created by the SDK example", "gfs2", "user", true, map[string]string{})
-	check(err)
-	size, _ := xenapi.SR.GetPhysicalSize(session, sr)
-	uuid, _ := xenapi.SR.GetUUID(session, sr)
-	fmt.Printf("Created SR: %s (%d GiB)\n", uuid, size/GiB)
-	check(xenapi.SR.Forget(session, sr))
-	fmt.Println("OK: create-gfs2-sr")
-	session.Logout()
-}
-
-// --- 52. Create an ISO library SR -----------------------------------------------------
+// --- 51. Create an ISO library SR -----------------------------------------------------
 func createIsoSr(url, user, password string) {
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
@@ -2195,59 +2812,82 @@ func createIsoSr(url, user, password string) {
 	check(err)
 	uuid, _ := xenapi.SR.GetUUID(session, sr)
 	fmt.Printf("Created ISO SR: %s\n", uuid)
-	check(xenapi.SR.Forget(session, sr))
+	detachAndForgetSR(session, sr)
 	fmt.Println("OK: create-iso-sr")
 	session.Logout()
 }
 
-// --- 53. Configure NRPE monitoring ----------------------------------------------------
+// --- 52. Configure NRPE monitoring ----------------------------------------------------
+// host.call_plugin is per-host - there is no pool-wide fan-out for plugin calls the way there is
+// for pool.enable_ssh - so configure every host in the pool, and restore each one to disabled
+// again afterwards.
 func configureNrpe(url, user, password string) {
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
-	host := hosts[0]
-	nrpe := func(fn string, args map[string]string) string {
-		r, e := xenapi.Host.CallPlugin(session, host, "nrpe", fn, args)
-		check(e)
-		return r
-	}
-	fmt.Printf("NRPE status before: %s\n", strings.TrimSpace(nrpe("status", map[string]string{})))
-	nrpe("enable", map[string]string{})
-	nrpe("set-config", map[string]string{"allowed_hosts": "127.0.0.1,::1,10.0.0.5", "debug": "0", "ssl_logging": "0x00"})
-	nrpe("restart", map[string]string{})
-	fmt.Printf("NRPE status after:  %s\n", strings.TrimSpace(nrpe("status", map[string]string{})))
-	for _, line := range strings.Split(nrpe("get-config", map[string]string{}), "\n") {
-		if strings.HasPrefix(line, "allowed_hosts:") {
-			fmt.Printf("Allowed hosts: %s\n", strings.TrimSpace(strings.SplitN(line, ":", 2)[1]))
+	for _, host := range hosts {
+		nrpe := func(fn string, args map[string]string) string {
+			r, e := xenapi.Host.CallPlugin(session, host, "nrpe", fn, args)
+			check(e)
+			return r
 		}
+		label, _ := xenapi.Host.GetNameLabel(session, host)
+		fmt.Printf("%s: NRPE status before: %s\n", label, strings.TrimSpace(nrpe("status", map[string]string{})))
+		nrpe("enable", map[string]string{})
+		nrpe("set-config", map[string]string{"allowed_hosts": "127.0.0.1,::1,10.0.0.5", "debug": "0", "ssl_logging": "0x00"})
+		nrpe("restart", map[string]string{})
+		fmt.Printf("  status after:  %s\n", strings.TrimSpace(nrpe("status", map[string]string{})))
+		for _, line := range strings.Split(nrpe("get-config", map[string]string{}), "\n") {
+			if strings.HasPrefix(line, "allowed_hosts:") {
+				fmt.Printf("  allowed hosts: %s\n", strings.TrimSpace(strings.SplitN(line, ":", 2)[1]))
+			}
+		}
+		nrpe("disable", map[string]string{}) // restore: leave it as we found it
 	}
 	fmt.Println("OK: configure-nrpe")
 	session.Logout()
 }
 
-// --- 54. Configure SNMP monitoring ----------------------------------------------------
-func configureSnmp(url, user, password string) {
+// --- 53. Configure SNMP monitoring ----------------------------------------------------
+// nmss is the list of real trap destinations SNMP notifications go to - an empty list never
+// configures where traps actually go, which is the whole point of "configure SNMP monitoring".
+// Plugin calls are per-host, so configure every host, and restore each one to disabled again
+// afterwards, the way XenRT's own SNMPServer.disable() does.
+func configureSnmp(url, user, password, trapDestination string) {
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
-	host := hosts[0]
-	snmp := func(fn string, args map[string]string) map[string]interface{} {
-		r, e := xenapi.Host.CallPlugin(session, host, "snmp", fn, args)
-		check(e)
-		var env map[string]interface{}
-		check(json.Unmarshal([]byte(r), &env))
-		return env
-	}
 	config := `{"common":{"enabled":"yes","debug_log":"no"},` +
 		`"agent":{"v2c":"yes","v3":"no","community":"sdk-community","user_name":"",` +
 		`"authentication_password":"","authentication_protocol":"",` +
-		`"privacy_password":"","privacy_protocol":""},"nmss":[]}`
-	snmp("set-config", map[string]string{"config": config})
-	status := snmp("status", map[string]string{})["result"].(map[string]interface{})
-	cfg := snmp("get-config", map[string]string{})["result"].(map[string]interface{})
-	agent := cfg["agent"].(map[string]interface{})
-	fmt.Printf("SNMP enabled: %v / %v\n", status["enabled"], status["active"])
-	fmt.Printf("Community: %v\n", agent["community"])
+		`"privacy_password":"","privacy_protocol":""},"nmss":[{"address":"` + trapDestination + `",` +
+		`"port":162,"v2c":"yes","v3":"no","community":"sdk-community","user_name":"",` +
+		`"authentication_password":"","authentication_protocol":"",` +
+		`"privacy_password":"","privacy_protocol":""}]}`
+	for _, host := range hosts {
+		snmp := func(fn string, args map[string]string) map[string]interface{} {
+			r, e := xenapi.Host.CallPlugin(session, host, "snmp", fn, args)
+			check(e)
+			var env map[string]interface{}
+			check(json.Unmarshal([]byte(r), &env))
+			return env
+		}
+		snmp("set-config", map[string]string{"config": config})
+		status := snmp("status", map[string]string{})["result"].(map[string]interface{})
+		cfg := snmp("get-config", map[string]string{})["result"].(map[string]interface{})
+		agent := cfg["agent"].(map[string]interface{})
+		nmss, _ := cfg["nmss"].([]interface{})
+		label, _ := xenapi.Host.GetNameLabel(session, host)
+		fmt.Printf("%s: SNMP enabled: %v / %v\n", label, status["enabled"], status["active"])
+		trap := "(none)"
+		if len(nmss) > 0 {
+			if first, ok := nmss[0].(map[string]interface{}); ok {
+				trap = fmt.Sprintf("%v", first["address"])
+			}
+		}
+		fmt.Printf("  community: %v, trap destination: %s\n", agent["community"], trap)
+		snmp("set-config", map[string]string{"config": `{"common":{"enabled":"no"}}`}) // restore
+	}
 	fmt.Println("OK: configure-snmp")
 	session.Logout()
 }
@@ -2311,6 +2951,13 @@ func attachUsbDevice(url, user, password, vmName string) {
 	attached, _ := xenapi.VM.GetVUSBs(session, vm)
 	fmt.Printf("Attached:       %d device(s)\n", len(attached))
 
+	// VUSB.Destroy refuses a VUSB that is still attached (OPERATION_NOT_ALLOWED) - on a running VM
+	// it gets plugged in as soon as it's created, so unplug it first.
+	vusbRecord, err := xenapi.VUSB.GetRecord(session, vusb)
+	check(err)
+	if vusbRecord.CurrentlyAttached {
+		check(xenapi.VUSB.Unplug(session, vusb))
+	}
 	check(xenapi.VUSB.Destroy(session, vusb))
 	check(xenapi.PUSB.SetPassthroughEnabled(session, pusbRef, false))
 	fmt.Println("OK: attach-usb-device")
@@ -2318,10 +2965,13 @@ func attachUsbDevice(url, user, password, vmName string) {
 }
 
 // --- Read workload-balancing recommendations ----------------------------------------------
-func wlbRecommendations(url, user, password, vmName string) {
+// wlbRecommendations needs a real, reachable WLB appliance: pool.InitializeWlb makes a synchronous
+// HTTP call to it and raises WLB_CONNECTION_REFUSED/WLB_CONNECTION_RESET if it can't connect -
+// there is no way to fake this with a placeholder. wlbHostPort is host:port, with no URL scheme -
+// that is the real wire format (xe pool-initialize-wlb wlb_url="10.x.x.x:30601" ...), not a URL.
+func wlbRecommendations(url, user, password, vmName, wlbHostPort, wlbUsername, wlbPassword string) {
 	session := connect(url, user, password)
-	check(xenapi.Pool.InitializeWlb(session, "https://wlb.example:8012", "wlbuser", "wlbpass",
-		user, password))
+	check(xenapi.Pool.InitializeWlb(session, wlbHostPort, wlbUsername, wlbPassword, user, password))
 
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
@@ -2413,6 +3063,12 @@ func configureClustering(url, user, password string) {
 }
 
 // --- Manage pool membership --------------------------------------------------------------
+// managePoolMembership lists the pool's hosts, promotes a different coordinator, then promotes
+// the original back. designate_new_master runs a two-phase commit across every host and ends by
+// restarting xapi pool-wide (the new coordinator becomes master, every other host becomes its
+// slave) - so the session this call was made on, and the connection itself, do not survive it.
+// Reconnect (with a bounded wait) before touching the pool again, rather than assuming the session
+// is still good, and re-resolve pool/host refs from the fresh session each time.
 func managePoolMembership(url, user, password string) {
 	session := connect(url, user, password)
 	pools, err := xenapi.Pool.GetAll(session)
@@ -2436,17 +3092,31 @@ func managePoolMembership(url, user, password string) {
 		}
 		fmt.Printf("  member: %s%s\n", hn, suffix)
 	}
+	otherName, _ := xenapi.Host.GetNameLabel(session, other)
 
 	// Promote another member. The pool database moves with the role and clients are redirected, so this
 	// briefly interrupts management traffic — it does not move any VM.
 	check(xenapi.Pool.DesignateNewMaster(session, other))
-	otherName, _ := xenapi.Host.GetNameLabel(session, other)
-	fmt.Printf("Promoted:    %s\n", otherName)
+	fmt.Printf("Promoting:   %s (xapi restarts pool-wide; reconnecting)\n", otherName)
+
+	session = reconnectAfterMasterChange(url, user, password)
+	pools, err = xenapi.Pool.GetAll(session)
+	check(err)
+	master, _ := xenapi.Pool.GetMaster(session, pools[0])
+	masterName, _ := xenapi.Host.GetNameLabel(session, master)
+	fmt.Printf("Promoted:    %s\n", masterName)
 
 	// Put it back. Ejecting a member (Pool.Eject) is the other half of this surface and is deliberately
 	// not shown: it cannot be undone from the pool, because rejoining is initiated by the ejected host.
 	check(xenapi.Pool.DesignateNewMaster(session, original))
-	fmt.Printf("Restored:    %s\n", name)
+	fmt.Printf("Restoring:   %s (reconnecting again)\n", name)
+
+	session = reconnectAfterMasterChange(url, user, password)
+	pools, err = xenapi.Pool.GetAll(session)
+	check(err)
+	master, _ = xenapi.Pool.GetMaster(session, pools[0])
+	masterName, _ = xenapi.Host.GetNameLabel(session, master)
+	fmt.Printf("Restored:    %s\n", masterName)
 
 	fmt.Println("OK: manage-pool-membership")
 	session.Logout()
@@ -2544,7 +3214,16 @@ func configurePvsAccelerator(url, user, password string) {
 	check(err)
 	fmt.Printf("  %s: %s\n", vm.NameLabel, status)
 
-	// Forgetting the site takes its servers, caches and proxies with it.
+	// Forgetting the site only cascades its cache storage - a running proxy or a server it still
+	// has makes forget refuse with PVS_SITE_CONTAINS_RUNNING_PROXIES/_SERVERS, so tear those down
+	// ourselves first, in the same order every real PVS teardown uses. (Cache storage doesn't need
+	// a separate call - forget cascades it correctly.)
+	check(xenapi.PVSProxy.Destroy(session, proxy))
+	servers, err := xenapi.PVSSite.GetServers(session, site)
+	check(err)
+	for _, server := range servers {
+		check(xenapi.PVSServer.Forget(session, server))
+	}
 	check(xenapi.PVSSite.Forget(session, site))
 	fmt.Println("OK: configure-pvs-accelerator")
 }
@@ -2609,10 +3288,9 @@ func manageSSHAccess(url, user, password string) {
 	check(err)
 
 	// Timed access is the point: set the timeout first and the server stamps an expiry when SSH is
-	// enabled, so a window opened for troubleshooting closes itself.
-	for _, host := range hosts {
-		check(xenapi.Host.SetSSHEnabledTimeout(session, host, 3600))
-	}
+	// enabled, so a window opened for troubleshooting closes itself. This is itself a pool-wide
+	// fan-out call, exactly like EnableSSH/DisableSSH - no need to loop hosts for it either.
+	check(xenapi.Pool.SetSSHEnabledTimeout(session, pools[0], 3600))
 
 	// The pool call fans out to every host, so there is no need to loop for the enable itself.
 	check(xenapi.Pool.EnableSSH(session, pools[0]))
@@ -2744,13 +3422,20 @@ func changedBlockTracking(url, user, password string) {
 	}
 	fmt.Printf("Backing up %s\n", record.NameLabel)
 
+	// CBT is switched on for the VM's own disk, and every snapshot taken from then on inherits it. It
+	// can't be switched on for a snapshot's disk after the fact (OPERATION_NOT_ALLOWED).
+	live := firstDisk(session, vm)
+	wasEnabled, err := xenapi.VDI.GetCbtEnabled(session, live)
+	check(err)
+	if !wasEnabled {
+		check(xenapi.VDI.EnableCbt(session, live))
+	}
+
 	first, err := xenapi.VM.Snapshot(session, vm, "cbt-backup-1", nil)
 	check(err)
 	second, err := xenapi.VM.Snapshot(session, vm, "cbt-backup-2", nil)
 	check(err)
 	vdiFrom, vdiTo := firstDisk(session, first), firstDisk(session, second)
-	check(xenapi.VDI.EnableCbt(session, vdiFrom))
-	check(xenapi.VDI.EnableCbt(session, vdiTo))
 
 	// One bit per 64 KiB block, base64-encoded; bit N set means block N changed. A real backup reads
 	// only those blocks, over NBD.
@@ -2768,7 +3453,9 @@ func changedBlockTracking(url, user, password string) {
 		changed, len(bitmap)*8, float64(changed)*64/1024, float64(size)/(1024*1024))
 
 	// Release the older snapshot's blocks but keep its change metadata, so the next incremental can
-	// still diff against it. The VDI record stays; its type changes.
+	// still diff against it. DataDestroy refuses a disk that a VM still uses (VDI_IN_USE), so drop the
+	// older snapshot's VM record first, as a backup tool does. The VDI record stays; its type changes.
+	check(xenapi.VM.Destroy(session, first))
 	check(xenapi.VDI.DataDestroy(session, vdiFrom))
 	vdiType, err := xenapi.VDI.GetType(session, vdiFrom)
 	check(err)
@@ -2776,8 +3463,13 @@ func changedBlockTracking(url, user, password string) {
 	check(err)
 	fmt.Printf("  older snapshot is now type=%s, still cbt_enabled=%t\n", vdiType, stillTracked)
 
-	check(xenapi.VM.Destroy(session, first))
-	check(xenapi.VM.Destroy(session, second))
+	// Tidy up: the newer snapshot and its disk, the metadata-only VDI, and CBT on the VM's own disk if
+	// this example switched it on.
+	destroyVMAndDisks(session, second)
+	check(xenapi.VDI.Destroy(session, vdiFrom))
+	if !wasEnabled {
+		check(xenapi.VDI.DisableCbt(session, live))
+	}
 	fmt.Println("OK: changed-block-tracking")
 }
 
@@ -2849,27 +3541,49 @@ func exportImportVm(url, user, password string) {
 	}
 	fmt.Printf("  archive holds %s and %d disk block(s)\n", names[0], blocks-1)
 
+	// The imported VM's ref is NOT in the /import response body on a real host (only this
+	// simulator's convenience echoes it there) - the only place it appears is the task named in the
+	// task_id query parameter, so create one, pass it, and read task.get_result() once the upload
+	// finishes (the same <value>...</value> string-strip wait-for-task already uses).
+	task, err := xenapi.Task.Create(session, "vm_import", "importing "+record.NameLabel+" back")
+	check(err)
+	defer xenapi.Task.Destroy(session, task)
+
 	archive, err := os.Open(path)
 	check(err)
 	request, err := http.NewRequest(http.MethodPut,
-		fmt.Sprintf("%s/import?session_id=%s", url, sid), archive)
+		fmt.Sprintf("%s/import?session_id=%s&task_id=%s", url, sid, task), archive)
 	check(err)
 	info, err := archive.Stat()
 	check(err)
 	request.ContentLength = info.Size()
 	putResp, err := insecureClient().Do(request)
 	check(err)
-	body, err := io.ReadAll(putResp.Body)
-	check(err)
+	io.Copy(io.Discard, putResp.Body)
 	putResp.Body.Close()
 	archive.Close()
 
-	imported := xenapi.VMRef(strings.TrimSpace(string(body)))
+	for {
+		status, err := xenapi.Task.GetStatus(session, task)
+		check(err)
+		if status != xenapi.TaskStatusTypePending {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if status, _ := xenapi.Task.GetStatus(session, task); status != xenapi.TaskStatusTypeSuccess {
+		errInfo, _ := xenapi.Task.GetErrorInfo(session, task)
+		panic(fmt.Sprintf("import failed: %v", errInfo))
+	}
+	result, err := xenapi.Task.GetResult(session, task)
+	check(err)
+	imported := xenapi.VMRef(strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(result, "<value>", ""), "</value>", "")))
 	name, err := xenapi.VM.GetNameLabel(session, imported)
 	check(err)
 	fmt.Printf("  imported as %s\n", name)
 
-	check(xenapi.VM.Destroy(session, imported))
+	// The import brought its own disks along; destroy those too, not just the VM record.
+	destroyVMAndDisks(session, imported)
 	check(os.Remove(path))
 	fmt.Println("OK: export-import-vm")
 }
@@ -3030,6 +3744,12 @@ func manageVmMedia(url, user, password string) {
 }
 
 // --- Back up a host's configuration ---
+// Both /host_backup and /host_restore are served only by whichever host physically accepted the
+// HTTP connection - the handler ignores any ref= in the query string entirely, there is no
+// forwarding to another pool member. So backing up/restoring a host means opening the connection
+// to THAT host's own address, not to the pool's (coordinator) url - a restore sent to the wrong
+// host's connection silently restores the WRONG host, not the one named by ref=. ref= is kept in
+// the query string purely for log-readability (a real host ignores it).
 func backupHostConfig(url, user, password string) {
 	session := connect(url, user, password)
 	defer session.Logout()
@@ -3039,6 +3759,9 @@ func backupHostConfig(url, user, password string) {
 	host := hosts[0]
 	name, err := xenapi.Host.GetNameLabel(session, host)
 	check(err)
+	address, err := xenapi.Host.GetAddress(session, host)
+	check(err)
+	hostAddr := hostURL(url, address)
 	fmt.Printf("Backing up %s\n", name)
 
 	// Backup and restore are HTTP transfers alongside the API, not API calls, so the session id travels
@@ -3050,7 +3773,7 @@ func backupHostConfig(url, user, password string) {
 	temp.Close()
 
 	resp, err := insecureClient().Get(
-		fmt.Sprintf("%s/host_backup?session_id=%s&ref=%s", url, sid, host))
+		fmt.Sprintf("%s/host_backup?session_id=%s&ref=%s", hostAddr, sid, host))
 	check(err)
 	backup, err := io.ReadAll(resp.Body)
 	check(err)
@@ -3058,21 +3781,41 @@ func backupHostConfig(url, user, password string) {
 	check(os.WriteFile(path, backup, 0o600))
 	fmt.Printf("  wrote %d bytes to %s\n", len(backup), filepath.Base(path))
 
-	fmt.Printf("  restoring it to %s: %s\n", name, restoreHostConfig(session, url, sid, host, backup))
+	fmt.Printf("  restoring it to %s: %s\n", name, restoreHostConfig(session, hostAddr, sid, host, backup))
 	if len(hosts) > 1 {
-		// The refusal is the half worth rehearsing: restoring one host's configuration onto another is
-		// destructive and unrecoverable, so the pool checks rather than trusting the caller.
-		other, err := xenapi.Host.GetNameLabel(session, hosts[1])
+		other := hosts[1]
+		otherName, err := xenapi.Host.GetNameLabel(session, other)
 		check(err)
-		fmt.Printf("  restoring it to %s: %s\n", other,
-			restoreHostConfig(session, url, sid, hosts[1], backup))
+		otherAddress, err := xenapi.Host.GetAddress(session, other)
+		check(err)
+		otherURL := hostURL(url, otherAddress)
+		// The refusal is the half worth rehearsing: restoring one host's configuration onto another is
+		// destructive and unrecoverable, so the pool checks rather than trusting the caller. Guard
+		// against a transport error with a friendly message instead of letting the whole example
+		// fail - a real pool's hosts are all reachable from a management client, so this only
+		// matters in topologies (like this simulator fixture) where a second host's address isn't
+		// actually routable from the caller.
+		fmt.Printf("  restoring it to %s: %s\n", otherName,
+			safeRestoreHostConfig(session, otherURL, sid, other, backup))
 	}
 
 	check(os.Remove(path))
 	fmt.Println("OK: backup-host-config")
 }
 
-// restoreHostConfig uploads a backup to a host and reports what the task says about it.
+// safeRestoreHostConfig calls restoreHostConfig but turns any transport error into a friendly
+// message instead of letting the whole example fail.
+func safeRestoreHostConfig(session *xenapi.Session, hostURL, sid string, host xenapi.HostRef, backup []byte) (result string) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = fmt.Sprintf("could not connect to %s directly (%v)", hostURL, r)
+		}
+	}()
+	return restoreHostConfig(session, hostURL, sid, host, backup)
+}
+
+// restoreHostConfig uploads a backup to a host - over a connection opened to THAT host's own
+// address - and reports what the task says about it.
 //
 // An upload answers 200 as soon as it has read the request headers, because the client waits for that
 // before it starts sending the file. The outcome therefore cannot be in the status line: it arrives on a
@@ -3286,10 +4029,18 @@ func serverStatusReport(url, user, password string) {
 	whole := fetchStatusReport(url, sid, keys)
 	fmt.Printf("everything (%d sections): %d bytes\n", len(keys), whole)
 
-	// Worth checking rather than assuming: a server that ignored the selection would look identical from
-	// here until someone opened the archive and found the whole thing.
-	subset := fetchStatusReport(url, sid, []string{"xenserver-config"})
-	fmt.Printf("xenserver-config only:   %d bytes\n", subset)
+	// Pick a real, small section from the host's own catalogue rather than assuming a name: the
+	// catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
+	// list, and "xenserver-config" isn't one of the real keys any host actually publishes.
+	subsetKey := keys[0]
+	for _, k := range keys {
+		if k == "firstboot" || k == "network-status" {
+			subsetKey = k
+			break
+		}
+	}
+	subset := fetchStatusReport(url, sid, []string{subsetKey})
+	fmt.Printf("%s only:   %d bytes\n", subsetKey, subset)
 	if subset >= whole {
 		fmt.Println("  ERROR: selecting fewer sections did not produce a smaller bundle")
 	}
@@ -3312,14 +4063,31 @@ func fetchStatusReport(url, sid string, entries []string) int {
 //   serverStatusReport("https://xenserver", "root", password)
 
 // --- Recover VMs after a disaster ---
-func disasterRecovery(url, user, password string) {
+// Disaster recovery works by writing the pool's own database out to a storage repository as a disk
+// of type "metadata". That disk can be read back as a SEPARATE database, so the ordinary calls
+// describe the pool as it was replicated rather than the pool you are connected to. Recovering
+// reads from that database and writes into a live pool, which is why the recover call is made on
+// the metadata session and takes a live session as its destination.
+//
+// That destination has to be a DIFFERENT, standby pool: recovering a VM back into the exact pool
+// it was replicated from can't actually succeed with force=false - the VM's uuid already exists
+// there, so VM.recover always takes the replace-or-fail path, and nothing replicated a moment ago
+// from a live database can ever be "newer" than the live object it came from
+// (VM_TO_IMPORT_IS_NOT_NEWER_VERSION). The one-line "fix" of passing force=true instead would make
+// it succeed by REPLACING (destroying and recreating) the live original - exactly the opposite of
+// what a DR demo should show, and the thing that would actually destroy a live VM if ever pointed
+// at the same pool it replicated from. A second pool is the only way force=false succeeds, and
+// what every real DR workflow actually does. Track the recovered VM by uuid, never by name: a
+// name can coincidentally collide with something already on the destination pool.
+func disasterRecovery(url, user, password, drURL string) {
+	if drURL == "" {
+		panic("disaster-recovery needs a second pool to recover into: pass dr_url=<url of a standby pool>")
+	}
 	session := connect(url, user, password)
 	defer session.Logout()
+	drSession := connect(drURL, user, password)
+	defer drSession.Logout()
 
-	// Disaster recovery works by writing the pool's own database out to a storage repository as a disk of
-	// type "metadata". That disk can be read back as a SEPARATE database, so the ordinary calls describe
-	// the pool as it was replicated rather than the pool you are connected to.
-	//
 	// Replication needs storage every host can reach and that can hold data. The server checks rather
 	// than taking your word for it, so ask before enabling.
 	srs, err := xenapi.SR.GetAllRecords(session)
@@ -3352,40 +4120,51 @@ func disasterRecovery(url, user, password string) {
 	check(err)
 
 	// The Go binding keeps its session private and offers no way to build one from a session id it did
-	// not create, so the metadata database has to be driven over plain JSON-RPC. Same reason the live
-	// session id is obtained separately: recover() needs one to say where the VM should land.
-	liveSession := rawLogin(url, user, password)
+	// not create, so the metadata database has to be driven over plain JSON-RPC. Same reason the
+	// destination pool's session id is obtained separately: recover() needs one to say where the VM
+	// should land.
+	drSessionID := rawLogin(drURL, user, password)
 	var recoverable map[string]struct {
-		NameLabel string `json:"name_label"`
+		UUID            string `json:"uuid"`
+		NameLabel       string `json:"name_label"`
+		IsATemplate     bool   `json:"is_a_template"`
+		IsControlDomain bool   `json:"is_control_domain"`
+		IsASnapshot     bool   `json:"is_a_snapshot"`
 	}
 	check(json.Unmarshal(rawRPC(url, "VM.get_all_records", string(metadataSession)), &recoverable))
-	fmt.Printf("  the replicated database describes %d recoverable VM(s)\n", len(recoverable))
 
+	// Only real guest VMs are recoverable - exclude templates, control domains and snapshots.
 	targets := make([]string, 0, len(recoverable))
-	for ref := range recoverable {
-		targets = append(targets, ref)
+	for ref, r := range recoverable {
+		if !r.IsATemplate && !r.IsControlDomain && !r.IsASnapshot {
+			targets = append(targets, ref)
+		}
 	}
+	fmt.Printf("  the replicated database describes %d recoverable VM(s)\n", len(targets))
+
 	sort.Slice(targets, func(i, j int) bool {
 		return recoverable[targets[i]].NameLabel < recoverable[targets[j]].NameLabel
 	})
 	target := targets[0]
+	targetUUID := recoverable[target].UUID
 	name := recoverable[target].NameLabel
 	fmt.Printf("  recovering %s\n", name)
 
-	// Both calls run on the METADATA session; the live session says where the VM should land.
-	rawRPC(url, "VM.assert_can_be_recovered", string(metadataSession), target, liveSession)
-	rawRPC(url, "VM.recover", string(metadataSession), target, liveSession, false)
+	// Both calls run on the METADATA session; session_to says where the VM should land - the
+	// STANDBY pool's session, not this one. Never force=true: see the doc comment above.
+	rawRPC(url, "VM.assert_can_be_recovered", string(metadataSession), target, drSessionID)
+	rawRPC(url, "VM.recover", string(metadataSession), target, drSessionID, false)
 
-	// It is a real VM in the live pool now, not merely a call that returned.
-	live, err := xenapi.VM.GetAllRecords(session)
+	// It is a real VM on the standby pool now, not merely a call that returned - look it up by the
+	// uuid full_restore preserved, never by name.
+	recovered, err := xenapi.VM.GetByUUID(drSession, targetUUID)
 	check(err)
-	for ref, r := range live {
-		if r.NameLabel == name {
-			fmt.Printf("  %s is %s in the live pool\n", name, r.PowerState)
-			check(xenapi.VM.Destroy(session, ref))
-			break
-		}
-	}
+	ps, _ := xenapi.VM.GetPowerState(drSession, recovered)
+	fmt.Printf("  %s is %s on the standby pool\n", name, ps)
+
+	// Tidy up on the standby pool only, by uuid - never touch the source pool's VMs, and never guess
+	// by name (a coincidentally-same-named VM must not be destroyed).
+	destroyVMAndDisks(drSession, recovered)
 
 	check(xenapi.SR.DisableDatabaseReplication(session, sr))
 	fmt.Println("OK: disaster-recovery")
@@ -3436,17 +4215,25 @@ func manageSecurebootCertificates(url, user, password string) {
 	fmt.Printf("  pool holds certificates:  %t\n", certs != "")
 
 	// A guest whose certificates have gone stale. Its state is what a client gates the flag/unflag
-	// actions on, so it is the field to watch.
+	// actions on, so it is the field to watch. This is a deliberately-provisioned state, not one a
+	// normally-provisioned Secure Boot guest is ever in - report and stop cleanly when no VM needs
+	// it, rather than failing with a bare lookup error.
 	vms, err := xenapi.VM.GetAllRecords(session)
 	check(err)
 	var vm xenapi.VMRef
 	var name string
+	found := false
 	for ref, r := range vms {
 		if !r.IsATemplate && !r.IsControlDomain && !r.IsASnapshot &&
 			r.SecurebootCertificatesState == xenapi.VMSecurebootCertificatesStateUpdateAvailable {
-			vm, name = ref, r.NameLabel
+			vm, name, found = ref, r.NameLabel, true
 			break
 		}
+	}
+	if !found {
+		fmt.Println("No guest needs a Secure Boot certificate refresh right now.")
+		fmt.Println("OK: manage-secureboot-certificates")
+		return
 	}
 	vmReadiness, err := xenapi.VM.GetSecurebootReadiness(session, vm)
 	check(err)
@@ -3504,18 +4291,37 @@ func restartHost(url, user, password string) {
 
 	// Evacuate moves the guests elsewhere in the pool. Afterwards only the control domain - the host's
 	// own management VM, which cannot move - is left.
-	check(xenapi.Host.Evacuate(session, host, "", 0))
+	check(xenapi.Host.Evacuate2(session, host))
 	fmt.Printf("  evacuated:  guests=%d\n", guestCount(session, host))
 
 	check(xenapi.Host.Reboot(session, host))
+	// A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long
+	// as XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the
+	// reboot to get underway, then explicitly re-enables - disabling does not clear itself, not even
+	// across a reboot, so nothing else brings the host back into service.
+	time.Sleep(5 * time.Second)
+	check(xenapi.Host.Enable(session, host))
 	enabled, _ = xenapi.Host.GetEnabled(session, host)
-	fmt.Printf("  rebooted:   enabled=%t\n", enabled)
+	fmt.Printf("  rebooted, re-enabled: enabled=%t\n", enabled)
 
-	// The other ending: off, and back on out of band.
-	check(xenapi.Host.Shutdown(session, host))
-	fmt.Printf("  shut down:  live=%t\n", hostLive(session, host))
-	check(xenapi.Host.PowerOn(session, host))
-	fmt.Printf("  powered on: live=%t\n", hostLive(session, host))
+	// The other ending: off, and back on out of band - but only demonstrated if that is actually
+	// configured (host.power_on has no fallback and simply fails if no mechanism is configured or
+	// working), and waiting for each transition before starting the next.
+	mode, _ := xenapi.Host.GetPowerOnMode(session, host)
+	if mode != "" {
+		check(xenapi.Host.Disable(session, host, false))
+		check(xenapi.Host.Shutdown(session, host))
+		waitForHostLive(session, host, false)
+		fmt.Printf("  shut down:  live=%t\n", hostLive(session, host))
+		check(xenapi.Host.PowerOn(session, host))
+		waitForHostLive(session, host, true)
+		fmt.Printf("  powered on: live=%t\n", hostLive(session, host))
+		check(xenapi.Host.Enable(session, host))
+		enabled, _ = xenapi.Host.GetEnabled(session, host)
+		fmt.Printf("  re-enabled: enabled=%t\n", enabled)
+	} else {
+		fmt.Println("  skipping shutdown/power-on: no out-of-band power-on mode is configured on this host")
+	}
 
 	fmt.Println("OK: restart-host")
 }
@@ -3549,32 +4355,32 @@ func vmFromSnapshot(url, user, password, vmName string) {
 	session := connect(url, user, password)
 	defer session.Logout()
 
-	// A snapshot is a VM record with is_a_snapshot set, so both of these are clones of it - the
-	// difference is only what you mark the result as.
+	// A snapshot is a VM record with is_a_snapshot (and is_a_template) set, and cloning it gives a custom
+	// template that stands on its own while the snapshot stays put.
 	vm := vmByName(session, vmName)
 	snapshot, err := xenapi.VM.Snapshot(session, vm, "sdk-example-source-snapshot", nil)
 	check(err)
 	fmt.Printf("Snapshot of %s taken\n", vmName)
 
-	// A clone of a snapshot is an ordinary VM. Worth reading back rather than assuming: a result still
-	// flagged as a snapshot would be filed under the original VM instead of standing on its own, and
-	// would not appear in a VM listing at all.
+	// A clone of a snapshot is a template, not another snapshot: it stands on its own instead of being
+	// filed under the original VM. Provision it to get an ordinary VM you can start.
 	newVM, err := xenapi.VM.Clone(session, snapshot, "sdk-example-vm-from-snapshot")
 	check(err)
+	provision(session, newVM)
 	newName, _ := xenapi.VM.GetNameLabel(session, newVM)
-	isSnap, _ := xenapi.VM.GetIsASnapshot(session, newVM)
-	fmt.Printf("  new VM:      %s (is_a_snapshot=%t)\n", newName, isSnap)
+	newIsTmpl, _ := xenapi.VM.GetIsATemplate(session, newVM)
+	fmt.Printf("  new VM:      %s (is_a_template=%t)\n", newName, newIsTmpl)
 
-	// The same clone, marked as a template instead: a starting point to stamp more VMs from.
+	// Another clone, left as the template it already is: a starting point to stamp more VMs from.
 	template, err := xenapi.VM.Clone(session, snapshot, "sdk-example-template-from-snapshot")
 	check(err)
-	check(xenapi.VM.SetIsATemplate(session, template, true))
 	tmplName, _ := xenapi.VM.GetNameLabel(session, template)
 	isTmpl, _ := xenapi.VM.GetIsATemplate(session, template)
 	fmt.Printf("  new template:%s (is_a_template=%t)\n", tmplName, isTmpl)
 
+	// Each clone made its own disks, and the snapshot has its own snapshot disks; destroy them all.
 	for _, ref := range []xenapi.VMRef{newVM, template, snapshot} {
-		check(xenapi.VM.Destroy(session, ref))
+		destroyVMAndDisks(session, ref)
 	}
 	fmt.Println("OK: vm-from-snapshot")
 }
@@ -3843,7 +4649,11 @@ func configureHostStorage(url, user, password string) {
 	fmt.Printf("  IQN now:      %s\n", iqn)
 	fmt.Printf("  multipathing: %t\n", multipathing)
 
-	check(xenapi.Host.SetIscsiIqn(session, host, beforeIqn))
+	// set_iscsi_iqn refuses an empty string (INVALID_VALUE) - only restore it if this host actually
+	// had one set before; a host that has never had an IQN configured can't be "restored" to empty.
+	if beforeIqn != "" {
+		check(xenapi.Host.SetIscsiIqn(session, host, beforeIqn))
+	}
 	check(xenapi.Host.SetMultipathing(session, host, beforeMultipathing))
 	fmt.Println("  restored")
 	fmt.Println("OK: configure-host-storage")
@@ -3939,8 +4749,17 @@ func manageDriverVariants(url, user, password string) {
 
 	// Select a variant explicitly. It becomes the selected one immediately; whether it is also active
 	// depends on whether the hardware is present and the driver already loaded.
+	// Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
+	// and variant order isn't guaranteed to put the usable one first - pick the first one that
+	// reports its hardware present, falling back to the first variant only if none do.
 	first := refs[0]
 	variant := drivers[first].Variants[0]
+	for _, v := range drivers[first].Variants {
+		if present, _ := xenapi.DriverVariant.GetHardwarePresent(session, v); present {
+			variant = v
+			break
+		}
+	}
 	check(xenapi.HostDriver.Select(session, first, variant))
 	after, err := xenapi.HostDriver.GetRecord(session, first)
 	check(err)
@@ -3993,101 +4812,197 @@ func rawLogin(url, user, password string) string {
 	return r.Result
 }
 
-var workflows = map[string]func(url, user, password string){
-	"connect-inventory":  func(u, n, p string) { connectInventory(u, n, p) },
-	"create-vm":          func(u, n, p string) { createVM(u, n, p, "Rocky Linux 8", "sdk-example-vm") },
-	"vm-lifecycle":       func(u, n, p string) { vmLifecycle(u, n, p, "Rocky Linux 8", "sdk-example-lifecycle") },
-	"manage-vm-disks":    func(u, n, p string) { manageVMDisks(u, n, p, "web-01") },
-	"dismiss-alerts":     func(u, n, p string) { dismissAlerts(u, n, p) },
-	"host-power-on":      func(u, n, p string) { hostPowerOn(u, n, p) },
-	"rotate-pool-secret": func(u, n, p string) { rotatePoolSecret(u, n, p) },
-	"change-root-password": func(u, n, p string) { changeRootPassword(u, n, p) },
-	"manage-certificates": func(u, n, p string) { manageCertificates(u, n, p) },
-	"snapshot-schedule":  func(u, n, p string) { snapshotSchedule(u, n, p, "web-01", "sdk-example-schedule") },
-	"manage-vm-groups":   func(u, n, p string) { manageVMGroups(u, n, p, "web-01", "sdk-example-group") },
-	"snapshot-revert":    func(u, n, p string) { snapshotRevert(u, n, p, "web-01", "sdk-example-snapshot") },
-	"create-nfs-sr":      func(u, n, p string) { createNfsSR(u, n, p, "192.0.2.10", "/export/sdk", "sdk-example-nfs") },
-	"create-network":     func(u, n, p string) { createNetwork(u, n, p, "sdk-example-net") },
-	"edit-vm-properties": func(u, n, p string) { editVMProperties(u, n, p, "web-01") },
-	"events":             func(u, n, p string) { events(u, n, p, "web-01") },
-	"new-vm-wizard":      func(u, n, p string) { newVMWizard(u, n, p, "Rocky Linux 8", "wizard-vm") },
-	"live-migrate":       func(u, n, p string) { liveMigrate(u, n, p, "Rocky Linux 8", "sdk-example-migrate") },
-	"host-maintenance":   func(u, n, p string) { hostMaintenance(u, n, p, "Rocky Linux 8", "sdk-example-maint") },
-	"configure-ha":       func(u, n, p string) { configureHa(u, n, p, "Shared NFS") },
-	"copy-vm":            func(u, n, p string) { copyVM(u, n, p, "db-01", "Shared NFS", "sdk-example-copy") },
-	"create-vm-with-vgpu": func(u, n, p string) { createVMWithVgpu(u, n, p, "Rocky Linux 8", "sdk-example-vgpu-vm") },
-	"tags-and-folders":    func(u, n, p string) { tagsAndFolders(u, n, p, "web-01") },
-	"configure-updates":   func(u, n, p string) { configureUpdates(u, n, p) },
-	"clone-vm":            func(u, n, p string) { cloneVM(u, n, p, "db-01", "sdk-example-clone") },
-	"delete-vm":           func(u, n, p string) { deleteVM(u, n, p, "Rocky Linux 8", "sdk-example-delete") },
-	"storage-migrate":     func(u, n, p string) { storageMigrate(u, n, p, "Rocky Linux 8", "sdk-example-storagemigrate") },
-	"apply-update":        func(u, n, p string) { applyUpdate(u, n, p) },
-	"checkpoint-vm":       func(u, n, p string) { checkpointVM(u, n, p, "Rocky Linux 8", "sdk-example-checkpoint") },
-	"attach-disk":         func(u, n, p string) { attachDisk(u, n, p, "Rocky Linux 8", "Shared NFS", "sdk-example-attachdisk") },
-	"wait-for-task":       func(u, n, p string) { waitForTask(u, n, p, "Rocky Linux 8", "sdk-example-asynctask") },
-	"error-handling":      func(u, n, p string) { errorHandling(u, n, p) },
-	"list-templates":      func(u, n, p string) { listTemplates(u, n, p) },
-	"custom-fields":       func(u, n, p string) { customFields(u, n, p, "web-01") },
-	"gpu-inventory":       func(u, n, p string) { gpuInventory(u, n, p) },
-	"read-metrics":        func(u, n, p string) { readMetrics(u, n, p) },
-	"rename-object":       func(u, n, p string) { renameObject(u, n, p, "web-01") },
-	"vm-boot-config":      func(u, n, p string) { vmBootConfig(u, n, p, "Rocky Linux 8", "sdk-example-boot") },
-	"host-info":           func(u, n, p string) { hostInfo(u, n, p) },
-	"list-roles":          func(u, n, p string) { listRoles(u, n, p) },
-	"pool-properties":     func(u, n, p string) { poolProperties(u, n, p) },
-	"sr-usage":            func(u, n, p string) { srUsage(u, n, p) },
-	"manage-vif":          func(u, n, p string) { manageVif(u, n, p, "Rocky Linux 8", "sdk-example-vif") },
-	"list-networks":       func(u, n, p string) { listNetworks(u, n, p) },
-	"vbd-inventory":       func(u, n, p string) { vbdInventory(u, n, p, "db-01") },
-	"pool-tags":           func(u, n, p string) { poolTags(u, n, p) },
-	"convert-to-template": func(u, n, p string) { convertToTemplate(u, n, p, "Rocky Linux 8", "sdk-example-totemplate") },
-	"find-by-uuid":        func(u, n, p string) { findByUUID(u, n, p, "web-01") },
-	"rolling-pool-update": func(u, n, p string) { rollingPoolUpdate(u, n, p) },
-	"pvs-accelerator":     func(u, n, p string) { pvsAccelerator(u, n, p) },
-	"configure-pvs-accelerator": func(u, n, p string) { configurePvsAccelerator(u, n, p) },
-	"manage-ssh-access":  func(u, n, p string) { manageSSHAccess(u, n, p) },
-	"manage-vtpm":        func(u, n, p string) { manageVtpm(u, n, p) },
-	"export-import-vm":   func(u, n, p string) { exportImportVm(u, n, p) },
-	"configure-dynamic-memory": func(u, n, p string) { configureDynamicMemory(u, n, p) },
-	"manage-vm-media":          func(u, n, p string) { manageVmMedia(u, n, p) },
-	"backup-host-config":       func(u, n, p string) { backupHostConfig(u, n, p) },
-	"manage-sr-lifecycle":      func(u, n, p string) { manageSrLifecycle(u, n, p, "192.0.2.10", "/export/spare") },
-	"set-default-sr":           func(u, n, p string) { setDefaultSr(u, n, p, "192.0.2.10", "/export/spare") },
-	"server-status-report":     func(u, n, p string) { serverStatusReport(u, n, p) },
-	"disaster-recovery":        func(u, n, p string) { disasterRecovery(u, n, p) },
-	"manage-secureboot-certificates": func(u, n, p string) { manageSecurebootCertificates(u, n, p) },
-	"restart-host":             func(u, n, p string) { restartHost(u, n, p) },
-	"manage-crash-dumps":       func(u, n, p string) { manageCrashDumps(u, n, p) },
-	"vm-from-snapshot":         func(u, n, p string) { vmFromSnapshot(u, n, p, "db-01") },
-	"attach-existing-disk":     func(u, n, p string) { attachExistingDisk(u, n, p) },
-	"changed-block-tracking": func(u, n, p string) { changedBlockTracking(u, n, p) },
-	"control-domain-memory": func(u, n, p string) { controlDomainMemory(u, n, p) },
-	"rrd-metrics":         func(u, n, p string) { rrdMetrics(u, n, p) },
-	"reclaim-space":       func(u, n, p string) { reclaimSpace(u, n, p) },
-	"vm-ip-address":       func(u, n, p string) { vmIpAddress(u, n, p) },
-	"manage-ad-users":     func(u, n, p string) { manageAdUsers(u, n, p) },
-	"create-iscsi-sr":     func(u, n, p string) { createIscsiSr(u, n, p) },
-	"create-smb-sr":       func(u, n, p string) { createSmbSr(u, n, p) },
-	"create-hba-sr":       func(u, n, p string) { createHbaSr(u, n, p) },
-	"create-gfs2-sr":      func(u, n, p string) { createGfs2Sr(u, n, p) },
-	"create-iso-sr":       func(u, n, p string) { createIsoSr(u, n, p) },
-	"configure-nrpe":      func(u, n, p string) { configureNrpe(u, n, p) },
-	"configure-snmp":      func(u, n, p string) { configureSnmp(u, n, p) },
-	"configure-clustering": func(u, n, p string) { configureClustering(u, n, p) },
-	"manage-pool-membership": func(u, n, p string) { managePoolMembership(u, n, p) },
-	"create-bond": func(u, n, p string) { createBond(u, n, p) },
-	"manage-vapp":         func(u, n, p string) { manageVapp(u, n, p, "web-01") },
-	"attach-usb-device":   func(u, n, p string) { attachUsbDevice(u, n, p, "web-01") },
-	"wlb-recommendations": func(u, n, p string) { wlbRecommendations(u, n, p, "web-01") },
-	"configure-pool-options":   func(u, n, p string) { configurePoolOptions(u, n, p) },
-	"configure-console-access": func(u, n, p string) { configureConsoleAccess(u, n, p) },
-	"configure-host-storage":   func(u, n, p string) { configureHostStorage(u, n, p) },
-	"configure-syslog":         func(u, n, p string) { configureSyslog(u, n, p, "192.0.2.50") },
-	"manage-driver-variants":   func(u, n, p string) { manageDriverVariants(u, n, p) },
+// workflow pairs a workflow's dispatcher defaults (chosen to work against the simulator) with the
+// function that resolves a merged parameter set into a call - the Go equivalent of Python's
+// `_wf(fn, **defaults)` wrapper.
+type workflow struct {
+	defaults map[string]string
+	run      func(url, user, password string, params map[string]string)
+}
+
+// wf builds a workflow entry: defaults, merged with CLI-supplied overrides (see main), are handed
+// to fn as one resolved parameter map.
+func wf(defaults map[string]string, fn func(url, user, password string, params map[string]string)) workflow {
+	return workflow{defaults: defaults, run: fn}
+}
+
+var workflows = map[string]workflow{
+	"connect-inventory": wf(nil, func(u, n, p string, m map[string]string) { connectInventory(u, n, p) }),
+	"create-vm": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "sdk-example-vm"},
+		func(u, n, p string, m map[string]string) { createVM(u, n, p, m["template_name"], m["new_vm_name"]) }),
+	"vm-lifecycle": wf(map[string]string{"source_vm": "web-01", "new_vm_name": "sdk-example-lifecycle"},
+		func(u, n, p string, m map[string]string) { vmLifecycle(u, n, p, m["source_vm"], m["new_vm_name"]) }),
+	"manage-vm-disks": wf(map[string]string{
+		"template_name": "Rocky Linux 8", "sr_name": "Shared NFS", "new_vm_name": "sdk-example-vm-disks",
+	}, func(u, n, p string, m map[string]string) {
+		manageVMDisks(u, n, p, m["template_name"], m["sr_name"], m["new_vm_name"])
+	}),
+	"dismiss-alerts":       wf(nil, func(u, n, p string, m map[string]string) { dismissAlerts(u, n, p) }),
+	"host-power-on":        wf(nil, func(u, n, p string, m map[string]string) { hostPowerOn(u, n, p) }),
+	"rotate-pool-secret":   wf(nil, func(u, n, p string, m map[string]string) { rotatePoolSecret(u, n, p) }),
+	"change-root-password": wf(nil, func(u, n, p string, m map[string]string) { changeRootPassword(u, n, p) }),
+	"manage-certificates":  wf(nil, func(u, n, p string, m map[string]string) { manageCertificates(u, n, p) }),
+	"snapshot-schedule": wf(map[string]string{"vm_name": "web-01", "schedule_name": "sdk-example-schedule"},
+		func(u, n, p string, m map[string]string) { snapshotSchedule(u, n, p, m["vm_name"], m["schedule_name"]) }),
+	"manage-vm-groups": wf(map[string]string{"vm_name": "web-01", "group_name": "sdk-example-group"},
+		func(u, n, p string, m map[string]string) { manageVMGroups(u, n, p, m["vm_name"], m["group_name"]) }),
+	"snapshot-revert": wf(map[string]string{"vm_name": "web-01", "snapshot_name": "sdk-example-snapshot"},
+		func(u, n, p string, m map[string]string) { snapshotRevert(u, n, p, m["vm_name"], m["snapshot_name"]) }),
+	"create-nfs-sr": wf(map[string]string{
+		"nfs_server": "192.0.2.10", "nfs_path": "/export/sdk", "sr_name": "sdk-example-nfs",
+	}, func(u, n, p string, m map[string]string) {
+		createNfsSR(u, n, p, m["nfs_server"], m["nfs_path"], m["sr_name"])
+	}),
+	"create-network": wf(map[string]string{"network_name": "sdk-example-net"},
+		func(u, n, p string, m map[string]string) { createNetwork(u, n, p, m["network_name"]) }),
+	"edit-vm-properties": wf(map[string]string{"vm_name": "web-01"},
+		func(u, n, p string, m map[string]string) { editVMProperties(u, n, p, m["vm_name"]) }),
+	"events": wf(map[string]string{"vm_name": "web-01"},
+		func(u, n, p string, m map[string]string) { events(u, n, p, m["vm_name"]) }),
+	"new-vm-wizard": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "wizard-vm"},
+		func(u, n, p string, m map[string]string) { newVMWizard(u, n, p, m["template_name"], m["new_vm_name"]) }),
+	"live-migrate": wf(map[string]string{
+		"source_vm": "web-01", "sr_name": "Shared NFS", "new_vm_name": "sdk-example-migrate",
+	}, func(u, n, p string, m map[string]string) {
+		liveMigrate(u, n, p, m["source_vm"], m["sr_name"], m["new_vm_name"])
+	}),
+	"host-maintenance": wf(map[string]string{
+		"source_vm": "web-01", "sr_name": "Shared NFS", "new_vm_name": "sdk-example-maint",
+	}, func(u, n, p string, m map[string]string) {
+		hostMaintenance(u, n, p, m["source_vm"], m["sr_name"], m["new_vm_name"])
+	}),
+	"configure-ha": wf(map[string]string{"heartbeat_sr_name": "Shared NFS"},
+		func(u, n, p string, m map[string]string) { configureHa(u, n, p, m["heartbeat_sr_name"]) }),
+	"copy-vm": wf(map[string]string{"vm_name": "db-01", "sr_name": "Shared NFS", "copy_name": "sdk-example-copy"},
+		func(u, n, p string, m map[string]string) { copyVM(u, n, p, m["vm_name"], m["sr_name"], m["copy_name"]) }),
+	"create-vm-with-vgpu": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "sdk-example-vgpu-vm"},
+		func(u, n, p string, m map[string]string) {
+			createVMWithVgpu(u, n, p, m["template_name"], m["new_vm_name"])
+		}),
+	"tags-and-folders": wf(map[string]string{"vm_name": "web-01"},
+		func(u, n, p string, m map[string]string) { tagsAndFolders(u, n, p, m["vm_name"]) }),
+	"configure-updates": wf(nil, func(u, n, p string, m map[string]string) { configureUpdates(u, n, p) }),
+	"clone-vm": wf(map[string]string{"vm_name": "db-01", "clone_name": "sdk-example-clone"},
+		func(u, n, p string, m map[string]string) { cloneVM(u, n, p, m["vm_name"], m["clone_name"]) }),
+	"delete-vm": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "sdk-example-delete"},
+		func(u, n, p string, m map[string]string) { deleteVM(u, n, p, m["template_name"], m["new_vm_name"]) }),
+	"storage-migrate": wf(map[string]string{"source_vm": "web-01", "new_vm_name": "sdk-example-storagemigrate"},
+		func(u, n, p string, m map[string]string) {
+			storageMigrate(u, n, p, m["source_vm"], m["new_vm_name"])
+		}),
+	"apply-update": wf(nil, func(u, n, p string, m map[string]string) { applyUpdate(u, n, p) }),
+	"checkpoint-vm": wf(map[string]string{"source_vm": "web-01", "new_vm_name": "sdk-example-checkpoint"},
+		func(u, n, p string, m map[string]string) { checkpointVM(u, n, p, m["source_vm"], m["new_vm_name"]) }),
+	"attach-disk": wf(map[string]string{
+		"template_name": "Rocky Linux 8", "sr_name": "Shared NFS", "new_vm_name": "sdk-example-attachdisk",
+	}, func(u, n, p string, m map[string]string) {
+		attachDisk(u, n, p, m["template_name"], m["sr_name"], m["new_vm_name"])
+	}),
+	"wait-for-task": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "sdk-example-asynctask"},
+		func(u, n, p string, m map[string]string) { waitForTask(u, n, p, m["template_name"], m["new_vm_name"]) }),
+	"error-handling": wf(nil, func(u, n, p string, m map[string]string) { errorHandling(u, n, p) }),
+	"list-templates": wf(nil, func(u, n, p string, m map[string]string) { listTemplates(u, n, p) }),
+	"custom-fields": wf(map[string]string{"vm_name": "web-01"},
+		func(u, n, p string, m map[string]string) { customFields(u, n, p, m["vm_name"]) }),
+	"gpu-inventory": wf(nil, func(u, n, p string, m map[string]string) { gpuInventory(u, n, p) }),
+	"read-metrics":  wf(nil, func(u, n, p string, m map[string]string) { readMetrics(u, n, p) }),
+	"rename-object": wf(map[string]string{"vm_name": "web-01"},
+		func(u, n, p string, m map[string]string) { renameObject(u, n, p, m["vm_name"]) }),
+	"vm-boot-config": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "sdk-example-boot"},
+		func(u, n, p string, m map[string]string) { vmBootConfig(u, n, p, m["template_name"], m["new_vm_name"]) }),
+	"host-info":       wf(nil, func(u, n, p string, m map[string]string) { hostInfo(u, n, p) }),
+	"list-roles":      wf(nil, func(u, n, p string, m map[string]string) { listRoles(u, n, p) }),
+	"pool-properties": wf(nil, func(u, n, p string, m map[string]string) { poolProperties(u, n, p) }),
+	"sr-usage":        wf(nil, func(u, n, p string, m map[string]string) { srUsage(u, n, p) }),
+	"manage-vif": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "sdk-example-vif"},
+		func(u, n, p string, m map[string]string) { manageVif(u, n, p, m["template_name"], m["new_vm_name"]) }),
+	"list-networks": wf(nil, func(u, n, p string, m map[string]string) { listNetworks(u, n, p) }),
+	"vbd-inventory": wf(map[string]string{"vm_name": "db-01"},
+		func(u, n, p string, m map[string]string) { vbdInventory(u, n, p, m["vm_name"]) }),
+	"pool-tags": wf(nil, func(u, n, p string, m map[string]string) { poolTags(u, n, p) }),
+	"convert-to-template": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "sdk-example-totemplate"},
+		func(u, n, p string, m map[string]string) {
+			convertToTemplate(u, n, p, m["template_name"], m["new_vm_name"])
+		}),
+	"find-by-uuid": wf(map[string]string{"vm_name": "web-01"},
+		func(u, n, p string, m map[string]string) { findByUUID(u, n, p, m["vm_name"]) }),
+	"rolling-pool-update":       wf(nil, func(u, n, p string, m map[string]string) { rollingPoolUpdate(u, n, p) }),
+	"pvs-accelerator":           wf(nil, func(u, n, p string, m map[string]string) { pvsAccelerator(u, n, p) }),
+	"configure-pvs-accelerator": wf(nil, func(u, n, p string, m map[string]string) { configurePvsAccelerator(u, n, p) }),
+	"manage-ssh-access":         wf(nil, func(u, n, p string, m map[string]string) { manageSSHAccess(u, n, p) }),
+	"manage-vtpm":               wf(nil, func(u, n, p string, m map[string]string) { manageVtpm(u, n, p) }),
+	"export-import-vm":          wf(nil, func(u, n, p string, m map[string]string) { exportImportVm(u, n, p) }),
+	"configure-dynamic-memory":  wf(nil, func(u, n, p string, m map[string]string) { configureDynamicMemory(u, n, p) }),
+	"manage-vm-media":           wf(nil, func(u, n, p string, m map[string]string) { manageVmMedia(u, n, p) }),
+	"backup-host-config":        wf(nil, func(u, n, p string, m map[string]string) { backupHostConfig(u, n, p) }),
+	"manage-sr-lifecycle": wf(map[string]string{"nfs_server": "192.0.2.10", "nfs_path": "/export/spare"},
+		func(u, n, p string, m map[string]string) { manageSrLifecycle(u, n, p, m["nfs_server"], m["nfs_path"]) }),
+	"set-default-sr": wf(map[string]string{"nfs_server": "192.0.2.10", "nfs_path": "/export/spare"},
+		func(u, n, p string, m map[string]string) { setDefaultSr(u, n, p, m["nfs_server"], m["nfs_path"]) }),
+	"server-status-report": wf(nil, func(u, n, p string, m map[string]string) { serverStatusReport(u, n, p) }),
+	// disaster-recovery has no usable default for dr_url (null/None/empty) - a second pool is
+	// structurally required, so raise a clear error naming what's missing if it's not supplied.
+	"disaster-recovery": wf(map[string]string{"dr_url": ""},
+		func(u, n, p string, m map[string]string) { disasterRecovery(u, n, p, m["dr_url"]) }),
+	"manage-secureboot-certificates": wf(nil, func(u, n, p string, m map[string]string) { manageSecurebootCertificates(u, n, p) }),
+	"restart-host":                   wf(nil, func(u, n, p string, m map[string]string) { restartHost(u, n, p) }),
+	"manage-crash-dumps":             wf(nil, func(u, n, p string, m map[string]string) { manageCrashDumps(u, n, p) }),
+	"vm-from-snapshot": wf(map[string]string{"vm_name": "db-01"},
+		func(u, n, p string, m map[string]string) { vmFromSnapshot(u, n, p, m["vm_name"]) }),
+	"attach-existing-disk":   wf(nil, func(u, n, p string, m map[string]string) { attachExistingDisk(u, n, p) }),
+	"changed-block-tracking": wf(nil, func(u, n, p string, m map[string]string) { changedBlockTracking(u, n, p) }),
+	"control-domain-memory":  wf(nil, func(u, n, p string, m map[string]string) { controlDomainMemory(u, n, p) }),
+	"rrd-metrics":            wf(nil, func(u, n, p string, m map[string]string) { rrdMetrics(u, n, p) }),
+	"reclaim-space":          wf(nil, func(u, n, p string, m map[string]string) { reclaimSpace(u, n, p) }),
+	"vm-ip-address": wf(map[string]string{"timeout": "60", "interval": "2"},
+		func(u, n, p string, m map[string]string) { vmIpAddress(u, n, p, m["timeout"], m["interval"]) }),
+	"manage-ad-users": wf(map[string]string{
+		"domain": "", "admin_user": "alice", "admin_password": "Password1", "new_user": "alice",
+	}, func(u, n, p string, m map[string]string) {
+		manageAdUsers(u, n, p, m["domain"], m["admin_user"], m["admin_password"], m["new_user"])
+	}),
+	"create-iscsi-sr": wf(map[string]string{
+		"target": "192.0.2.30", "port": "", "chap_user": "", "chap_password": "", "target_iqn": "",
+		"sr_name": "sdk-example-iscsi",
+	}, func(u, n, p string, m map[string]string) {
+		createIscsiSr(u, n, p, m["target"], m["port"], m["chap_user"], m["chap_password"], m["target_iqn"],
+			m["sr_name"])
+	}),
+	"create-smb-sr": wf(map[string]string{
+		"server": "192.0.2.40", "share": "/vmstore", "smb_username": "Administrator",
+		"smb_password": "Password1", "sr_name": "sdk-example-smb",
+	}, func(u, n, p string, m map[string]string) {
+		createSmbSr(u, n, p, m["server"], m["share"], m["smb_username"], m["smb_password"], m["sr_name"])
+	}),
+	"create-hba-sr": wf(map[string]string{"sr_name": "sdk-example-hba"},
+		func(u, n, p string, m map[string]string) { createHbaSr(u, n, p, m["sr_name"]) }),
+	"create-iso-sr":  wf(nil, func(u, n, p string, m map[string]string) { createIsoSr(u, n, p) }),
+	"configure-nrpe": wf(nil, func(u, n, p string, m map[string]string) { configureNrpe(u, n, p) }),
+	"configure-snmp": wf(map[string]string{"trap_destination": "192.0.2.50"},
+		func(u, n, p string, m map[string]string) { configureSnmp(u, n, p, m["trap_destination"]) }),
+	"configure-clustering":   wf(nil, func(u, n, p string, m map[string]string) { configureClustering(u, n, p) }),
+	"manage-pool-membership": wf(nil, func(u, n, p string, m map[string]string) { managePoolMembership(u, n, p) }),
+	"create-bond":            wf(nil, func(u, n, p string, m map[string]string) { createBond(u, n, p) }),
+	"manage-vapp": wf(map[string]string{"vm_name": "web-01"},
+		func(u, n, p string, m map[string]string) { manageVapp(u, n, p, m["vm_name"]) }),
+	"attach-usb-device": wf(map[string]string{"vm_name": "web-01"},
+		func(u, n, p string, m map[string]string) { attachUsbDevice(u, n, p, m["vm_name"]) }),
+	"wlb-recommendations": wf(map[string]string{
+		"vm_name": "web-01", "wlb_host_port": "wlb.example:8012", "wlb_username": "wlbuser", "wlb_password": "wlbpass",
+	}, func(u, n, p string, m map[string]string) {
+		wlbRecommendations(u, n, p, m["vm_name"], m["wlb_host_port"], m["wlb_username"], m["wlb_password"])
+	}),
+	"configure-pool-options":   wf(nil, func(u, n, p string, m map[string]string) { configurePoolOptions(u, n, p) }),
+	"configure-console-access": wf(nil, func(u, n, p string, m map[string]string) { configureConsoleAccess(u, n, p) }),
+	"configure-host-storage":   wf(nil, func(u, n, p string, m map[string]string) { configureHostStorage(u, n, p) }),
+	"configure-syslog": wf(map[string]string{"syslog_server": "192.0.2.50"},
+		func(u, n, p string, m map[string]string) { configureSyslog(u, n, p, m["syslog_server"]) }),
+	"manage-driver-variants": wf(nil, func(u, n, p string, m map[string]string) { manageDriverVariants(u, n, p) }),
 }
 
 func main() {
-	// cross-pool-copy-vm spans two pools, so it takes an extra 5th argument: the destination URL.
+	// cross-pool-copy-vm spans two pools, so it keeps its existing fixed 4-arg form (plus the
+	// destination URL), unchanged - no key=value overrides.
 	if len(os.Args) >= 2 && os.Args[1] == "cross-pool-copy-vm" {
 		if len(os.Args) != 6 {
 			fmt.Fprintln(os.Stderr, "usage: go run . cross-pool-copy-vm <sourceUrl> <user> <password> <destUrl>")
@@ -4096,8 +5011,8 @@ func main() {
 		crossPoolCopyVM(os.Args[2], os.Args[3], os.Args[4], os.Args[5], "db-01")
 		return
 	}
-	if len(os.Args) != 5 {
-		fmt.Fprintln(os.Stderr, "usage: go run . <workflow> <url> <user> <password>")
+	if len(os.Args) < 5 {
+		fmt.Fprintln(os.Stderr, "usage: go run . <workflow> <url> <user> <password> [key=value ...]")
 		os.Exit(2)
 	}
 	workflow, ok := workflows[os.Args[1]]
@@ -4106,5 +5021,21 @@ func main() {
 		os.Exit(2)
 	}
 
-	workflow(os.Args[2], os.Args[3], os.Args[4])
+	// Everything else is a named parameter with a default chosen to work against the simulator;
+	// key=value arguments after the password override that workflow's default for the named
+	// parameter.
+	params := make(map[string]string, len(workflow.defaults))
+	for k, v := range workflow.defaults {
+		params[k] = v
+	}
+	for _, arg := range os.Args[5:] {
+		key, value, found := strings.Cut(arg, "=")
+		if !found {
+			fmt.Fprintf(os.Stderr, "extra arguments must be key=value (got %q)\n", arg)
+			os.Exit(2)
+		}
+		params[key] = value
+	}
+
+	workflow.run(os.Args[2], os.Args[3], os.Args[4], params)
 }

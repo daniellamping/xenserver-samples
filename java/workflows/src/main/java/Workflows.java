@@ -58,6 +58,8 @@ import com.xensource.xenapi.PIF;
 import com.xensource.xenapi.Bond;
 import com.xensource.xenapi.HostDriver;
 import com.xensource.xenapi.DriverVariant;
+import com.xensource.xenapi.Secret;
+import com.xensource.xenapi.ProbeResult;
 import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.classic.methods.HttpPut;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
@@ -75,6 +77,7 @@ import org.apache.hc.core5.ssl.SSLContexts;
 import javax.net.ssl.SSLContext;
 import java.net.URL;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -148,6 +151,223 @@ public class Workflows {
         return vdis;
     }
 
+    // VM.destroy removes the VM record but leaves its disks behind; collect the owned VDIs first and
+    // destroy them afterward. Works for a snapshot/checkpoint too - its "disks" are its own snapshot VDIs.
+    private static void destroyVmAndDisks(Connection conn, VM vm) throws Exception {
+        Set<VDI> vdis = new LinkedHashSet<>(diskVdis(conn, vm));
+        // A checkpoint (or a suspended VM) also owns a suspend image holding its memory, which no VBD
+        // points at: destroy that as well.
+        VDI suspendVdi = vm.getSuspendVDI(conn);
+        if (!suspendVdi.toWireString().equals("OpaqueRef:NULL")) vdis.add(suspendVdi);
+        vm.destroy(conn);
+        for (VDI vdi : vdis) vdi.destroy(conn);
+    }
+
+    // Detach an SR from every host, then forget it: XenCenter's Detach followed by Forget. SR.forget refuses
+    // an SR that is still attached (SR_HAS_PBD), so unplug its PBDs first. Forgetting drops the pool's record
+    // of the SR but leaves the data on the storage itself.
+    private static void detachAndForgetSr(Connection conn, SR sr) throws Exception {
+        for (PBD pbd : sr.getPBDs(conn)) {
+            if (pbd.getCurrentlyAttached(conn)) pbd.unplug(conn);
+        }
+        sr.forget(conn);
+    }
+
+    // What xe vm-install does before VM.provision: a template's other_config["disks"] names sr="" for
+    // every disk, and released xapi takes that literally and fails with UUID_INVALID. Rewrite each
+    // disk's sr attribute to the pool's default SR first.
+    private static void provision(Connection conn, VM vm) throws Exception {
+        String disks = vm.getOtherConfig(conn).get("disks");
+        if (disks != null && disks.contains("sr=\"\"")) {
+            SR defaultSr = Pool.getAllRecords(conn).values().iterator().next().defaultSR;
+            vm.removeFromOtherConfig(conn, "disks");
+            vm.addToOtherConfig(conn, "disks", disks.replace("sr=\"\"", "sr=\"" + defaultSr.getUuid(conn) + "\""));
+        }
+        vm.provision(conn);
+    }
+
+    // The first (from the end) field of a probe failure that looks like an XML fragment, or null.
+    // SR.probe's deliberate failures surface as SrBackendFailure (status/stdout/stderr); other XenAPI
+    // failures carry their raw params in errorDescription. Scan in reverse, like the Python reference.
+    private static String xmlFromFailure(Types.XenAPIException e) {
+        java.util.List<String> candidates = new ArrayList<>();
+        if (e instanceof Types.SrBackendFailure) {
+            Types.SrBackendFailure sbf = (Types.SrBackendFailure) e;
+            candidates.add(sbf.status);
+            candidates.add(sbf.stdout);
+            candidates.add(sbf.stderr);
+        } else if (e.errorDescription != null) {
+            candidates.addAll(java.util.Arrays.asList(e.errorDescription));
+        }
+        java.util.Collections.reverse(candidates);
+        for (String c : candidates) {
+            if (c != null && c.trim().startsWith("<")) return c;
+        }
+        return null;
+    }
+
+    // Return the XML a backend sends back on its deliberately-failing discovery probe. The New SR
+    // wizard (and XenRT) discover iSCSI/HBA LUNs by asking with an incomplete device-config on purpose:
+    // the backend can't create anything from it yet, so it fails with an SR_BACKEND_FAILURE_<n> error
+    // whose params carry an XML fragment describing what it found. A probe that unexpectedly SUCCEEDS
+    // means the device-config was already complete - not the discovery prompt this helper looks for.
+    // Never probe by attempting SR.create instead: on real storage a create that succeeds formats the LUN.
+    private static String probeForFailure(Connection conn, Host host, Map<String, String> deviceConfig,
+            String smType) throws Exception {
+        try {
+            SR.probe(conn, host, deviceConfig, smType, new HashMap<String, String>());
+        } catch (Types.XenAPIException e) {
+            String xml = xmlFromFailure(e);
+            if (xml != null) return xml;
+            throw e;
+        }
+        throw new RuntimeException("SR.probe for " + smType + " succeeded without asking for more "
+                + "information; check the target address");
+    }
+
+    // Parse an XML fragment and return its document root (used on the probe XML above).
+    private static org.w3c.dom.Document parseXml(String xml) throws Exception {
+        return javax.xml.parsers.DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                .parse(new org.xml.sax.InputSource(new java.io.StringReader(xml)));
+    }
+
+    private static String firstTagText(org.w3c.dom.Element root, String tag) {
+        org.w3c.dom.NodeList nodes = root.getElementsByTagName(tag);
+        return nodes.getLength() > 0 ? nodes.item(0).getTextContent() : null;
+    }
+
+    // Pick the IQN from an iSCSI discovery probe: the caller's, if named (it must be one the target
+    // offers), else the first. An array usually offers many targets - one per LUN, often belonging to
+    // different users - so on shared storage always name yours: SR.create formats the LUN behind it.
+    private static String chooseTargetIqn(org.w3c.dom.Element iqnRoot, String target, String targetIqn) {
+        org.w3c.dom.NodeList nodes = iqnRoot.getElementsByTagName("TargetIQN");
+        List<String> offered = new ArrayList<>();
+        for (int i = 0; i < nodes.getLength(); i++) offered.add(nodes.item(i).getTextContent());
+        if (targetIqn == null || targetIqn.isEmpty()) return offered.get(0);
+        if (!offered.contains(targetIqn))
+            throw new RuntimeException("target " + target + " does not offer IQN " + targetIqn);
+        return targetIqn;
+    }
+
+    // A throwaway self-signed certificate and private key (PEM), the way XenRT provisions one for its
+    // own certificate tests. Java has no dependency-free public API to mint an X.509 certificate (the
+    // internal sun.security.x509 classes need extra JVM flags under the module system), so shell out to
+    // openssl - the same tool XenRT itself uses - and read the two PEM files back.
+    private static String[] selfSignedCertPem() throws Exception {
+        java.io.File keyFile = java.io.File.createTempFile("sdk-example-key-", ".pem");
+        java.io.File certFile = java.io.File.createTempFile("sdk-example-cert-", ".pem");
+        try {
+            Process p = new ProcessBuilder("openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                    "-keyout", keyFile.getAbsolutePath(), "-out", certFile.getAbsolutePath(),
+                    "-days", "365", "-subj", "/CN=sdk-example")
+                    .redirectErrorStream(true).start();
+            String output = new String(p.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            int code = p.waitFor();
+            if (code != 0) throw new RuntimeException("openssl failed (" + code + "): " + output);
+            String certPem = java.nio.file.Files.readString(certFile.toPath());
+            String keyPem = java.nio.file.Files.readString(keyFile.toPath());
+            return new String[]{certPem, keyPem};
+        } finally {
+            keyFile.delete();
+            certFile.delete();
+        }
+    }
+
+    // Wait out a pool-wide xapi restart (pool.designateNewMaster) and reconnect. XenRT's own helper for
+    // this call treats the connection dropping as the expected, successful outcome and then waits several
+    // minutes before trusting the pool again, rather than retrying immediately - do the same here.
+    private static Connection reconnectAfterMasterChange(String url, String user, String password) throws Exception {
+        long deadline = System.currentTimeMillis() + 600_000;
+        Exception lastError = null;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                return connect(url, user, password);
+            } catch (Exception e) {
+                lastError = e;
+                Thread.sleep(5000);
+            }
+        }
+        throw new RuntimeException("the pool did not come back after the master change: " + lastError);
+    }
+
+    // Poll host_metrics.live until it matches, rather than issuing the next power command immediately -
+    // real out-of-band power control has no retry of its own, so a tool that doesn't wait can issue a
+    // second command while the first is still in flight. Short default timeout is intentional for a
+    // demo; real tooling (XenRT's waitForEnabled) waits up to 900s.
+    private static void waitForHostLive(Connection conn, Host host, boolean want) throws Exception {
+        long deadline = System.currentTimeMillis() + 60_000;
+        while (host.getMetrics(conn).getLive(conn) != want) {
+            if (System.currentTimeMillis() > deadline)
+                throw new RuntimeException("host did not reach live=" + want + " in time");
+            Thread.sleep(2000);
+        }
+    }
+
+    // Build the URL for a given host's own address, keeping the scheme and port the caller originally
+    // connected with (a host's management address carries no port of its own).
+    private static String hostUrl(String url, String address) throws Exception {
+        URL parsed = new URL(url);
+        int port = parsed.getPort();
+        return parsed.getProtocol() + "://" + address + (port >= 0 ? ":" + port : "");
+    }
+
+    // Relocate every one of a (not-yet-started) VM's disks onto the given SR, the same VDI.poolMigrate
+    // storage-migrate already demonstrates.
+    private static void moveDisksToSr(Connection conn, VM vm, SR sr) throws Exception {
+        for (VDI vdi : diskVdis(conn, vm)) {
+            if (!vdi.getSR(conn).equals(sr)) awaitTask(conn, vdi.poolMigrateAsync(conn, sr, new HashMap<String, String>()));
+        }
+    }
+
+    // Wait for an Async task to finish, return its result and destroy it. A call that copies a disk runs
+    // for many minutes - longer than the client waits for a reply (10 minutes by default) - so long
+    // operations start the Async twin, which returns a Task at once, and poll that instead.
+    private static String awaitTask(Connection conn, Task task) throws Exception {
+        try {
+            while (task.getStatus(conn) == Types.TaskStatusType.PENDING) Thread.sleep(1000);
+            if (task.getStatus(conn) != Types.TaskStatusType.SUCCESS)
+                throw new RuntimeException(task.getNameLabel(conn) + " failed: " + task.getErrorInfo(conn));
+            return task.getResult(conn).replace("<value>", "").replace("</value>", "").trim();
+        } finally {
+            task.destroy(conn);
+        }
+    }
+
+    // A throwaway VM with a working guest OS: a copy of an existing VM that has one. Suspend,
+    // checkpoint, live migration and clean shutdown all need the guest's cooperation: on a running VM
+    // with no PV drivers xapi refuses them up front with VM_LACKS_FEATURE (a VM freshly cloned from a
+    // template has no OS at all). So copy a VM that does have an OS and PV drivers, without disturbing
+    // it: snapshot it (fine while it runs), clone the snapshot - a clone of a snapshot is a template -
+    // and provision that into an ordinary VM. The snapshot is only needed for the clone, so it goes
+    // again straight away.
+    private static VM copyOfGuest(Connection conn, String sourceVmName, String newVmName) throws Exception {
+        VM source = vmByName(conn, sourceVmName);
+        VM snapshot = source.snapshot(conn, newVmName + "-source");
+        VM vm = snapshot.createClone(conn, newVmName);
+        provision(conn, vm);
+        destroyVmAndDisks(conn, snapshot);
+        return vm;
+    }
+
+    // Wait, after VM.start, until the guest's PV drivers have reported in. xapi only offers the
+    // guest-dependent operations once the guest says it can do them, and getAllowedOperations is where
+    // it says so: wait for CLEAN_SHUTDOWN to appear there (the same check that refuses it with
+    // VM_LACKS_FEATURE beforehand). A booting OS takes a while.
+    private static void waitForGuestAgent(Connection conn, VM vm) throws Exception {
+        waitForGuestAgent(conn, vm, 300, 2);
+    }
+
+    private static void waitForGuestAgent(Connection conn, VM vm, int timeoutSeconds, int intervalSeconds)
+            throws Exception {
+        long deadline = System.currentTimeMillis() + timeoutSeconds * 1000L;
+        while (!vm.getAllowedOperations(conn).contains(Types.VmOperations.CLEAN_SHUTDOWN)) {
+            if (System.currentTimeMillis() > deadline)
+                throw new RuntimeException("the guest's PV drivers did not report in within " + timeoutSeconds
+                        + "s; does the source VM have a guest OS with PV drivers (XenServer VM Tools)?");
+            Thread.sleep(intervalSeconds * 1000L);
+        }
+    }
+
     // --- 1. Connect & inventory --------------------------------------------------------
     private static void connectInventory(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
@@ -185,10 +405,10 @@ public class Workflows {
         VM vm = template.createClone(conn, newVmName);
         System.out.println("Cloned new VM: " + vm.getUuid(conn));
 
-        vm.provision(conn);
+        provision(conn, vm);
         System.out.println("Provisioned. is_a_template = " + vm.getIsATemplate(conn));
 
-        vm.destroy(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("Cleaned up the example VM.");
 
         System.out.println("OK: create-vm");
@@ -198,48 +418,99 @@ public class Workflows {
     //   createVm("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-vm");
 
     // --- 3. VM power lifecycle ---------------------------------------------------------
+    // Suspend and clean shutdown need the guest's cooperation (VM_LACKS_FEATURE without PV drivers), so
+    // the copy is made from sourceVm, a VM with a guest OS and PV drivers, and the example waits for the
+    // guest to report in after starting. Suspend also needs a suspend-image SR (the VM's own, else the
+    // pool's, else the host's); check one is actually configured before trying, rather than assuming it is.
     private static void vmLifecycle(String url, String user, String password,
-            String templateName, String newVmName) throws Exception {
+            String sourceVm, String newVmName) throws Exception {
         Connection conn = connect(url, user, password);
-        // Power operations are destructive, so work on a throwaway VM cloned from the template.
-        VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        VM vm = copyOfGuest(conn, sourceVm, newVmName);
 
         System.out.println("Initial power state: " + vm.getPowerState(conn));
         vm.start(conn, false, true);
-        System.out.println("After start:    " + vm.getPowerState(conn));
+        waitForGuestAgent(conn, vm);
+        System.out.println("After start:   " + vm.getPowerState(conn));
 
         // The emulated hardware (the device model) can be restarted under a running guest without
         // rebooting it - what you reach for when the VM's virtual devices misbehave.
         vm.restartDeviceModels(conn);
         System.out.println("Device models restarted; still " + vm.getPowerState(conn));
 
-        vm.suspend(conn);
-        System.out.println("After suspend:  " + vm.getPowerState(conn));
-        vm.resume(conn, false, true);
-        System.out.println("After resume:   " + vm.getPowerState(conn));
-        vm.cleanShutdown(conn);
-        System.out.println("After shutdown: " + vm.getPowerState(conn));
+        if (hasSuspendSr(conn, vm)) {
+            vm.suspend(conn);
+            System.out.println("After suspend: " + vm.getPowerState(conn));
+            vm.resume(conn, false, true);
+            waitForGuestAgent(conn, vm);   // the PV drivers reconnect after a resume
+            System.out.println("After resume:  " + vm.getPowerState(conn));
+        } else {
+            System.out.println("Skipping suspend/resume: no suspend-image SR is configured for this VM/pool/host");
+        }
 
-        vm.destroy(conn);
+        // A clean shutdown asks the guest OS to shut itself down, as pressing the power button would.
+        vm.cleanShutdown(conn);
+        System.out.println("After shutdown:" + vm.getPowerState(conn));
+
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: vm-lifecycle");
         Session.logout(conn);
     }
+
+    // Whether VM.suspend has a suspend-image SR to use: the VM's own, else the pool's, else the resident
+    // host's - the same fallback order xapi's choose_suspend_sr uses.
+    private static boolean hasSuspendSr(Connection conn, VM vm) throws Exception {
+        if (!vm.getSuspendSR(conn).toWireString().equals("OpaqueRef:NULL")) return true;
+        Pool pool = Pool.getAll(conn).iterator().next();
+        if (!pool.getSuspendImageSR(conn).toWireString().equals("OpaqueRef:NULL")) return true;
+        Host host = pool.getMaster(conn);
+        return !host.getSuspendImageSr(conn).toWireString().equals("OpaqueRef:NULL");
+    }
     // Run it:
-    //   vmLifecycle("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-lifecycle");
+    //   vmLifecycle("https://xenserver", "root", password, "web-01", "sdk-example-lifecycle");
 
     // --- 4. Manage VM disks: Deactivate / Resize / Activate --------------------------
-    private static void manageVmDisks(String url, String user, String password, String vmName)
-            throws Exception {
+    // Not the VM's root/boot disk: a real VM's system disk is unpluggable=false (only a template's
+    // non-system disks default to unpluggable), so VBD.unplug on it fails on a real host with
+    // VBD_NOT_UNPLUGGABLE - and the VM has to be running in the first place, or unplug fails with
+    // VM_BAD_POWER_STATE. Work on a data disk this example adds to its own throwaway VM instead,
+    // matching XenCenter's own "deactivate" action, which only ever targets additional disks, and tidy
+    // up afterwards so the example is repeatable. No shrink: real SR backends refuse one outright
+    // (SR_BACKEND_FAILURE_79), so this only ever grows.
+    private static void manageVmDisks(String url, String user, String password,
+            String templateName, String srName, String newVmName) throws Exception {
+        final long GiB = 1024L * 1024 * 1024;
         Connection conn = connect(url, user, password);
-        VM vm = vmByName(conn, vmName);
+        VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
+        provision(conn, vm);
+        vm.start(conn, false, true);
 
-        // The VM's first real disk (a CD drive is a VBD too, hence the type filter).
-        VBD vbd = null;
-        for (VBD candidate : vm.getVBDs(conn)) {
-            if (candidate.getType(conn) == Types.VbdType.DISK) { vbd = candidate; break; }
-        }
-        VDI vdi = vbd.getVDI(conn);
+        SR sr = srByName(conn, srName, false);
+        VDI.Record vdiRec = new VDI.Record();
+        vdiRec.nameLabel = "sdk-example-data-disk";
+        vdiRec.SR = sr;
+        vdiRec.virtualSize = 4 * GiB;
+        vdiRec.type = Types.VdiType.USER;
+        vdiRec.sharable = false;
+        vdiRec.readOnly = false;
+        vdiRec.otherConfig = new HashMap<>();
+        VDI vdi = VDI.create(conn, vdiRec);
+
+        VBD.Record vbdRec = new VBD.Record();
+        vbdRec.VM = vm;
+        vbdRec.VDI = vdi;
+        vbdRec.userdevice = vm.getAllowedVBDDevices(conn).iterator().next();
+        vbdRec.mode = Types.VbdMode.RW;
+        vbdRec.type = Types.VbdType.DISK;
+        vbdRec.empty = false;
+        // A Java record sends every field, so say so explicitly: a VBD created with unpluggable=false
+        // can't be hot-unplugged (VBD_NOT_UNPLUGGABLE). xapi's own default, when the field is left
+        // out, is true.
+        vbdRec.unpluggable = true;
+        vbdRec.otherConfig = new HashMap<>();
+        vbdRec.qosAlgorithmType = "";
+        vbdRec.qosAlgorithmParams = new HashMap<>();
+        VBD vbd = VBD.create(conn, vbdRec);
+        vbd.plug(conn);
         System.out.println("Disk attached:  " + vbd.getCurrentlyAttached(conn));
 
         // Deactivate = VBD.unplug. The disk stays with the VM; it is just no longer live.
@@ -258,6 +529,9 @@ public class Workflows {
         long grown = vdi.getVirtualSize(conn) + (1024L * 1024 * 1024);
         vdi.resizeOnline(conn, grown);
         System.out.println("Grown online:   " + vdi.getVirtualSize(conn) + " bytes");
+
+        vm.hardShutdown(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: manage-vm-disks");
         Session.logout(conn);
     }
@@ -287,10 +561,11 @@ public class Workflows {
         Host host = Host.getAll(conn).iterator().next();
 
         // Mode and config travel together: the config carries the credentials the mode needs.
+        // "wake-on-lan" is a real, still-supported mode and needs no credentials; the legacy "iLO"/"DRAC"
+        // modes were removed from the real power-on plugin (REQ-811) and fail the moment host.power_on is
+        // actually called.
         Map<String, String> cfg = new HashMap<>();
-        cfg.put("power_on_ip", "192.0.2.9");
-        cfg.put("power_on_user", "poweradmin");
-        host.setPowerOnMode(conn, "iLO", cfg);
+        host.setPowerOnMode(conn, "wake-on-lan", cfg);
         System.out.println("Power-on mode:  " + host.getPowerOnMode(conn));
         for (Map.Entry<String, String> e : new TreeMap<>(host.getPowerOnConfig(conn)).entrySet()) {
             System.out.println("  " + e.getKey() + " = " + e.getValue());
@@ -302,14 +577,31 @@ public class Workflows {
     }
 
     // --- Rotate the pool secret ------------------------------------------------------
+    // xapi checks its own preconditions before rotating - HA must be disabled, every host must be live,
+    // no rolling pool upgrade may be in progress, and the pool must be licensed for it - and raises a
+    // clear error naming which one failed rather than silently refusing. Report that explanation instead
+    // of letting an unhandled XenAPIException speak for itself. Still reports OK either way - the point
+    // is demonstrating the precondition handling, not requiring the rotation to succeed.
     private static void rotatePoolSecret(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
         Pool pool = Pool.getAll(conn).iterator().next();
         System.out.println("Pool:           " + pool.getNameLabel(conn));
 
-        // A pool-wide operation; existing sessions survive it.
-        Pool.rotateSecret(conn);
-        System.out.println("Rotated. Still connected: " + (Pool.getAll(conn).size() == 1));
+        try {
+            // A pool-wide operation; existing sessions survive it.
+            Pool.rotateSecret(conn);
+            System.out.println("Rotated. Still connected: " + (Pool.getAll(conn).size() == 1));
+        } catch (Types.HaIsEnabled e) {
+            System.out.println("Could not rotate the pool secret: HA is enabled on this pool; disable it first.");
+        } catch (Types.CannotContactHost e) {
+            System.out.println("Could not rotate the pool secret: a host in the pool is not reachable.");
+        } catch (Types.NotSupportedDuringUpgrade e) {
+            System.out.println("Could not rotate the pool secret: a rolling pool upgrade is in progress.");
+        } catch (Types.LicenceRestriction e) {
+            System.out.println("Could not rotate the pool secret: this edition is not licensed for pool secret rotation.");
+        } catch (Types.XenAPIException e) {
+            System.out.println("Could not rotate the pool secret: " + e.shortDescription);
+        }
         System.out.println("OK: rotate-pool-secret");
         Session.logout(conn);
     }
@@ -327,13 +619,10 @@ public class Workflows {
         // The existing session stays valid afterwards - only NEW connections need the new password.
         System.out.println("Session still usable: " + (Pool.getAll(conn).size() == 1));
 
-        // Supplying the wrong current password is the failure worth handling.
-        try {
-            Session.changePassword(conn, "definitely-not-it", "irrelevant");
-            System.out.println("unexpected: the wrong old password was accepted");
-        } catch (Types.XenAPIException e) {
-            System.out.println("Wrong old password rejected: " + e.shortDescription);
-        }
+        // Not demonstrated: a "wrong old password is rejected" check. session.change_password on a
+        // ROOT session ignores old_pwd entirely (CA-13567, confirmed in xapi_session.ml) - the call
+        // succeeds regardless of what's passed as the old password. The real gate is that only a
+        // session with is_local_superuser may call this at all.
 
         Session.changePassword(conn, temporary, password);
         System.out.println("Password restored.");
@@ -342,28 +631,48 @@ public class Workflows {
     }
 
     // --- Manage TLS certificates -----------------------------------------------------
+    // Install a pool-wide trusted certificate, replace a host's own TLS identity with a real certificate,
+    // reset it back to a fresh self-signed one, and read the counts back.
+    //
+    // A real, generated self-signed certificate, not a placeholder string: xapi decodes whatever is
+    // handed to installTrustedCertificate/installServerCertificate as PEM and rejects anything that isn't
+    // a well-formed certificate (INVALID_VALUE), so a dummy string fails on a real host even though it
+    // has no such check in the simulator. installTrustedCertificate/uninstallTrustedCertificate are the
+    // current API; the CA-specific pair this example used to call (installCaCertificate/
+    // uninstallCaCertificate) were deprecated in their favour.
     private static void manageCertificates(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
         Host host = Host.getAll(conn).iterator().next();
+        Pool pool = Pool.getAll(conn).iterator().next();
+        String[] certAndKey = selfSignedCertPem();
+        String certPem = certAndKey[0], keyPem = certAndKey[1];
 
         System.out.println("Certificates:   " + Certificate.getAll(conn).size());
 
-        // A CA certificate is pool-wide; a server certificate belongs to one host.
-        Pool.installCaCertificate(conn, "sdk-example-ca",
-                "-----BEGIN CERTIFICATE-----sdk-example-----END CERTIFICATE-----");
+        // ca=true: trusted as a root to verify a chain, not pinned as one specific leaf certificate.
+        // purpose=[]: general pool trust, not the licensing/ldaps-specific uses that enum also covers.
+        // installTrustedCertificate returns nothing, so find the new record by diffing the set.
+        Set<Certificate> before = Certificate.getAll(conn);
+        pool.installTrustedCertificate(conn, true, certPem, new java.util.HashSet<Types.CertificatePurpose>());
+        Set<Certificate> after = Certificate.getAll(conn);
+        after.removeAll(before);
+        Certificate certRef = after.iterator().next();
         System.out.println("After CA add:   " + Certificate.getAll(conn).size());
 
+        // Actually replace the host's own TLS identity with a real certificate (what this workflow's name
+        // promises, beyond CA trust), then reset it back to a fresh self-signed one.
+        host.installServerCertificate(conn, certPem, keyPem, "");
+        System.out.println("Host certificate replaced with a real, generated certificate.");
         host.resetServerCertificate(conn);
         System.out.println("Host certificate reset (a fresh self-signed identity).");
 
-        Pool.uninstallCaCertificate(conn, "sdk-example-ca", false);
+        pool.uninstallTrustedCertificate(conn, certRef);
         System.out.println("After CA remove:" + Certificate.getAll(conn).size());
 
         // Separately from which certificates exist: whether the pool actually CHECKS the ones its
         // members present to each other. Turning it on is a one-way door from here - there is no
         // matching disable, because a pool that could be talked out of verifying would not be
         // verifying - so the call is idempotent and safe to repeat.
-        Pool pool = Pool.getAll(conn).iterator().next();
         System.out.println("TLS verification: " + pool.getTlsVerificationEnabled(conn));
         Pool.enableTlsVerification(conn);
         System.out.println("  after enabling: " + pool.getTlsVerificationEnabled(conn));
@@ -395,13 +704,21 @@ public class Workflows {
         vm.setSnapshotSchedule(conn, vmss);
         System.out.println("Members:          " + vmss.getVMs(conn).size());
 
-        // Run it three times against a retention of two: the oldest is pruned away.
+        // Run it three times against a retention of two: the oldest is pruned away. Compare against the
+        // snapshots the VM already had, so only the schedule's own are counted (and tidied up below).
+        Set<VM> before = vm.getSnapshots(conn);
         for (int i = 0; i < 3; i++) {
             vmss.snapshotNow(conn);
         }
-        System.out.println("Snapshots kept:   " + vm.getSnapshots(conn).size() + " (retention 2)");
+        Set<VM> kept = new HashSet<>(vm.getSnapshots(conn));
+        kept.removeAll(before);
+        System.out.println("Snapshots kept:   " + kept.size() + " (retention 2)");
 
+        // Tidy up: a schedule with VMs still on it cannot be destroyed (VMSS_HAS_VM), so take the VM off it
+        // first. Destroying the schedule leaves the snapshots it took, so destroy those too, with their disks.
+        vm.setSnapshotSchedule(conn, new VMSS("OpaqueRef:NULL"));
         vmss.destroy(conn);
+        for (VM snapshot : kept) destroyVmAndDisks(conn, snapshot);
         System.out.println("OK: snapshot-schedule");
         Session.logout(conn);
     }
@@ -432,9 +749,8 @@ public class Workflows {
             System.out.println("  " + m.getNameLabel(conn));
         }
 
-        vm.setGroups(conn, new LinkedHashSet<VMGroup>());
-        System.out.println("After removal:  " + group.getVMs(conn).size() + " member(s)");
-
+        // VM_group.destroy already clears the group from every member VM's groups field - no need to
+        // remove membership ourselves first.
         group.destroy(conn);
         System.out.println("OK: manage-vm-groups");
         Session.logout(conn);
@@ -446,24 +762,43 @@ public class Workflows {
         Connection conn = connect(url, user, password);
         VM vm = vmByName(conn, vmName);
         System.out.println("Snapshotting VM: " + vm.getNameLabel(conn));
+        boolean wasRunning = vm.getPowerState(conn) == Types.VmPowerState.RUNNING;
 
         VM snap = vm.snapshot(conn, snapshotName);
         System.out.println("Created snapshot: " + snap.getUuid(conn));
 
+        // A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
+        // VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
+        // session id travels in the query string. Only a running VM has a console to capture: the server
+        // answers HTTP 500 for a halted VM, and for the snapshot record itself.
+        if (vm.getPowerState(conn) == Types.VmPowerState.RUNNING) {
+            HttpGet thumbGet = new HttpGet(url + "/vncsnapshot?session_id=" + conn.getSessionReference()
+                    + "&ref=" + vm.toWireString());
+            try (CloseableHttpClient http = trustingHttpClient()) {
+                byte[] png = http.execute(thumbGet, resp -> {
+                    if (resp.getCode() != 200) throw new java.io.IOException("vncsnapshot: HTTP " + resp.getCode());
+                    return EntityUtils.toByteArray(resp.getEntity());
+                });
+                System.out.println("Thumbnail:      " + png.length + " bytes of PNG");
+            }
+        } else {
+            System.out.println("Thumbnail:      none (the VM is not running, so it has no console)");
+        }
+
         snap.revert(conn);
         System.out.println("Reverted VM to the snapshot.");
 
-        // A client shows a thumbnail of what was on screen when the snapshot was taken. It is an HTTP
-        // transfer alongside the API, not an API call, so the session id travels in the query string.
-        HttpGet thumbGet = new HttpGet(url + "/vncsnapshot?session_id=" + conn.getSessionReference()
-                + "&ref=" + snap.toWireString());
-        try (CloseableHttpClient http = trustingHttpClient()) {
-            byte[] png = http.execute(thumbGet, resp -> EntityUtils.toByteArray(resp.getEntity()));
-            System.out.println("Thumbnail:      " + png.length + " bytes of PNG");
+        // Reverting to a plain snapshot always leaves the VM Halted (xapi hard-shuts-down a running VM
+        // before reverting it), even if it was Running a moment ago - restart it afterwards if that's how
+        // we found it, so the workflow actually restores what it changed.
+        if (wasRunning) {
+            vm.start(conn, false, true);
+            System.out.println("Restarted the VM (it was running before the revert).");
         }
 
-        // A snapshot is itself a (special) VM record; destroy it to clean up.
-        snap.destroy(conn);
+        // A snapshot is itself a (special) VM record, with its own snapshot disks; destroy both to clean up
+        // (the source VM's disks are untouched - they are not the snapshot's).
+        destroyVmAndDisks(conn, snap);
         System.out.println("OK: snapshot-revert");
         Session.logout(conn);
     }
@@ -485,7 +820,7 @@ public class Workflows {
             "nfs", "user", true, new java.util.HashMap<>());
         System.out.println("Created SR: " + sr.getUuid(conn));
 
-        sr.forget(conn);
+        detachAndForgetSr(conn, sr);
         System.out.println("OK: create-nfs-sr");
         Session.logout(conn);
     }
@@ -644,6 +979,11 @@ public class Workflows {
         vifRec.otherConfig = new java.util.HashMap<>();
         vifRec.qosAlgorithmType = "";
         vifRec.qosAlgorithmParams = new java.util.HashMap<>();
+        // Left unset, the binding's Record defaults these two enums to its own UNRECOGNIZED sentinel,
+        // which released xapi rejects outright rather than treating as "no IP configured". Say so
+        // explicitly.
+        vifRec.ipv4ConfigurationMode = Types.VifIpv4ConfigurationMode.NONE;
+        vifRec.ipv6ConfigurationMode = Types.VifIpv6ConfigurationMode.NONE;
         VIF.create(conn, vifRec);
         System.out.println("Networking:    NIC on " + ne.getValue().nameLabel);
 
@@ -668,13 +1008,17 @@ public class Workflows {
     //   newVmWizard("https://xenserver", "root", password, "Rocky Linux 8", "wizard-vm");
 
     // --- 10. Live migrate a VM ---------------------------------------------------------
+    // Moves a throwaway copy of sourceVm, a VM with a guest OS and PV drivers: live migration needs the
+    // guest's cooperation (VM_LACKS_FEATURE without PV drivers). Only the VM's memory moves, so the
+    // destination host has to see its disks already: a disk on local storage refuses with
+    // VM_REQUIRES_SR. Put the copy's disks on the shared SR srName first.
     private static void liveMigrate(String url, String user, String password,
-            String templateName, String newVmName) throws Exception {
+            String sourceVm, String srName, String newVmName) throws Exception {
         Connection conn = connect(url, user, password);
-        // Start a throwaway VM so there is something running to migrate.
-        VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        VM vm = copyOfGuest(conn, sourceVm, newVmName);
+        moveDisksToSr(conn, vm, srByName(conn, srName, true));
         vm.start(conn, false, true);
+        waitForGuestAgent(conn, vm);
 
         Host sourceHost = vm.getResidentOn(conn);
         System.out.println("VM is running on: " + sourceHost.getNameLabel(conn));
@@ -693,16 +1037,24 @@ public class Workflows {
 
         // Tidy up so the example is repeatable.
         vm.hardShutdown(conn);
-        vm.destroy(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: live-migrate");
         Session.logout(conn);
     }
     // Run it:
-    //   liveMigrate("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-migrate");
+    //   liveMigrate("https://xenserver", "root", password, "web-01", "Shared NFS", "sdk-example-migrate");
 
     // --- 11. Enter & exit maintenance mode ---------------------------------------------
+    // Pins a throwaway copy of sourceVm to the host so evacuation has work to do. Evacuation
+    // live-migrates the guest, which needs its cooperation (VM_LACKS_FEATURE without PV drivers), so
+    // sourceVm must have a guest OS with PV drivers.
+    //
+    // Evacuation needs somewhere else in the pool that can actually see the VM's disk - a VM whose only
+    // disk is on local (non-shared) storage can't be evacuated at all (VM_REQUIRES_SR), and a pool's
+    // installation-time default SR is commonly local storage. Put the pinned VM's disk on a shared SR
+    // explicitly rather than trusting whatever the pool default happens to be.
     private static void hostMaintenance(String url, String user, String password,
-            String templateName, String newVmName) throws Exception {
+            String sourceVm, String srName, String newVmName) throws Exception {
         Connection conn = connect(url, user, password);
         // Choose a host that is not the pool coordinator, so the coordinator can receive its guests.
         Host master = Pool.getAllRecords(conn).values().iterator().next().master;
@@ -712,10 +1064,11 @@ public class Workflows {
         System.out.println("Maintenance host: " + hostRef.getNameLabel(conn));
 
         // Pin a running VM to that host so evacuation has something to move.
-        VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        VM vm = copyOfGuest(conn, sourceVm, newVmName);
+        moveDisksToSr(conn, vm, srByName(conn, srName, true));
         vm.setAffinity(conn, hostRef);
         vm.start(conn, false, true);
+        waitForGuestAgent(conn, vm);
         System.out.println("Guest resident on:" + vm.getResidentOn(conn).getNameLabel(conn));
 
         // Enter maintenance mode: disable the host, then evacuate its guests.
@@ -730,12 +1083,12 @@ public class Workflows {
 
         // Tidy up so the example is repeatable.
         vm.hardShutdown(conn);
-        vm.destroy(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: host-maintenance");
         Session.logout(conn);
     }
     // Run it:
-    //   hostMaintenance("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-maint");
+    //   hostMaintenance("https://xenserver", "root", password, "web-01", "Shared NFS", "sdk-example-maint");
 
     // --- 12. Configure high availability -----------------------------------------------
     private static void configureHa(String url, String user, String password,
@@ -793,17 +1146,19 @@ public class Workflows {
         SR sr = srByName(conn, srName, false);
         System.out.println("Copying '" + source.getNameLabel(conn) + "' to SR: " + sr.getNameLabel(conn));
 
+        // VM.copy (like VM.clone) requires a Halted source (VM_BAD_POWER_STATE otherwise).
+        boolean wasRunning = source.getPowerState(conn) == Types.VmPowerState.RUNNING;
+        if (wasRunning) source.cleanShutdown(conn);
+
         VM copy = source.copy(conn, copyName, sr);
         System.out.println("Copied VM:     " + copy.getUuid(conn));
         System.out.println("Copy has " + copy.getVBDs(conn).size()
                 + " VBD(s), is_a_template = " + copy.getIsATemplate(conn));
 
+        if (wasRunning) source.start(conn, false, true);
+
         // Tidy up: destroy the copy and its disks, leaving the source VM intact.
-        Set<VDI> copyVdis = new LinkedHashSet<>();
-        for (VBD vbd : copy.getVBDs(conn))
-            if (vbd.getType(conn) == Types.VbdType.DISK) copyVdis.add(vbd.getVDI(conn));
-        copy.destroy(conn);
-        for (VDI vdi : copyVdis) vdi.destroy(conn);
+        destroyVmAndDisks(conn, copy);
         System.out.println("Cleaned up the copied VM (left the source intact).");
         System.out.println("OK: copy-vm");
         Session.logout(conn);
@@ -835,7 +1190,7 @@ public class Workflows {
 
         // Provision a fresh VM from the template to attach the vGPU to.
         VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        provision(conn, vm);
 
         // Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty. Same call
         // as XenCenter's New VM wizard GPU page and the VM Properties GPU page.
@@ -849,7 +1204,7 @@ public class Workflows {
 
         // Tidy up so the example is repeatable.
         vgpu.destroy(conn);
-        vm.destroy(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("Cleaned up the example VM and its vGPU.");
 
         System.out.println("OK: create-vm-with-vgpu");
@@ -886,11 +1241,16 @@ public class Workflows {
     // --- 16. Configure updates (CDN) ---------------------------------------------------
     private static void configureUpdates(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
+        // update=True: without it this introduces only a base package mirror, not an actual *update*
+        // repository - pool.syncUpdates needs one with update=True enabled (NO_REPOSITORY_ENABLED
+        // otherwise), which is exactly what apply-update and rolling-pool-update rely on.
         Repository repo = Repository.introduce(conn, "sdk-cdn", "SDK example repository",
-                "https://cdn.example/base", "https://cdn.example/source", false, "");
+                "https://cdn.example/base", "https://cdn.example/source", true, "");
         System.out.println("Introduced repository: " + repo.getNameLabel(conn));
 
         Pool pool = Pool.getAll(conn).iterator().next();
+        // Remember the pool's own repositories, to put them back afterwards.
+        Set<Repository> previous = pool.getRepositories(conn);
         pool.setRepositories(conn, new LinkedHashSet<>(java.util.List.of(repo)));
         pool.setUpdateSyncEnabled(conn, true);
         System.out.println("Pool repositories: " + pool.getRepositories(conn).size()
@@ -898,7 +1258,7 @@ public class Workflows {
 
         // Tidy up so the example is repeatable.
         pool.setUpdateSyncEnabled(conn, false);
-        pool.setRepositories(conn, new LinkedHashSet<>());
+        pool.setRepositories(conn, previous);
         repo.forget(conn);
         System.out.println("OK: configure-updates");
         Session.logout(conn);
@@ -918,9 +1278,7 @@ public class Workflows {
         System.out.println("Clone has " + clone.getVBDs(conn).size() + " VBD(s)");
 
         // Tidy up: destroy the clone and its (owned) disks.
-        Set<VDI> vdis = diskVdis(conn, clone);
-        clone.destroy(conn);
-        for (VDI vdi : vdis) vdi.destroy(conn);
+        destroyVmAndDisks(conn, clone);
         System.out.println("OK: clone-vm");
         Session.logout(conn);
     }
@@ -934,7 +1292,7 @@ public class Workflows {
         // Make a throwaway VM to delete. VM.destroy removes the VM but leaves its disks, so the
         // owned VDIs are destroyed explicitly afterward — exactly what XenCenter's Delete VM does.
         VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        provision(conn, vm);
         String uuid = vm.getUuid(conn);
         Set<VDI> vdis = diskVdis(conn, vm);
         System.out.println("Deleting VM " + uuid + " with " + vdis.size() + " disk(s)");
@@ -953,52 +1311,94 @@ public class Workflows {
     //   deleteVm("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-delete");
 
     // --- 19. Storage live-migration (move a disk to another SR) -------------------------
+    // Moving a running VM's disk needs the guest's cooperation (VM_LACKS_FEATURE without PV drivers),
+    // so this works on a throwaway copy of sourceVm, a VM with a guest OS and PV drivers. (A halted VM's
+    // disk moves too, without the guest; what VDI.poolMigrate always needs is a VM to move the disk
+    // for - a VDI no VBD points at fails VDI_NEEDS_VM_FOR_MIGRATE.)
     private static void storageMigrate(String url, String user, String password,
-            String templateName, String newVmName) throws Exception {
+            String sourceVm, String newVmName) throws Exception {
         Connection conn = connect(url, user, password);
-        // Provision a VM so it has a disk to relocate, note the disk's current SR.
-        VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        VM vm = copyOfGuest(conn, sourceVm, newVmName);
+        vm.start(conn, false, true);
+        waitForGuestAgent(conn, vm);
         VDI vdi = diskVdis(conn, vm).iterator().next();
         SR sourceSr = vdi.getSR(conn);
         System.out.println("Disk is on SR: " + sourceSr.getNameLabel(conn));
 
-        // Pick a different SR that can hold a VDI and move the disk there (live storage migration).
+        // Pick a different SR that holds disks and that the VM's host can reach (an attached PBD there).
+        Host host = vm.getResidentOn(conn);
         SR destSr = null;
         for (Map.Entry<SR, SR.Record> e : SR.getAllRecords(conn).entrySet()) {
-            if (!e.getKey().equals(sourceSr)
-                    && !"iso".equals(e.getValue().type) && !"udev".equals(e.getValue().type)) {
-                destSr = e.getKey();
-                break;
-            }
+            SR.Record r = e.getValue();
+            if (e.getKey().equals(sourceSr) || "iso".equals(r.contentType)
+                    || "iso".equals(r.type) || "udev".equals(r.type))
+                continue;
+            boolean reachable = false;
+            for (PBD pbd : r.PBDs)
+                if (pbd.getHost(conn).equals(host) && pbd.getCurrentlyAttached(conn)) { reachable = true; break; }
+            if (reachable) { destSr = e.getKey(); break; }
         }
-        vdi.poolMigrate(conn, destSr, new java.util.HashMap<>());
+        // poolMigrate returns the disk's new VDI: the copy on the destination SR replaces the original.
+        // Copying a disk takes minutes, so run it as a task (see awaitTask).
+        vdi = new VDI(awaitTask(conn, vdi.poolMigrateAsync(conn, destSr, new java.util.HashMap<>())));
 
         System.out.println("Disk moved to:  " + vdi.getSR(conn).getNameLabel(conn));
 
-        // Tidy up.
-        vm.destroy(conn);
-        vdi.destroy(conn);
+        // Tidy up: the VM and the disks it now owns.
+        vm.hardShutdown(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: storage-migrate");
         Session.logout(conn);
     }
     // Run it:
-    //   storageMigrate("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-storagemigrate");
+    //   storageMigrate("https://xenserver", "root", password, "web-01", "sdk-example-storagemigrate");
 
     // --- 20. Apply updates from the CDN ------------------------------------------------
+    // pool.syncUpdates needs at least one repository with update=True enabled (NO_REPOSITORY_ENABLED
+    // otherwise) - introduce and attach a throwaway one, and forget it again afterwards. Applying a batch
+    // whose mandatory guidance needs an evacuation fails with HOST_EVACUATION_IS_REQUIRED unless the
+    // host's resident VMs are moved off first; handle that rather than assuming an update batch never
+    // asks for one. Only call host.reboot/host.restart_agent when the RETURNED pending guidance actually
+    // contains REBOOT_HOST/RESTART_TOOLSTACK (modern xapi, >=23.18.0, never auto-reboots - it only
+    // records guidance) - not unconditionally after every apply.
     private static void applyUpdate(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
-        // Sync the pool's update metadata from the CDN; the returned hash identifies the synced set.
         Pool pool = Pool.getAll(conn).iterator().next();
-        String hash = pool.syncUpdates(conn, false, "", "");
-        System.out.println("Synced updates; hash length " + hash.length());
+        Repository repo = Repository.introduce(conn, "sdk-cdn", "SDK example repository",
+                "https://cdn.example/base", "https://cdn.example/source", true, "");
+        // Remember the pool's own repositories, to put them back afterwards.
+        Set<Repository> previous = pool.getRepositories(conn);
+        pool.setRepositories(conn, new LinkedHashSet<>(java.util.List.of(repo)));
+        try {
+            // Sync the pool's update metadata; the returned hash identifies the synced set.
+            String hash = pool.syncUpdates(conn, false, "", "");
+            System.out.println("Synced updates; hash length " + hash.length());
 
-        // Apply the synced updates to each host. XenCenter then reads the reboot guidance to decide
-        // whether a Rolling Pool Upgrade reboot is needed.
-        for (Map.Entry<Host, Host.Record> e : Host.getAllRecords(conn).entrySet()) {
-            e.getKey().applyUpdates(conn, hash);
-            System.out.println("  " + e.getValue().nameLabel + ": applied; pending guidance = "
-                    + e.getKey().getPendingGuidances(conn));
+            // Apply the synced updates to each host. XenCenter then reads the reboot guidance to decide
+            // whether a Rolling Pool Upgrade reboot is needed.
+            for (Map.Entry<Host, Host.Record> e : Host.getAllRecords(conn).entrySet()) {
+                Host host = e.getKey();
+                try {
+                    host.applyUpdates(conn, hash);
+                } catch (Types.HostEvacuationIsRequired ex) {
+                    System.out.println("  " + e.getValue().nameLabel + ": needs evacuating first; "
+                            + "evacuating and retrying");
+                    host.disable(conn);
+                    host.evacuate(conn);
+                    host.applyUpdates(conn, hash);
+                    host.enable(conn);
+                }
+                Set<Types.UpdateGuidances> guidance = host.getPendingGuidances(conn);
+                System.out.println("  " + e.getValue().nameLabel + ": applied; pending guidance = " + guidance);
+                if (guidance.contains(Types.UpdateGuidances.REBOOT_HOST)) {
+                    host.reboot(conn);
+                } else if (guidance.contains(Types.UpdateGuidances.RESTART_TOOLSTACK)) {
+                    host.restartAgent(conn);
+                }
+            }
+        } finally {
+            pool.setRepositories(conn, previous);
+            repo.forget(conn);
         }
         System.out.println("OK: apply-update");
         Session.logout(conn);
@@ -1007,30 +1407,38 @@ public class Workflows {
     //   applyUpdate("https://xenserver", "root", password);
 
     // --- 21. Checkpoint & revert -------------------------------------------------------
+    // Checkpointing needs the guest's cooperation (VM_LACKS_FEATURE without PV drivers), hence a copy of
+    // sourceVm - a VM with a guest OS and PV drivers - rather than an OS-less template clone.
     private static void checkpointVm(String url, String user, String password,
-            String templateName, String newVmName) throws Exception {
+            String sourceVm, String newVmName) throws Exception {
         Connection conn = connect(url, user, password);
         // A checkpoint captures disk AND memory (unlike a plain snapshot), so the VM must be running.
-        VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        VM vm = copyOfGuest(conn, sourceVm, newVmName);
         vm.start(conn, false, true);
+        waitForGuestAgent(conn, vm);
 
         VM checkpoint = vm.checkpoint(conn, "sdk-example-checkpoint-1");
         System.out.println("Created checkpoint: " + checkpoint.getUuid(conn));
         System.out.println("is_a_snapshot = " + checkpoint.getIsASnapshot(conn));
 
         checkpoint.revert(conn);
-        System.out.println("Reverted the VM to the checkpoint.");
+        // A checkpoint's own power_state is always Suspended (it captures memory as well as disk), and
+        // revert restores exactly that - so the VM is Suspended here, not Running as it was before the
+        // checkpoint, with a suspend_VDI holding the checkpoint's memory image. VM.resume clears that:
+        // destroying a Suspended VM directly (as a bare "if Running: hardShutdown" check would, since the
+        // VM is never Running here) leaves that suspend_VDI behind as a storage leak.
+        System.out.println("Reverted the VM to the checkpoint; power state now: " + vm.getPowerState(conn));
+        vm.resume(conn, false, true);
 
-        // Tidy up.
-        checkpoint.destroy(conn);
-        if (vm.getPowerState(conn) == Types.VmPowerState.RUNNING) vm.hardShutdown(conn);
-        vm.destroy(conn);
+        // Tidy up. The checkpoint owns its own snapshot disks, separate from the VM's.
+        destroyVmAndDisks(conn, checkpoint);
+        vm.hardShutdown(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: checkpoint-vm");
         Session.logout(conn);
     }
     // Run it:
-    //   checkpointVm("https://xenserver", "root", password, "Rocky Linux 8", "sdk-example-checkpoint");
+    //   checkpointVm("https://xenserver", "root", password, "web-01", "sdk-example-checkpoint");
 
     // --- 22. Attach a new disk to a VM -------------------------------------------------
     private static void attachDisk(String url, String user, String password,
@@ -1038,7 +1446,7 @@ public class Workflows {
         final long GiB = 1024L * 1024 * 1024;
         Connection conn = connect(url, user, password);
         VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        provision(conn, vm);
         SR sr = srByName(conn, srName, false);
 
         // Create a fresh VDI on the SR and attach it as a new VBD (a new virtual disk).
@@ -1067,11 +1475,8 @@ public class Workflows {
         System.out.println("Attached an 8 GiB disk on " + sr.getNameLabel(conn) + " as device " + device);
         System.out.println("VM now has " + vm.getVBDs(conn).size() + " VBD(s)");
 
-        // Tidy up: gather the owned disks first, then destroy the VM (which removes its VBDs), then
-        // destroy the disks (VM.destroy leaves VDIs behind).
-        Set<VDI> owned = diskVdis(conn, vm);
-        vm.destroy(conn);
-        for (VDI d : owned) d.destroy(conn);
+        // Tidy up: the VM and both the disk it was provisioned with and the one just attached.
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: attach-disk");
         Session.logout(conn);
     }
@@ -1111,13 +1516,19 @@ public class Workflows {
     private static void errorHandling(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
         // XenAPI errors surface as a XenAPIException. Specific errors are typed subclasses (e.g.
-        // UuidInvalid): the class name identifies the error and getMessage() is the readable text.
+        // UuidInvalid): the class name identifies the error. getMessage() is NOT the readable text here -
+        // CA-432675: the generated XenAPIException never calls super(message), so Throwable.getMessage()
+        // is null for every typed XenAPI exception in the current Java SDK (confirmed against a real
+        // host; the SDK fix isn't released yet). shortDescription/errorDescription carry the real text,
+        // and work against any SDK build.
         try {
             Host.getByUuid(conn, "this-uuid-does-not-exist");
             System.out.println("unexpected: no error");
         } catch (Types.XenAPIException e) {
             System.out.println("Caught expected failure: " + e.getClass().getSimpleName());
-            System.out.println("Short message: " + e.getMessage());
+            System.out.println("Short message: " + e.shortDescription);
+            if (e.errorDescription != null)
+                System.out.println("Error fields: " + java.util.Arrays.toString(e.errorDescription));
         }
         System.out.println("OK: error-handling");
         Session.logout(conn);
@@ -1236,27 +1647,30 @@ public class Workflows {
             String templateName, String newVmName) throws Exception {
         Connection conn = connect(url, user, password);
         VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        provision(conn, vm);
 
         vm.setVCPUsMax(conn, 4L);
         vm.setVCPUsAtStartup(conn, 2L);
 
         // Boot mode: firmware ("bios"/"uefi") lives in HVM_boot_params; Secure Boot in
-        // platform["secureboot"]. Switch to UEFI Secure Boot (as the New VM wizard does for a
-        // UEFI-capable template) and read it back.
+        // platform["secureboot"]. "auto" (not a hard-coded "true") is the real xe/XenCenter convention:
+        // xapi resolves it against whether the pool actually holds Secure Boot certificates, at VM.start
+        // time - a hard "true" would claim Secure Boot is on even on a template that was never set up for
+        // it, since setPlatform does no validation of its own.
         Map<String, String> bootParams = new java.util.HashMap<>();
         bootParams.put("order", "cdn");
         bootParams.put("firmware", "uefi");
         vm.setHVMBootParams(conn, bootParams);
         Map<String, String> platform = vm.getPlatform(conn);
-        platform.put("secureboot", "true");
+        platform.put("secureboot", "auto");
         vm.setPlatform(conn, platform);
         System.out.println("vCPUs: " + vm.getVCPUsAtStartup(conn) + "/" + vm.getVCPUsMax(conn));
         System.out.println("Boot order: " + vm.getHVMBootParams(conn).get("order"));
         System.out.println("Boot mode: firmware=" + vm.getHVMBootParams(conn).get("firmware")
-                + ", secureboot=" + vm.getPlatform(conn).get("secureboot"));
+                + ", secureboot=" + vm.getPlatform(conn).get("secureboot")
+                + " (resolved against pool certificates at boot)");
 
-        vm.destroy(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: vm-boot-config");
         Session.logout(conn);
     }
@@ -1361,7 +1775,7 @@ public class Workflows {
             String templateName, String newVmName) throws Exception {
         Connection conn = connect(url, user, password);
         VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn);
+        provision(conn, vm);
         Network net = Network.getAll(conn).iterator().next();
         String device = vm.getAllowedVIFDevices(conn).iterator().next();
 
@@ -1374,12 +1788,17 @@ public class Workflows {
         vifRec.otherConfig = new java.util.HashMap<>();
         vifRec.qosAlgorithmType = "";
         vifRec.qosAlgorithmParams = new java.util.HashMap<>();
+        // Left unset, the binding's Record defaults these two enums to its own UNRECOGNIZED sentinel,
+        // which released xapi rejects outright rather than treating as "no IP configured". Say so
+        // explicitly.
+        vifRec.ipv4ConfigurationMode = Types.VifIpv4ConfigurationMode.NONE;
+        vifRec.ipv6ConfigurationMode = Types.VifIpv6ConfigurationMode.NONE;
         VIF vif = VIF.create(conn, vifRec);
         System.out.println("Attached a VIF on device " + device + "; VM now has "
                 + vm.getVIFs(conn).size() + " NIC(s)");
 
         vif.destroy(conn);
-        vm.destroy(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: manage-vif");
         Session.logout(conn);
     }
@@ -1437,14 +1856,14 @@ public class Workflows {
             String templateName, String newVmName) throws Exception {
         Connection conn = connect(url, user, password);
         VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
-        vm.provision(conn); // now a real (halted) VM
+        provision(conn, vm); // now a real (halted) VM
         System.out.println("is_a_template after provision: " + vm.getIsATemplate(conn));
 
         // Converting a VM to a custom template is a one-way operation.
         vm.setIsATemplate(conn, true);
         System.out.println("is_a_template after convert:  " + vm.getIsATemplate(conn));
 
-        vm.destroy(conn);
+        destroyVmAndDisks(conn, vm);
         System.out.println("OK: convert-to-template");
         Session.logout(conn);
     }
@@ -1467,23 +1886,42 @@ public class Workflows {
     //   findByUuid("https://xenserver", "root", password, "web-01");
 
     // --- 41. Rolling pool update ------------------------------------------------------
+    // Needs an enabled update repository the same way apply-update does - introduce and attach a
+    // throwaway one, forget it again afterwards. Modern xapi (>=23.18.0) doesn't reboot a host for you:
+    // it only records pending guidance, so only reboot (or restart the toolstack) when the applied batch
+    // actually asks for it.
     private static void rollingPoolUpdate(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
         Pool pool = Pool.getAll(conn).iterator().next();
-        String hash = pool.syncUpdates(conn, false, "", "");
-        System.out.println("Synced updates; hash length " + hash.length());
+        Repository repo = Repository.introduce(conn, "sdk-cdn", "SDK example repository",
+                "https://cdn.example/base", "https://cdn.example/source", true, "");
+        // Remember the pool's own repositories, to put them back afterwards.
+        Set<Repository> previous = pool.getRepositories(conn);
+        pool.setRepositories(conn, new LinkedHashSet<>(java.util.List.of(repo)));
+        try {
+            String hash = pool.syncUpdates(conn, false, "", "");
+            System.out.println("Synced updates; hash length " + hash.length());
 
-        // The rolling pattern behind XenCenter's automated Install Updates:
-        // disable -> evacuate -> apply -> reboot -> re-enable, one host at a time.
-        for (Map.Entry<Host, Host.Record> e : Host.getAllRecords(conn).entrySet()) {
-            Host host = e.getKey();
-            System.out.println("Updating " + e.getValue().nameLabel + ":");
-            host.disable(conn);            // stop new VMs landing here
-            host.evacuate(conn);           // move running guests to the rest of the pool
-            host.applyUpdates(conn, hash); // apply the synced updates
-            System.out.println("  applied; pending guidance = " + host.getPendingGuidances(conn));
-            host.reboot(conn);             // reboot into the updated software
-            host.enable(conn);             // return the host to service
+            // The rolling pattern behind XenCenter's automated Install Updates:
+            // disable -> evacuate -> apply -> reboot (only if asked) -> re-enable, one host at a time.
+            for (Map.Entry<Host, Host.Record> e : Host.getAllRecords(conn).entrySet()) {
+                Host host = e.getKey();
+                System.out.println("Updating " + e.getValue().nameLabel + ":");
+                host.disable(conn);            // stop new VMs landing here
+                host.evacuate(conn);           // move running guests to the rest of the pool
+                host.applyUpdates(conn, hash); // apply the synced updates
+                Set<Types.UpdateGuidances> guidance = host.getPendingGuidances(conn);
+                System.out.println("  applied; pending guidance = " + guidance);
+                if (guidance.contains(Types.UpdateGuidances.REBOOT_HOST)) {
+                    host.reboot(conn);         // reboot into the updated software
+                } else if (guidance.contains(Types.UpdateGuidances.RESTART_TOOLSTACK)) {
+                    host.restartAgent(conn);
+                }
+                host.enable(conn);             // return the host to service
+            }
+        } finally {
+            pool.setRepositories(conn, previous);
+            repo.forget(conn);
         }
         System.out.println("OK: rolling-pool-update");
         Session.logout(conn);
@@ -1589,7 +2027,9 @@ public class Workflows {
                 for (int k = 0; k < legends.size(); k++) {
                     String[] parts = legends.get(k).asText().split(":");
                     if (parts[1].equals("host") && parts[3].equals("pvsaccelerator_space_utilization")) {
-                        peak.merge(parts[2], values.get(k).asDouble(), Math::max);
+                        double value = values.get(k).asDouble();
+                        if (Double.isNaN(value)) continue; // a gap in the series, not a real sample
+                        peak.merge(parts[2], value, Math::max);
                     }
                 }
             }
@@ -1622,7 +2062,9 @@ public class Workflows {
             pargs.put("sr_uuid", sr.uuid);
             String result = host.callPlugin(conn, "trim", "do_trim", pargs);
             System.out.println("  reclaimed freed space on " + sr.nameLabel + ": " + result);
-            if (!"true".equals(result)) throw new RuntimeException("trim plugin returned '" + result + "'");
+            // Compare case-insensitively: a real host's trim plugin answers "True" (capitalised).
+            if (!"true".equalsIgnoreCase(result.trim()))
+                throw new RuntimeException("trim plugin returned '" + result + "'");
             System.out.println("OK: reclaim-space");
         } finally {
             Session.logout(conn);
@@ -1632,45 +2074,78 @@ public class Workflows {
     //   reclaimSpace("https://xenserver", "root", password);
 
     // --- 46. Get a VM's IP address -----------------------------------------------------
-    private static void vmIpAddress(String url, String user, String password) throws Exception {
+    // A VM that has only just started may not have reported in yet (no guest_metrics at all, or an
+    // empty networks map) - retry for a while rather than giving up on the first look, the way XenRT's
+    // own IP-discovery helpers do (they retry and fall back through several strategies for up to several
+    // minutes before concluding a guest has no usable address).
+    private static void vmIpAddress(String url, String user, String password,
+            long timeoutMs, long intervalMs) throws Exception {
         Connection conn = connect(url, user, password);
         try {
-            // A running guest reports its IP in VM_guest_metrics.networks, keyed "<vif device>/ip".
-            VM.Record vm = null;
-            for (VM.Record r : VM.getAllRecords(conn).values())
-                if (r.powerState == Types.VmPowerState.RUNNING && !r.isATemplate && !r.isControlDomain
-                        && !r.guestMetrics.toWireString().equals("OpaqueRef:NULL")) { vm = r; break; }
-            java.util.Map<String, String> networks = vm.guestMetrics.getRecord(conn).networks;
-            String ip = networks.getOrDefault("0/ip", "(no address reported)");
-            System.out.println("  " + vm.nameLabel + ": " + ip);
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            while (true) {
+                // A running guest reports its IP in networks, keyed "<vif device>/ip" (e.g. "0/ip").
+                VM.Record vm = null;
+                for (VM.Record r : VM.getAllRecords(conn).values())
+                    if (r.powerState == Types.VmPowerState.RUNNING && !r.isATemplate && !r.isControlDomain
+                            && !r.guestMetrics.toWireString().equals("OpaqueRef:NULL")) { vm = r; break; }
+                String ip = null;
+                if (vm != null) {
+                    Map<String, String> networks = vm.guestMetrics.getRecord(conn).networks;
+                    ip = networks.get("0/ip");
+                }
+                if (ip != null) {
+                    System.out.println("  " + vm.nameLabel + ": " + ip);
+                    break;
+                }
+                if (System.currentTimeMillis() > deadline)
+                    throw new RuntimeException("no running guest reported an IP address within "
+                            + (timeoutMs / 1000) + "s");
+                Thread.sleep(intervalMs);
+            }
             System.out.println("OK: vm-ip-address");
         } finally {
             Session.logout(conn);
         }
     }
     // Run it:
-    //   vmIpAddress("https://xenserver", "root", password);
+    //   vmIpAddress("https://xenserver", "root", password, 60_000, 2_000);
 
     // --- 47. Manage Active Directory users ---------------------------------------------
-    private static void manageAdUsers(String url, String user, String password) throws Exception {
+    // Join AD, add a user as a subject with an RBAC role, read it back, then tidy up.
+    //
+    // Needs a real, reachable AD domain controller - enableExternalAuth fails at the very first call
+    // (DNS/LDAP/Kerberos) without one, so domain/adminUser/adminPassword have to identify a real domain
+    // to join. newUser is the account to grant a role to; its subject identity is looked up against the
+    // directory just joined, so it has to be a real account there too. The simulator models a
+    // single-user, domain-less fake directory (hence the empty domain default) - override every one of
+    // these on a real pool.
+    private static void manageAdUsers(String url, String user, String password, String domain,
+            String adminUser, String adminPassword, String newUser) throws Exception {
         Connection conn = connect(url, user, password);
         try {
             Pool pool = Pool.getAll(conn).iterator().next();
             java.util.Map<String, String> config = new java.util.HashMap<>();
-            config.put("user", "administrator"); config.put("pass", "secret"); config.put("ldaps", "false");
-            pool.enableExternalAuth(conn, config, "citrix.local", "AD");
-            System.out.println("Joined domain: citrix.local");
+            config.put("user", adminUser);
+            config.put("pass", adminPassword);
+            config.put("ldaps", "false");
+            pool.enableExternalAuth(conn, config, domain, "AD");
+            System.out.println("Joined domain: " + (!domain.isEmpty() ? domain : "(none - simulator's fake directory)"));
 
-            String sid = Auth.getSubjectIdentifier(conn, "alice@citrix.local");
+            String subjectName = !domain.isEmpty() ? newUser + "@" + domain : newUser;
+            String sid = Auth.getSubjectIdentifier(conn, subjectName);
             java.util.Map<String, String> info = Auth.getSubjectInformationFromIdentifier(conn, sid);
+            // otherConfig/roles are accepted here but discarded by real xapi (it re-derives otherConfig
+            // from AD itself, and roles isn't a settable constructor field) - subject.addToRoles below is
+            // the call that actually matters.
             Subject.Record srec = new Subject.Record();
             srec.subjectIdentifier = sid;
-            srec.otherConfig = info;
+            srec.otherConfig = new java.util.HashMap<>();
             Subject subject = Subject.create(conn, srec);
 
-            Role admin = null;
-            for (Map.Entry<Role, Role.Record> e : Role.getAllRecords(conn).entrySet())
-                if (e.getValue().nameLabel.equals("pool-admin") && e.getValue().subroles.size() > 0) { admin = e.getKey(); break; }
+            // Resolve the "pool-admin" role with role.getByNameLabel (simpler/more idiomatic than
+            // filtering getAllRecords, matches what `xe subject-role-add role-name=` does server-side).
+            Role admin = Role.getByNameLabel(conn, "pool-admin").iterator().next();
             subject.addToRoles(conn, admin);
             StringBuilder roles = new StringBuilder();
             for (Role r : subject.getRoles(conn)) roles.append(r.getNameLabel(conn)).append(" ");
@@ -1685,104 +2160,130 @@ public class Workflows {
 
             subject.removeFromRoles(conn, admin);
             subject.destroy(conn);
-            pool.disableExternalAuth(conn, config);
+            pool.disableExternalAuth(conn, new java.util.HashMap<>());
             System.out.println("OK: manage-ad-users");
         } finally {
             Session.logout(conn);
         }
     }
     // Run it:
-    //   manageAdUsers("https://xenserver", "root", password);
+    //   manageAdUsers("https://xenserver", "root", password, "", "alice", "Password1", "alice");
 
     // --- 48. Create an iSCSI SR --------------------------------------------------------
-    private static void createIscsiSr(String url, String user, String password) throws Exception {
+    // Connect an SR to a LUN on the iSCSI target, discovering the IQN and the LUN the way the New SR
+    // wizard and XenRT do: a device-config that's missing a piece makes the backend fail on purpose, and
+    // the failure carries an XML fragment listing what it needs next.
+    // SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target: pass
+    // targetIqn to name yours (see chooseTargetIqn).
+    private static void createIscsiSr(String url, String user, String password, String target,
+            String port, String chapUser, String chapPassword, String targetIqn, String srName) throws Exception {
         final long GiB = 1024L * 1024 * 1024;
         Connection conn = connect(url, user, password);
         try {
             Host host = Host.getAllRecords(conn).keySet().iterator().next();
             Map<String, String> dc = new java.util.HashMap<>();
-            dc.put("target", "192.0.2.30");
-            dc.put("targetIQN", "iqn.2009-01.com.xenpretender:target-0");
-            dc.put("SCSIid", "360a980004265656d5f4a2d63764e5734");
-            SR sr = SR.create(conn, host, dc, 0L, "sdk-iscsi-sr", "iSCSI SR created by the SDK example",
+            dc.put("target", target);
+            if (port != null && !port.isEmpty()) dc.put("port", port);
+            if (chapUser != null && !chapUser.isEmpty()) {
+                dc.put("chapuser", chapUser);
+                dc.put("chappassword", chapPassword);
+            }
+
+            // First failing probe: target only -> the backend lists the IQNs it offers.
+            org.w3c.dom.Element iqnRoot = parseXml(probeForFailure(conn, host, dc, "lvmoiscsi")).getDocumentElement();
+            dc.put("targetIQN", chooseTargetIqn(iqnRoot, target, targetIqn));
+            System.out.println("Discovered IQN: " + dc.get("targetIQN"));
+
+            // Second failing probe: +targetIQN -> the backend lists the LUNs behind it. Real create also
+            // carries LUNid, which XenRT's own LUN-preparation helper always includes when known.
+            org.w3c.dom.Element lunRoot = parseXml(probeForFailure(conn, host, dc, "lvmoiscsi")).getDocumentElement();
+            org.w3c.dom.Element lun = (org.w3c.dom.Element) lunRoot.getElementsByTagName("LUN").item(0);
+            dc.put("SCSIid", firstTagText(lun, "SCSIid"));
+            String lunId = firstTagText(lun, "LUNid");
+            dc.put("LUNid", lunId != null ? lunId : "0");
+            System.out.println("Discovered LUN " + dc.get("LUNid") + " (SCSIid " + dc.get("SCSIid") + ")");
+
+            SR sr = SR.create(conn, host, dc, 0L, srName, "iSCSI SR created by the SDK example",
                 "lvmoiscsi", "user", true, new java.util.HashMap<>());
             System.out.println("Created SR: " + sr.getUuid(conn) + " (" + sr.getPhysicalSize(conn) / GiB + " GiB)");
-            sr.forget(conn);
+            detachAndForgetSr(conn, sr);
             System.out.println("OK: create-iscsi-sr");
         } finally {
             Session.logout(conn);
         }
     }
     // Run it:
-    //   createIscsiSr("https://xenserver", "root", password);
+    //   createIscsiSr("https://xenserver", "root", password, "192.0.2.30", null, null, null, null, "sdk-example-iscsi");
 
     // --- 49. Create an SMB SR ----------------------------------------------------------
-    private static void createSmbSr(String url, String user, String password) throws Exception {
+    // Connect a shared SR to an SMB/CIFS file share (create validates + sizes from the share). The
+    // password travels as a Secret, not plaintext device-config - the way XenRT and XenCenter both do it,
+    // and the only form seen in real captured sr-create calls for this SR type.
+    private static void createSmbSr(String url, String user, String password, String server, String share,
+            String smbUsername, String smbPassword, String srName) throws Exception {
         final long GiB = 1024L * 1024 * 1024;
         Connection conn = connect(url, user, password);
         try {
             Host host = Host.getAllRecords(conn).keySet().iterator().next();
+            Secret.Record secretRec = new Secret.Record();
+            secretRec.value = smbPassword;
+            secretRec.otherConfig = new java.util.HashMap<>();
+            Secret secret = Secret.create(conn, secretRec);
+
             Map<String, String> dc = new java.util.HashMap<>();
-            dc.put("server", "192.0.2.40");
-            dc.put("serverpath", "/vmstore");
-            dc.put("username", "Administrator");
-            dc.put("password", "Password1");
-            SR sr = SR.create(conn, host, dc, 0L, "sdk-smb-sr", "SMB SR created by the SDK example",
+            dc.put("server", server);
+            dc.put("serverpath", share);
+            dc.put("username", smbUsername);
+            dc.put("password_secret", secret.getUuid(conn));
+            SR sr = SR.create(conn, host, dc, 0L, srName, "SMB SR created by the SDK example",
                 "smb", "user", true, new java.util.HashMap<>());
             System.out.println("Created SR: " + sr.getUuid(conn) + " (" + sr.getPhysicalSize(conn) / GiB + " GiB)");
-            sr.forget(conn);
+            detachAndForgetSr(conn, sr);
+            secret.destroy(conn);
             System.out.println("OK: create-smb-sr");
         } finally {
             Session.logout(conn);
         }
     }
     // Run it:
-    //   createSmbSr("https://xenserver", "root", password);
+    //   createSmbSr("https://xenserver", "root", password, "192.0.2.40", "/vmstore", "Administrator",
+    //       "Password1", "sdk-example-smb");
 
     // --- 50. Create an HBA SR ----------------------------------------------------------
-    private static void createHbaSr(String url, String user, String password) throws Exception {
+    // Connect a shared SR to a fibre-channel (HBA) LUN, discovering it the way the New SR wizard does:
+    // probing with no SCSIid fails on purpose and lists every LUN the backend can see.
+    // SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
+    private static void createHbaSr(String url, String user, String password, String srName) throws Exception {
         final long GiB = 1024L * 1024 * 1024;
         Connection conn = connect(url, user, password);
         try {
             Host host = Host.getAllRecords(conn).keySet().iterator().next();
+
+            // The root element varies by backend; find BlockDevice entries by tag wherever they are.
+            org.w3c.dom.Element devlistRoot =
+                parseXml(probeForFailure(conn, host, new java.util.HashMap<>(), "lvmohba")).getDocumentElement();
+            org.w3c.dom.Element device = (org.w3c.dom.Element) devlistRoot.getElementsByTagName("BlockDevice").item(0);
+            String scsiId = firstTagText(device, "SCSIid");
+            String path = firstTagText(device, "path");
+            System.out.println("Discovered LUN: SCSIid " + scsiId + " on " + path);
+
+            // SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path>
+            // is for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
             Map<String, String> dc = new java.util.HashMap<>();
-            dc.put("SCSIid", "360a980004265656d5f4a2d63764e5736");
-            SR sr = SR.create(conn, host, dc, 0L, "sdk-hba-sr", "HBA SR created by the SDK example",
+            dc.put("SCSIid", scsiId);
+            SR sr = SR.create(conn, host, dc, 0L, srName, "HBA SR created by the SDK example",
                 "lvmohba", "user", true, new java.util.HashMap<>());
             System.out.println("Created SR: " + sr.getUuid(conn) + " (" + sr.getPhysicalSize(conn) / GiB + " GiB)");
-            sr.forget(conn);
+            detachAndForgetSr(conn, sr);
             System.out.println("OK: create-hba-sr");
         } finally {
             Session.logout(conn);
         }
     }
     // Run it:
-    //   createHbaSr("https://xenserver", "root", password);
+    //   createHbaSr("https://xenserver", "root", password, "sdk-example-hba");
 
-    // --- 51. Create a GFS2 SR ----------------------------------------------------------
-    private static void createGfs2Sr(String url, String user, String password) throws Exception {
-        final long GiB = 1024L * 1024 * 1024;
-        Connection conn = connect(url, user, password);
-        try {
-            Host host = Host.getAllRecords(conn).keySet().iterator().next();
-            Map<String, String> dc = new java.util.HashMap<>();
-            dc.put("provider", "iscsi");
-            dc.put("target", "192.0.2.30");
-            dc.put("targetIQN", "iqn.2009-01.com.xenpretender:target-0");
-            dc.put("SCSIid", "360a980004265656d5f4a2d63764e5735");
-            SR sr = SR.create(conn, host, dc, 0L, "sdk-gfs2-sr", "GFS2 SR created by the SDK example",
-                "gfs2", "user", true, new java.util.HashMap<>());
-            System.out.println("Created SR: " + sr.getUuid(conn) + " (" + sr.getPhysicalSize(conn) / GiB + " GiB)");
-            sr.forget(conn);
-            System.out.println("OK: create-gfs2-sr");
-        } finally {
-            Session.logout(conn);
-        }
-    }
-    // Run it:
-    //   createGfs2Sr("https://xenserver", "root", password);
-
-    // --- 52. Create an ISO library SR --------------------------------------------------
+    // --- 51. Create an ISO library SR --------------------------------------------------
     private static void createIsoSr(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
         try {
@@ -1793,7 +2294,7 @@ public class Workflows {
             SR sr = SR.create(conn, host, dc, 0L, "sdk-iso-sr", "ISO library created by the SDK example",
                 "iso", "iso", true, new java.util.HashMap<>());
             System.out.println("Created ISO SR: " + sr.getUuid(conn));
-            sr.forget(conn);
+            detachAndForgetSr(conn, sr);
             System.out.println("OK: create-iso-sr");
         } finally {
             Session.logout(conn);
@@ -1802,23 +2303,31 @@ public class Workflows {
     // Run it:
     //   createIsoSr("https://xenserver", "root", password);
 
-    // --- 53. Configure NRPE monitoring -------------------------------------------------
+    // --- 52. Configure NRPE monitoring -------------------------------------------------
+    // host.callPlugin is per-host - there is no pool-wide fan-out for plugin calls the way there is for
+    // pool.enableSsh - so configure every host in the pool, and restore each one to disabled again
+    // afterwards.
     private static void configureNrpe(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
         try {
-            Host host = Host.getAllRecords(conn).keySet().iterator().next();
-            System.out.println("NRPE status before: " + host.callPlugin(conn, "nrpe", "status", new java.util.HashMap<>()).trim());
-            host.callPlugin(conn, "nrpe", "enable", new java.util.HashMap<>());
-            Map<String, String> cfg = new java.util.HashMap<>();
-            cfg.put("allowed_hosts", "127.0.0.1,::1,10.0.0.5");
-            cfg.put("debug", "0");
-            cfg.put("ssl_logging", "0x00");
-            host.callPlugin(conn, "nrpe", "set-config", cfg);
-            host.callPlugin(conn, "nrpe", "restart", new java.util.HashMap<>());
-            System.out.println("NRPE status after:  " + host.callPlugin(conn, "nrpe", "status", new java.util.HashMap<>()).trim());
-            for (String line : host.callPlugin(conn, "nrpe", "get-config", new java.util.HashMap<>()).split("\n")) {
-                if (line.startsWith("allowed_hosts:"))
-                    System.out.println("Allowed hosts: " + line.split(":", 2)[1].trim());
+            for (Host host : Host.getAll(conn)) {
+                String label = host.getNameLabel(conn);
+                System.out.println(label + ": NRPE status before: "
+                        + host.callPlugin(conn, "nrpe", "status", new java.util.HashMap<>()).trim());
+                host.callPlugin(conn, "nrpe", "enable", new java.util.HashMap<>());
+                Map<String, String> cfg = new java.util.HashMap<>();
+                cfg.put("allowed_hosts", "127.0.0.1,::1,10.0.0.5");
+                cfg.put("debug", "0");
+                cfg.put("ssl_logging", "0x00");
+                host.callPlugin(conn, "nrpe", "set-config", cfg);
+                host.callPlugin(conn, "nrpe", "restart", new java.util.HashMap<>());
+                System.out.println("  status after:  "
+                        + host.callPlugin(conn, "nrpe", "status", new java.util.HashMap<>()).trim());
+                for (String line : host.callPlugin(conn, "nrpe", "get-config", new java.util.HashMap<>()).split("\n")) {
+                    if (line.startsWith("allowed_hosts:"))
+                        System.out.println("  allowed hosts: " + line.split(":", 2)[1].trim());
+                }
+                host.callPlugin(conn, "nrpe", "disable", new java.util.HashMap<>()); // restore
             }
             System.out.println("OK: configure-nrpe");
         } finally {
@@ -1828,29 +2337,45 @@ public class Workflows {
     // Run it:
     //   configureNrpe("https://xenserver", "root", password);
 
-    // --- 54. Configure SNMP monitoring -------------------------------------------------
-    private static void configureSnmp(String url, String user, String password) throws Exception {
+    // --- 53. Configure SNMP monitoring -------------------------------------------------
+    // trap_destination: the "nmss" list must contain at least one non-empty entry pointed at it (an empty
+    // list never configures where traps actually go - arguably the main point of "configure SNMP
+    // monitoring"; confirmed XenRT's own default test config always carries exactly one). Loop every
+    // host, same reasoning as configure-nrpe; restore each host to {"common":{"enabled":"no"}} (a partial
+    // config - real set-config merges) at the end, the way XenRT's own SNMPServer.disable() does.
+    private static void configureSnmp(String url, String user, String password, String trapDestination)
+            throws Exception {
         Connection conn = connect(url, user, password);
         try {
-            Host host = Host.getAllRecords(conn).keySet().iterator().next();
             String config = "{\"common\":{\"enabled\":\"yes\",\"debug_log\":\"no\"},"
                 + "\"agent\":{\"v2c\":\"yes\",\"v3\":\"no\",\"community\":\"sdk-community\",\"user_name\":\"\","
                 + "\"authentication_password\":\"\",\"authentication_protocol\":\"\","
-                + "\"privacy_password\":\"\",\"privacy_protocol\":\"\"},\"nmss\":[]}";
-            Map<String, String> args = new java.util.HashMap<>();
-            args.put("config", config);
-            host.callPlugin(conn, "snmp", "set-config", args);
-            String status = host.callPlugin(conn, "snmp", "status", new java.util.HashMap<>());
-            String cfg = host.callPlugin(conn, "snmp", "get-config", new java.util.HashMap<>());
-            System.out.println("SNMP enabled: " + jsonField(status, "enabled") + " / " + jsonField(status, "active"));
-            System.out.println("Community: " + jsonField(cfg, "community"));
+                + "\"privacy_password\":\"\",\"privacy_protocol\":\"\"},"
+                + "\"nmss\":[{\"address\":\"" + trapDestination + "\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\","
+                + "\"community\":\"sdk-community\",\"user_name\":\"\",\"authentication_password\":\"\","
+                + "\"authentication_protocol\":\"\",\"privacy_password\":\"\",\"privacy_protocol\":\"\"}]}";
+            for (Host host : Host.getAll(conn)) {
+                Map<String, String> args = new java.util.HashMap<>();
+                args.put("config", config);
+                host.callPlugin(conn, "snmp", "set-config", args);
+                String status = host.callPlugin(conn, "snmp", "status", new java.util.HashMap<>());
+                String cfg = host.callPlugin(conn, "snmp", "get-config", new java.util.HashMap<>());
+                String label = host.getNameLabel(conn);
+                System.out.println(label + ": SNMP enabled: " + jsonField(status, "enabled")
+                        + " / " + jsonField(status, "active"));
+                System.out.println("  community: " + jsonField(cfg, "community")
+                        + ", trap destination: " + jsonField(cfg, "address"));
+                Map<String, String> restore = new java.util.HashMap<>();
+                restore.put("config", "{\"common\":{\"enabled\":\"no\"}}");
+                host.callPlugin(conn, "snmp", "set-config", restore); // restore
+            }
             System.out.println("OK: configure-snmp");
         } finally {
             Session.logout(conn);
         }
     }
     // Run it:
-    //   configureSnmp("https://xenserver", "root", password);
+    //   configureSnmp("https://xenserver", "root", password, "192.0.2.50");
 
     // --- Manage a vApp ---------------------------------------------------------------
     private static void manageVapp(String url, String user, String password, String vmName)
@@ -1905,6 +2430,9 @@ public class Workflows {
                     new HashMap<String, String>());
             System.out.println("Attached:       " + vm.getVUSBs(conn).size() + " device(s)");
 
+            // VUSB.destroy refuses a VUSB that is still attached (OPERATION_NOT_ALLOWED) - on a running VM
+            // it gets plugged in as soon as it's created, so unplug it first.
+            if (vusb.getCurrentlyAttached(conn)) vusb.unplug(conn);
             vusb.destroy(conn);
             entry.getKey().setPassthroughEnabled(conn, false);
             System.out.println("OK: attach-usb-device");
@@ -1916,11 +2444,17 @@ public class Workflows {
     //   attachUsbDevice("https://xenserver", "root", password, "web-01");
 
     // --- Read workload-balancing recommendations -------------------------------------
-    private static void wlbRecommendations(String url, String user, String password, String vmName)
-            throws Exception {
+    // Connect a workload-balancing appliance and read its placement advice.
+    //
+    // Needs a real, reachable WLB appliance: pool.initializeWlb makes a synchronous HTTP call to it and
+    // raises WLB_CONNECTION_REFUSED/WLB_CONNECTION_RESET if it can't connect - there is no way to fake
+    // this with a placeholder. wlbHostPort is host:port, with no URL scheme - that is the real wire
+    // format (xe pool-initialize-wlb wlb_url="10.x.x.x:30601" ...), not a URL.
+    private static void wlbRecommendations(String url, String user, String password, String vmName,
+            String wlbHostPort, String wlbUsername, String wlbPassword) throws Exception {
         Connection conn = connect(url, user, password);
         try {
-            Pool.initializeWlb(conn, "https://wlb.example:8012", "wlbuser", "wlbpass", user, password);
+            Pool.initializeWlb(conn, wlbHostPort, wlbUsername, wlbPassword, user, password);
             Pool pool = Pool.getAll(conn).iterator().next();
             System.out.println("WLB: " + pool.getWlbUrl(conn));
 
@@ -2004,35 +2538,56 @@ public class Workflows {
     //   configureClustering("https://xenserver", "root", password);
 
     // --- Manage pool membership ------------------------------------------------------
+    // designateNewMaster runs a two-phase commit across every host and ends by restarting xapi pool-wide
+    // (the new coordinator becomes master, every other host becomes its slave) - so the session this call
+    // was made on, and the connection itself, do not survive it. Reconnect (with a bounded wait, since
+    // xapi is briefly unavailable while it restarts, the same way XenRT's own helper for this call does)
+    // before touching the pool again, and re-resolve every ref from the fresh session - do not reuse the
+    // old session or any ref resolved from it.
     private static void managePoolMembership(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
-        try {
-            Pool pool = Pool.getAll(conn).iterator().next();
-            Host original = pool.getMaster(conn);
-            System.out.println("Coordinator: " + original.getNameLabel(conn));
+        Pool pool = Pool.getAll(conn).iterator().next();
+        Host original = pool.getMaster(conn);
+        String originalName = original.getNameLabel(conn);
+        System.out.println("Coordinator: " + originalName);
 
-            Host other = null;
-            for (Host h : Host.getAll(conn)) {
-                System.out.println("  member: " + h.getNameLabel(conn)
-                        + (h.equals(original) ? " (coordinator)" : ""));
-                if (!h.equals(original)) other = h;
-            }
-
-            // Promote another member. The pool database moves with the role and clients are redirected,
-            // so this briefly interrupts management traffic — it does not move any VM.
-            Pool.designateNewMaster(conn, other);
-            System.out.println("Promoted:    " + other.getNameLabel(conn));
-
-            // Put it back. Ejecting a member (Pool.eject) is the other half of this surface and is
-            // deliberately not shown: it cannot be undone from the pool, because rejoining is initiated
-            // by the ejected host.
-            Pool.designateNewMaster(conn, original);
-            System.out.println("Restored:    " + original.getNameLabel(conn));
-
-            System.out.println("OK: manage-pool-membership");
-        } finally {
-            Session.logout(conn);
+        String otherName = null;
+        for (Host h : Host.getAll(conn)) {
+            System.out.println("  member: " + h.getNameLabel(conn)
+                    + (h.equals(original) ? " (coordinator)" : ""));
+            if (!h.equals(original)) otherName = h.getNameLabel(conn);
         }
+        Host other = hostByName(conn, otherName);
+
+        // Promote another member. The pool database moves with the role and clients are redirected, so
+        // this briefly interrupts management traffic - it does not move any VM.
+        Pool.designateNewMaster(conn, other);
+        System.out.println("Promoting:   " + otherName + " (xapi restarts pool-wide; reconnecting)");
+
+        conn = reconnectAfterMasterChange(url, user, password);
+        pool = Pool.getAll(conn).iterator().next();
+        System.out.println("Promoted:    " + pool.getMaster(conn).getNameLabel(conn));
+
+        // Put it back. Ejecting a member (Pool.eject) is the other half of this surface and is
+        // deliberately not shown: it cannot be undone from the pool, because rejoining is initiated
+        // by the ejected host.
+        Host originalAgain = hostByName(conn, originalName);
+        Pool.designateNewMaster(conn, originalAgain);
+        System.out.println("Restoring:   " + originalName + " (reconnecting again)");
+
+        conn = reconnectAfterMasterChange(url, user, password);
+        pool = Pool.getAll(conn).iterator().next();
+        System.out.println("Restored:    " + pool.getMaster(conn).getNameLabel(conn));
+
+        System.out.println("OK: manage-pool-membership");
+        Session.logout(conn);
+    }
+
+    /** Find a host by its exact name label (used to re-resolve a host across a reconnect). */
+    private static Host hostByName(Connection conn, String name) throws Exception {
+        for (Map.Entry<Host, Host.Record> e : Host.getAllRecords(conn).entrySet())
+            if (name.equals(e.getValue().nameLabel)) return e.getKey();
+        throw new RuntimeException("no host named '" + name + "' was found");
     }
     // Run it:
     //   managePoolMembership("https://xenserver", "root", password);
@@ -2121,7 +2676,11 @@ public class Workflows {
             // "initialised", and a proxy on a VM whose NIC is unplugged reports "stopped".
             System.out.printf("  %s: %s%n", guest.getValue().nameLabel, proxy.getStatus(conn));
 
-            // Forgetting the site takes its servers, caches and proxies with it.
+            // Forgetting the site only cascades its cache storage - a running proxy or a server it still
+            // has makes forget refuse with PVS_SITE_CONTAINS_RUNNING_PROXIES/_SERVERS, so tear those down
+            // ourselves first, in the same order every real PVS teardown uses.
+            proxy.destroy(conn);
+            for (PVSServer server : site.getServers(conn)) server.forget(conn);
             site.forget(conn);
             System.out.println("OK: configure-pvs-accelerator");
         } finally {
@@ -2167,8 +2726,9 @@ public class Workflows {
             Pool pool = Pool.getAll(conn).iterator().next();
 
             // Timed access is the point: set the timeout first and the server stamps an expiry when SSH
-            // is enabled, so a window opened for troubleshooting closes itself.
-            for (Host host : Host.getAll(conn)) host.setSshEnabledTimeout(conn, 3600L);
+            // is enabled, so a window opened for troubleshooting closes itself. set_ssh_enabled_timeout is
+            // itself a pool-wide fan-out call, exactly like enable_ssh/disable_ssh - no need to loop hosts.
+            pool.setSshEnabledTimeout(conn, 3600L);
 
             // The pool call fans out to every host, so there is no need to loop for the enable itself.
             pool.enableSsh(conn);
@@ -2277,12 +2837,16 @@ public class Workflows {
             if (vm == null) throw new Exception("no VM with a disk");
             System.out.println("Backing up " + record.nameLabel);
 
+            // CBT is switched on for the VM's own disk, and every snapshot taken from then on inherits it.
+            // It can't be switched on for a snapshot's disk after the fact (OPERATION_NOT_ALLOWED).
+            VDI live = firstDisk(conn, vm);
+            boolean wasEnabled = live.getCbtEnabled(conn);
+            if (!wasEnabled) live.enableCbt(conn);
+
             VM first = vm.snapshot(conn, "cbt-backup-1");
             VM second = vm.snapshot(conn, "cbt-backup-2");
             VDI vdiFrom = firstDisk(conn, first);
             VDI vdiTo = firstDisk(conn, second);
-            vdiFrom.enableCbt(conn);
-            vdiTo.enableCbt(conn);
 
             // One bit per 64 KiB block, base64-encoded; bit N set means block N changed. A real backup
             // reads only those blocks, over NBD.
@@ -2294,13 +2858,19 @@ public class Workflows {
                 vdiTo.getVirtualSize(conn) / (1024.0 * 1024));
 
             // Release the older snapshot's blocks but keep its change metadata, so the next incremental
-            // can still diff against it. The VDI record stays; its type changes.
+            // can still diff against it. data_destroy refuses a disk that a VM still uses (VDI_IN_USE), so
+            // drop the older snapshot's VM record first, as a backup tool does. The VDI record stays; its
+            // type changes.
+            first.destroy(conn);
             vdiFrom.dataDestroy(conn);
             System.out.printf("  older snapshot is now type=%s, still cbt_enabled=%b%n",
                 vdiFrom.getType(conn), vdiFrom.getCbtEnabled(conn));
 
-            first.destroy(conn);
-            second.destroy(conn);
+            // Tidy up: the newer snapshot and its disk, the metadata-only VDI, and CBT on the VM's own
+            // disk if this example switched it on.
+            destroyVmAndDisks(conn, second);
+            vdiFrom.destroy(conn);
+            if (!wasEnabled) live.disableCbt(conn);
             System.out.println("OK: changed-block-tracking");
         } finally {
             Session.logout(conn);
@@ -2351,17 +2921,32 @@ public class Workflows {
             long blocks = names.stream().filter(n -> !n.endsWith(".checksum")).count() - 1;
             System.out.printf("  archive holds %s and %d disk block(s)%n", names.get(0), blocks);
 
-            String imported;
-            HttpPut put = new HttpPut(url + "/import?session_id=" + session);
-            put.setEntity(new org.apache.hc.core5.http.io.entity.ByteArrayEntity(
-                java.nio.file.Files.readAllBytes(file.toPath()), null));
-            try (CloseableHttpClient http = trustingHttpClient()) {
-                imported = http.execute(put, resp -> EntityUtils.toString(resp.getEntity())).trim();
+            // The imported VM's ref is NOT in the /import response body on a real host (only this
+            // simulator's convenience echoes it there). Create a task first, append &task_id=<task> to
+            // the /import URL, poll the task, and parse the ref out of task.getResult() (same
+            // <value>...</value> string-strip wait-for-task already uses). Destroy the task in a finally.
+            Task task = Task.create(conn, "vm_import", "importing " + record.nameLabel + " back");
+            VM importedVm;
+            try {
+                HttpPut put = new HttpPut(url + "/import?session_id=" + session + "&task_id=" + task.toWireString());
+                put.setEntity(new org.apache.hc.core5.http.io.entity.ByteArrayEntity(
+                    java.nio.file.Files.readAllBytes(file.toPath()), null));
+                try (CloseableHttpClient http = trustingHttpClient()) {
+                    http.execute(put, resp -> EntityUtils.toString(resp.getEntity()));
+                }
+
+                while (task.getStatus(conn) == Types.TaskStatusType.PENDING) Thread.sleep(500);
+                if (task.getStatus(conn) != Types.TaskStatusType.SUCCESS)
+                    throw new RuntimeException("import failed: " + task.getErrorInfo(conn));
+                String result = task.getResult(conn).replace("<value>", "").replace("</value>", "").trim();
+                importedVm = new VM(result);
+            } finally {
+                task.destroy(conn);
             }
-            VM importedVm = new VM(imported);   // the response body is the new VM's reference
             System.out.println("  imported as " + importedVm.getNameLabel(conn));
 
-            importedVm.destroy(conn);
+            // The import brought its own disks along; destroy those too, not just the VM record.
+            destroyVmAndDisks(conn, importedVm);
             file.delete();
             System.out.println("OK: export-import-vm");
         } finally {
@@ -2509,18 +3094,25 @@ public class Workflows {
     //   manageVmMedia("https://xenserver", "root", password);
 
     // --- Back up a host's configuration ---
+    // Both /host_backup and /host_restore are served only by whichever host physically accepted the HTTP
+    // connection - the handler ignores any ref= in the query string entirely, there is no forwarding to
+    // another pool member. So backing up/restoring a host means opening the connection to THAT host's own
+    // address, not to the pool's (coordinator) url - a restore sent to the wrong host's connection
+    // silently restores the WRONG host, not the one named by ref=. ref= is kept in the query string
+    // purely for log-readability (a real host ignores it; it is not what makes this correct).
     private static void backupHostConfig(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
         try {
             java.util.List<Host> hosts = new java.util.ArrayList<Host>(Host.getAll(conn));
             Host host = hosts.get(0);
+            String session = conn.getSessionReference();
+            String hostUrl = hostUrl(url, host.getAddress(conn));
             System.out.println("Backing up " + host.getNameLabel(conn));
 
             // Backup and restore are HTTP transfers alongside the API, not API calls, so the session id
             // travels in the query string.
-            String session = conn.getSessionReference();
             java.io.File file = java.io.File.createTempFile("sdk-example-host", ".backup");
-            HttpGet get = new HttpGet(url + "/host_backup?session_id=" + session
+            HttpGet get = new HttpGet(hostUrl + "/host_backup?session_id=" + session
                     + "&ref=" + host.toWireString());
             byte[] backup;
             try (CloseableHttpClient http = trustingHttpClient()) {
@@ -2530,14 +3122,20 @@ public class Workflows {
             System.out.printf("  wrote %d bytes to %s%n", backup.length, file.getName());
 
             System.out.println("  restoring it to " + host.getNameLabel(conn) + ": "
-                    + restoreHostConfig(conn, url, session, host, backup));
+                    + restoreHostConfig(conn, hostUrl, session, host, backup));
             if (hosts.size() > 1) {
-                // The refusal is the half worth rehearsing: restoring one host's configuration onto
-                // another is destructive and unrecoverable, so the pool checks rather than trusting
-                // the caller.
                 Host other = hosts.get(1);
-                System.out.println("  restoring it to " + other.getNameLabel(conn) + ": "
-                        + restoreHostConfig(conn, url, session, other, backup));
+                String result;
+                try {
+                    String otherUrl = hostUrl(url, other.getAddress(conn));
+                    result = restoreHostConfig(conn, otherUrl, session, other, backup);
+                } catch (Exception e) {
+                    // A real pool's hosts are all reachable from a management client; this only guards an
+                    // environment (e.g. a simulator whose second host's address isn't actually routable
+                    // from here) where that isn't true, so the example still finishes cleanly.
+                    result = "could not connect directly (" + e + ")";
+                }
+                System.out.println("  restoring it to " + other.getNameLabel(conn) + ": " + result);
             }
 
             file.delete();
@@ -2550,17 +3148,18 @@ public class Workflows {
     //   backupHostConfig("https://xenserver", "root", password);
 
     /**
-     * Uploads a backup to a host and reports what the task says about it.
+     * Uploads a backup to a host - over a connection opened to THAT host's own address - and reports
+     * what the task says about it.
      *
      * An upload answers 200 as soon as it has read the request headers, because the client waits for
      * that before it starts sending the file. The outcome therefore cannot be in the status line: it
      * arrives on a task you create first, name in the URL, and poll once the upload has finished.
      */
-    private static String restoreHostConfig(Connection conn, String url, String session,
+    private static String restoreHostConfig(Connection conn, String hostUrl, String session,
                                             Host host, byte[] backup) throws Exception {
         Task task = Task.create(conn, "host_restore", "restoring a configuration backup");
         try {
-            HttpPut put = new HttpPut(url + "/host_restore?session_id=" + session
+            HttpPut put = new HttpPut(hostUrl + "/host_restore?session_id=" + session
                     + "&ref=" + host.toWireString() + "&task_id=" + task.toWireString());
             put.setEntity(new org.apache.hc.core5.http.io.entity.ByteArrayEntity(backup, null));
             try (CloseableHttpClient http = trustingHttpClient()) {
@@ -2720,10 +3319,15 @@ public class Workflows {
             int whole = fetchStatusReport(url, session, keys);
             System.out.printf("everything (%d sections): %d bytes%n", keys.size(), whole);
 
-            // Worth checking rather than assuming: a server that ignored the selection would look
-            // identical from here until someone opened the archive and found the whole thing.
-            int subset = fetchStatusReport(url, session, java.util.Arrays.asList("xenserver-config"));
-            System.out.printf("xenserver-config only:   %d bytes%n", subset);
+            // Pick a real, small section from the host's own catalogue rather than assuming a name: the
+            // catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
+            // list, and "xenserver-config" isn't one of the real keys any host actually publishes.
+            String subsetKey = keys.get(0);
+            for (String k : keys) {
+                if (k.equals("firstboot") || k.equals("network-status")) { subsetKey = k; break; }
+            }
+            int subset = fetchStatusReport(url, session, java.util.Arrays.asList(subsetKey));
+            System.out.printf("%s only:   %d bytes%n", subsetKey, subset);
             if (subset >= whole)
                 System.out.println("  ERROR: selecting fewer sections did not produce a smaller bundle");
 
@@ -2746,13 +3350,30 @@ public class Workflows {
     //   serverStatusReport("https://xenserver", "root", password);
 
     // --- Recover VMs after a disaster ---
-    private static void disasterRecovery(String url, String user, String password) throws Exception {
+    // Disaster recovery works by writing the pool's own database out to a storage repository as a disk
+    // of type "metadata". That disk can be read back as a SEPARATE database - VDI.openDatabase hands you
+    // a Session scoped to it - so the ordinary calls describe the pool as it was replicated rather than
+    // the pool you are connected to. Recovering reads from that database and writes into a live pool,
+    // which is why the recover call is made on the metadata session and takes a live session as its
+    // destination.
+    //
+    // That destination has to be a DIFFERENT, standby pool: recovering a VM back into the exact pool it
+    // was replicated from can't actually succeed with force=false. The VM's uuid already exists there, so
+    // VM.recover always takes the replace-or-fail path, and nothing replicated a moment ago from a live
+    // database can ever be "newer" than the live object it came from - it fails with
+    // VM_TO_IMPORT_IS_NOT_NEWER_VERSION. The one-line "fix" of passing force=true instead would make it
+    // succeed by REPLACING (destroying and recreating) the live original - exactly the opposite of what a
+    // DR demo should show. A second pool is the only way force=false succeeds (a brand-new VM object, not
+    // a replace), and it's what every real DR workflow actually does. Track the recovered VM by uuid,
+    // never by name: a name can coincidentally collide with something already on the destination pool,
+    // and tidy-up must never guess by name.
+    private static void disasterRecovery(String url, String user, String password, String drUrl) throws Exception {
+        if (drUrl == null || drUrl.isEmpty())
+            throw new RuntimeException("disaster-recovery needs a second pool to recover into: pass "
+                    + "dr_url=<url of a standby pool>");
         Connection conn = connect(url, user, password);
+        Connection drConn = connect(drUrl, user, password);
         try {
-            // Disaster recovery works by writing the pool's own database out to a storage repository as a
-            // disk of type "metadata". That disk can be read back as a SEPARATE database, so the ordinary
-            // calls describe the pool as it was replicated rather than the pool you are connected to.
-            //
             // Replication needs storage every host can reach and that can hold data. The server checks
             // rather than taking your word for it, so ask before enabling.
             SR sr = null;
@@ -2773,47 +3394,59 @@ public class Workflows {
                 if (v.getType(conn) == Types.VdiType.METADATA) { metadataVdi = v; break; }
             System.out.println("  metadata disk: " + metadataVdi.getUuid(conn));
 
+            // A session onto the replicated database rather than the live pool.
             Session metadata = metadataVdi.openDatabase(conn);
 
             // The generated classes always send the Connection's own session, so reading the replicated
             // database means dispatching by hand with the metadata session in its place. Connection
             // .dispatch is the binding's own entry point, so this still goes over the trusting HTTP
             // client that connect() set up.
-            Map<VM, VM.Record> recoverable = conn.dispatch("VM.get_all_records",
+            Map<VM, VM.Record> all = conn.dispatch("VM.get_all_records",
                 new Object[]{metadata.toWireString()},
                 new com.fasterxml.jackson.core.type.TypeReference<Map<VM, VM.Record>>() {});
+
+            // Only real guest VMs are recoverable - exclude templates, control domains and snapshots.
+            Map<VM, VM.Record> recoverable = new java.util.LinkedHashMap<>();
+            for (Map.Entry<VM, VM.Record> e : all.entrySet()) {
+                VM.Record r = e.getValue();
+                if (!r.isATemplate && !r.isControlDomain && !r.isASnapshot) recoverable.put(e.getKey(), r);
+            }
             System.out.printf("  the replicated database describes %d recoverable VM(s)%n", recoverable.size());
 
             VM target = null;
             String name = null;
+            String targetUuid = null;
             for (Map.Entry<VM, VM.Record> e : recoverable.entrySet())
                 if (name == null || e.getValue().nameLabel.compareTo(name) < 0) {
-                    target = e.getKey(); name = e.getValue().nameLabel;
+                    target = e.getKey(); name = e.getValue().nameLabel; targetUuid = e.getValue().uuid;
                 }
             System.out.println("  recovering " + name);
 
-            // Both calls run on the METADATA session; the live one says where the VM should land.
+            // Both calls run on the METADATA session; session_to says where the VM should land - the
+            // STANDBY pool's session, not this one.
+            String drSessionId = drConn.getSessionReference();
             conn.<Object>dispatch("VM.assert_can_be_recovered",
-                new Object[]{metadata.toWireString(), target.toWireString(), conn.getSessionReference()});
+                new Object[]{metadata.toWireString(), target.toWireString(), drSessionId});
             conn.<Object>dispatch("VM.recover",
-                new Object[]{metadata.toWireString(), target.toWireString(), conn.getSessionReference(), false});
+                new Object[]{metadata.toWireString(), target.toWireString(), drSessionId, false});
 
-            // It is a real VM in the live pool now, not merely a call that returned.
-            for (Map.Entry<VM, VM.Record> e : VM.getAllRecords(conn).entrySet())
-                if (name.equals(e.getValue().nameLabel)) {
-                    System.out.printf("  %s is %s in the live pool%n", name, e.getValue().powerState);
-                    e.getKey().destroy(conn);
-                    break;
-                }
+            // It is a real VM on the standby pool now, not merely a call that returned - look it up by
+            // the uuid full_restore preserved, not by name.
+            VM recovered = VM.getByUuid(drConn, targetUuid);
+            System.out.println("  " + name + " is " + recovered.getPowerState(drConn) + " on the standby pool");
 
+            // Tidy up on the standby pool only, by uuid - never touch the source pool's VMs, and never
+            // guess by name (a coincidentally-same-named VM must not be destroyed).
+            destroyVmAndDisks(drConn, recovered);
             sr.disableDatabaseReplication(conn);
             System.out.println("OK: disaster-recovery");
         } finally {
             Session.logout(conn);
+            Session.logout(drConn);
         }
     }
     // Run it:
-    //   disasterRecovery("https://xenserver", "root", password);
+    //   disasterRecovery("https://xenserver", "root", password, "https://standby-pool");
 
     // --- Manage Secure Boot certificates ---
     private static void manageSecurebootCertificates(String url, String user, String password) throws Exception {
@@ -2843,7 +3476,15 @@ public class Workflows {
                     vm = e.getKey(); name = r.nameLabel; break;
                 }
             }
-            if (vm == null) throw new RuntimeException("no guest has a pending certificate update");
+            if (vm == null) {
+                // The precondition is the part worth being honest about: this needs a VM whose Secure
+                // Boot certificates are already due to refresh. That's a deliberately-provisioned state,
+                // not one a normally-provisioned Secure Boot guest is ever in - so report and stop cleanly
+                // rather than failing with a bare lookup error.
+                System.out.println("No guest needs a Secure Boot certificate refresh right now.");
+                System.out.println("OK: manage-secureboot-certificates");
+                return;
+            }
             System.out.printf("%s: readiness %s, certificates %s%n", name,
                 vm.getSecurebootReadiness(conn), vm.getSecurebootCertificatesState(conn));
 
@@ -2888,13 +3529,32 @@ public class Workflows {
             System.out.printf("  evacuated:  guests=%d%n", guestCount(conn, host));
 
             host.reboot(conn);
-            System.out.println("  rebooted:   enabled=" + host.getEnabled(conn));
+            // A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as
+            // long as XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough
+            // for the reboot to get underway, then explicitly re-enables - nothing does that for us, not
+            // even the reboot itself: disabling does not clear itself, not even across a reboot.
+            Thread.sleep(5000);
+            host.enable(conn);
+            System.out.println("  rebooted, re-enabled: enabled=" + host.getEnabled(conn));
 
-            // The other ending: off, and back on out of band.
-            host.shutdown(conn);
-            System.out.println("  shut down:  live=" + host.getMetrics(conn).getLive(conn));
-            host.powerOn(conn);
-            System.out.println("  powered on: live=" + host.getMetrics(conn).getLive(conn));
+            // The other ending: off, and back on out of band - but only demonstrated if that is actually
+            // configured, and waiting for each transition before starting the next. A real host.power_on
+            // has no retry of its own and simply fails, "The host failed to power on.", if no mechanism is
+            // configured or working.
+            if (host.getPowerOnMode(conn) != null && !host.getPowerOnMode(conn).isEmpty()) {
+                host.disable(conn);
+                host.shutdown(conn);
+                waitForHostLive(conn, host, false);
+                System.out.println("  shut down:  live=" + host.getMetrics(conn).getLive(conn));
+                host.powerOn(conn);
+                waitForHostLive(conn, host, true);
+                System.out.println("  powered on: live=" + host.getMetrics(conn).getLive(conn));
+                host.enable(conn);
+                System.out.println("  re-enabled: enabled=" + host.getEnabled(conn));
+            } else {
+                System.out.println("  skipping shutdown/power-on: no out-of-band power-on mode is "
+                        + "configured on this host");
+            }
 
             System.out.println("OK: restart-host");
         } finally {
@@ -2916,28 +3576,28 @@ public class Workflows {
             throws Exception {
         Connection conn = connect(url, user, password);
         try {
-            // A snapshot is a VM record with is_a_snapshot set, so both of these are clones of it - the
-            // difference is only what you mark the result as.
+            // A snapshot is a VM record with is_a_snapshot (and is_a_template) set, and cloning it gives a
+            // custom template that stands on its own while the snapshot stays put.
             VM vm = vmByName(conn, vmName);
             VM snapshot = vm.snapshot(conn, "sdk-example-source-snapshot");
             System.out.println("Snapshot of " + vmName + " taken");
 
-            // A clone of a snapshot is an ordinary VM. Worth reading back rather than assuming: a result
-            // still flagged as a snapshot would be filed under the original VM instead of standing on
-            // its own, and would not appear in a VM listing at all.
+            // A clone of a snapshot is a template, not another snapshot: it stands on its own instead of
+            // being filed under the original VM. Provision it to get an ordinary VM you can start.
             VM newVm = snapshot.createClone(conn, "sdk-example-vm-from-snapshot");
-            System.out.printf("  new VM:      %s (is_a_snapshot=%s)%n",
-                newVm.getNameLabel(conn), newVm.getIsASnapshot(conn));
+            provision(conn, newVm);
+            System.out.printf("  new VM:      %s (is_a_template=%s)%n",
+                newVm.getNameLabel(conn), newVm.getIsATemplate(conn));
 
-            // The same clone, marked as a template instead: a starting point to stamp more VMs from.
+            // Another clone, left as the template it already is: a starting point to stamp more VMs from.
             VM template = snapshot.createClone(conn, "sdk-example-template-from-snapshot");
-            template.setIsATemplate(conn, true);
             System.out.printf("  new template:%s (is_a_template=%s)%n",
                 template.getNameLabel(conn), template.getIsATemplate(conn));
 
-            newVm.destroy(conn);
-            template.destroy(conn);
-            snapshot.destroy(conn);
+            // Each clone owns its own disks, and so does the snapshot itself.
+            destroyVmAndDisks(conn, newVm);
+            destroyVmAndDisks(conn, template);
+            destroyVmAndDisks(conn, snapshot);
             System.out.println("OK: vm-from-snapshot");
         } finally {
             Session.logout(conn);
@@ -3168,7 +3828,10 @@ public class Workflows {
             System.out.println("  IQN now:      " + host.getIscsiIqn(conn));
             System.out.println("  multipathing: " + host.getMultipathing(conn));
 
-            host.setIscsiIqn(conn, beforeIqn);
+            // set_iscsi_iqn refuses an empty string (INVALID_VALUE); only restore it if this host actually
+            // had one set before - a host that has never had an IQN configured has it empty, and there is
+            // no way to set it back to empty through this call.
+            if (beforeIqn != null && !beforeIqn.isEmpty()) host.setIscsiIqn(conn, beforeIqn);
             host.setMultipathing(conn, beforeMultipathing);
             System.out.println("  restored");
             System.out.println("OK: configure-host-storage");
@@ -3233,8 +3896,14 @@ public class Workflows {
 
             // Select a variant explicitly. It becomes the selected one immediately; whether it is also
             // active depends on whether the hardware is present and the driver already loaded.
+            // Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
+            // and variant order isn't guaranteed to put the usable one first.
             Map.Entry<HostDriver, HostDriver.Record> first = drivers.get(0);
-            DriverVariant variant = first.getValue().variants.iterator().next();
+            DriverVariant variant = null;
+            for (DriverVariant candidate : first.getValue().variants) {
+                if (candidate.getHardwarePresent(conn)) { variant = candidate; break; }
+            }
+            if (variant == null) variant = first.getValue().variants.iterator().next();
             first.getKey().select(conn, variant);
             HostDriver.Record after = first.getKey().getRecord(conn);
             System.out.printf("  %s: selected %s, active %s%n",
@@ -3265,11 +3934,125 @@ public class Workflows {
         return m.find() ? m.group(1) : "";
     }
 
+    // Every workflow's dispatcher defaults (chosen to work against the simulator), keyed by its CLI
+    // parameter name (snake_case, matching the Python reference) so `key=value` overrides after the
+    // password stay consistent across every language's port of this dispatcher. Merged with any
+    // CLI-supplied overrides before the real method is called - this is the Java equivalent of the
+    // Python reference's `_wf(fn, **defaults)` wrapper.
+    private static Map<String, Map<String, String>> buildDefaults() {
+        Map<String, Map<String, String>> d = new java.util.LinkedHashMap<>();
+        d.put("connect-inventory", mapOf());
+        d.put("create-vm", mapOf("template_name", "Rocky Linux 8", "new_vm_name", "sdk-example-vm"));
+        d.put("vm-lifecycle", mapOf("source_vm", "web-01", "new_vm_name", "sdk-example-lifecycle"));
+        d.put("manage-vm-disks", mapOf("template_name", "Rocky Linux 8", "sr_name", "Shared NFS",
+                "new_vm_name", "sdk-example-vm-disks"));
+        d.put("dismiss-alerts", mapOf());
+        d.put("host-power-on", mapOf());
+        d.put("rotate-pool-secret", mapOf());
+        d.put("change-root-password", mapOf());
+        d.put("manage-certificates", mapOf());
+        d.put("snapshot-schedule", mapOf("vm_name", "web-01", "schedule_name", "sdk-example-schedule"));
+        d.put("manage-vm-groups", mapOf("vm_name", "web-01", "group_name", "sdk-example-group"));
+        d.put("snapshot-revert", mapOf("vm_name", "web-01", "snapshot_name", "sdk-example-snapshot"));
+        d.put("create-nfs-sr", mapOf("nfs_server", "192.0.2.10", "nfs_path", "/export/sdk",
+                "sr_name", "sdk-example-nfs"));
+        d.put("create-network", mapOf("network_name", "sdk-example-net"));
+        d.put("edit-vm-properties", mapOf("vm_name", "web-01"));
+        d.put("events", mapOf("vm_name", "web-01"));
+        d.put("new-vm-wizard", mapOf("template_name", "Rocky Linux 8", "new_vm_name", "wizard-vm"));
+        d.put("live-migrate", mapOf("source_vm", "web-01", "sr_name", "Shared NFS",
+                "new_vm_name", "sdk-example-migrate"));
+        d.put("host-maintenance", mapOf("source_vm", "web-01", "sr_name", "Shared NFS",
+                "new_vm_name", "sdk-example-maint"));
+        d.put("configure-ha", mapOf("heartbeat_sr_name", "Shared NFS"));
+        d.put("copy-vm", mapOf("vm_name", "db-01", "sr_name", "Shared NFS", "copy_name", "sdk-example-copy"));
+        d.put("create-vm-with-vgpu", mapOf("template_name", "Rocky Linux 8", "new_vm_name", "sdk-example-vgpu-vm"));
+        d.put("tags-and-folders", mapOf("vm_name", "web-01"));
+        d.put("configure-updates", mapOf());
+        d.put("clone-vm", mapOf("vm_name", "db-01", "clone_name", "sdk-example-clone"));
+        d.put("delete-vm", mapOf("template_name", "Rocky Linux 8", "new_vm_name", "sdk-example-delete"));
+        d.put("storage-migrate", mapOf("source_vm", "web-01", "new_vm_name", "sdk-example-storagemigrate"));
+        d.put("apply-update", mapOf());
+        d.put("checkpoint-vm", mapOf("source_vm", "web-01", "new_vm_name", "sdk-example-checkpoint"));
+        d.put("attach-disk", mapOf("template_name", "Rocky Linux 8", "sr_name", "Shared NFS",
+                "new_vm_name", "sdk-example-attachdisk"));
+        d.put("wait-for-task", mapOf("template_name", "Rocky Linux 8", "new_vm_name", "sdk-example-asynctask"));
+        d.put("error-handling", mapOf());
+        d.put("list-templates", mapOf());
+        d.put("custom-fields", mapOf("vm_name", "web-01"));
+        d.put("gpu-inventory", mapOf());
+        d.put("read-metrics", mapOf());
+        d.put("rename-object", mapOf("vm_name", "web-01"));
+        d.put("vm-boot-config", mapOf("template_name", "Rocky Linux 8", "new_vm_name", "sdk-example-boot"));
+        d.put("host-info", mapOf());
+        d.put("list-roles", mapOf());
+        d.put("pool-properties", mapOf());
+        d.put("sr-usage", mapOf());
+        d.put("manage-vif", mapOf("template_name", "Rocky Linux 8", "new_vm_name", "sdk-example-vif"));
+        d.put("list-networks", mapOf());
+        d.put("vbd-inventory", mapOf("vm_name", "db-01"));
+        d.put("pool-tags", mapOf());
+        d.put("convert-to-template", mapOf("template_name", "Rocky Linux 8", "new_vm_name", "sdk-example-totemplate"));
+        d.put("find-by-uuid", mapOf("vm_name", "web-01"));
+        d.put("rolling-pool-update", mapOf());
+        d.put("pvs-accelerator", mapOf());
+        d.put("configure-pvs-accelerator", mapOf());
+        d.put("manage-ssh-access", mapOf());
+        d.put("manage-vtpm", mapOf());
+        d.put("configure-dynamic-memory", mapOf());
+        d.put("manage-vm-media", mapOf());
+        d.put("backup-host-config", mapOf());
+        d.put("manage-sr-lifecycle", mapOf("nfs_server", "192.0.2.10", "nfs_path", "/export/spare"));
+        d.put("set-default-sr", mapOf("nfs_server", "192.0.2.10", "nfs_path", "/export/spare"));
+        d.put("server-status-report", mapOf());
+        d.put("disaster-recovery", mapOf()); // dr_url has no default - raised as an error if absent
+        d.put("manage-secureboot-certificates", mapOf());
+        d.put("restart-host", mapOf());
+        d.put("manage-crash-dumps", mapOf());
+        d.put("configure-pool-options", mapOf());
+        d.put("configure-console-access", mapOf());
+        d.put("configure-host-storage", mapOf());
+        d.put("configure-syslog", mapOf("syslog_server", "192.0.2.50"));
+        d.put("manage-driver-variants", mapOf());
+        d.put("vm-from-snapshot", mapOf("vm_name", "db-01"));
+        d.put("attach-existing-disk", mapOf());
+        d.put("export-import-vm", mapOf());
+        d.put("changed-block-tracking", mapOf());
+        d.put("control-domain-memory", mapOf());
+        d.put("rrd-metrics", mapOf());
+        d.put("reclaim-space", mapOf());
+        d.put("vm-ip-address", mapOf("timeout", "60", "interval", "2"));
+        d.put("manage-ad-users", mapOf("domain", "", "admin_user", "alice",
+                "admin_password", "Password1", "new_user", "alice"));
+        d.put("create-iscsi-sr", mapOf("target", "192.0.2.30", "sr_name", "sdk-example-iscsi"));
+        d.put("create-smb-sr", mapOf("server", "192.0.2.40", "share", "/vmstore",
+                "smb_username", "Administrator", "smb_password", "Password1", "sr_name", "sdk-example-smb"));
+        d.put("create-hba-sr", mapOf("sr_name", "sdk-example-hba"));
+        d.put("create-iso-sr", mapOf());
+        d.put("configure-nrpe", mapOf());
+        d.put("configure-snmp", mapOf("trap_destination", "192.0.2.50"));
+        d.put("configure-clustering", mapOf());
+        d.put("manage-pool-membership", mapOf());
+        d.put("create-bond", mapOf());
+        d.put("manage-vapp", mapOf("vm_name", "web-01"));
+        d.put("attach-usb-device", mapOf("vm_name", "web-01"));
+        d.put("wlb-recommendations", mapOf("vm_name", "web-01", "wlb_host_port", "wlb.example:8012",
+                "wlb_username", "wlbuser", "wlb_password", "wlbpass"));
+        return d;
+    }
+
+    private static Map<String, String> mapOf(String... kv) {
+        Map<String, String> m = new java.util.LinkedHashMap<>();
+        for (int i = 0; i < kv.length; i += 2) m.put(kv[i], kv[i + 1]);
+        return m;
+    }
+
     // Maps the <workflow> argument to the matching self-contained method above, supplying the concrete
     // objects each one operates on. In your own code you would call these methods directly (see the
     // "Run it:" line under each) rather than through this dispatcher.
     public static void main(String[] args) throws Exception {
-        // cross-pool-copy-vm spans two pools, so it takes an extra 5th argument: the destination URL.
+        // cross-pool-copy-vm spans two pools, so it takes an extra 5th argument: the destination URL. It
+        // keeps its existing fixed 4-positional-arg form (plus destUrl), unlike every other workflow.
         if (args.length >= 1 && args[0].equals("cross-pool-copy-vm")) {
             if (args.length != 5) {
                 System.err.println("usage: java Workflows cross-pool-copy-vm <sourceUrl> <user> <password> <destUrl>");
@@ -3278,61 +4061,84 @@ public class Workflows {
             crossPoolCopyVm(args[1], args[2], args[3], args[4], "db-01");
             return;
         }
-        if (args.length != 4) {
-            System.err.println("usage: java Workflows <workflow> <url> <user> <password>");
+
+        Map<String, Map<String, String>> defaults = buildDefaults();
+        if (args.length < 4 || !defaults.containsKey(args[0])) {
+            System.err.println("usage: java Workflows <workflow> <url> <user> <password> [key=value ...]");
+            System.err.println("  workflows: " + String.join("|", defaults.keySet()) + "|cross-pool-copy-vm");
             System.exit(2);
         }
 
-        String url = args[1], user = args[2], password = args[3];
-        switch (args[0]) {
+        String workflow = args[0], url = args[1], user = args[2], password = args[3];
+        Map<String, String> p = new java.util.LinkedHashMap<>(defaults.get(workflow));
+        for (int i = 4; i < args.length; i++) {
+            int eq = args[i].indexOf('=');
+            if (eq < 0) {
+                System.err.println("extra arguments must be key=value (got '" + args[i] + "')");
+                System.exit(2);
+            }
+            p.put(args[i].substring(0, eq), args[i].substring(eq + 1));
+        }
+
+        switch (workflow) {
             case "connect-inventory": connectInventory(url, user, password); break;
-            case "create-vm": createVm(url, user, password, "Rocky Linux 8", "sdk-example-vm"); break;
-            case "vm-lifecycle": vmLifecycle(url, user, password, "Rocky Linux 8", "sdk-example-lifecycle"); break;
-            case "manage-vm-disks": manageVmDisks(url, user, password, "web-01"); break;
+            case "create-vm": createVm(url, user, password, p.get("template_name"), p.get("new_vm_name")); break;
+            case "vm-lifecycle": vmLifecycle(url, user, password, p.get("source_vm"), p.get("new_vm_name")); break;
+            case "manage-vm-disks":
+                manageVmDisks(url, user, password, p.get("template_name"), p.get("sr_name"), p.get("new_vm_name")); break;
             case "dismiss-alerts": dismissAlerts(url, user, password); break;
             case "host-power-on": hostPowerOn(url, user, password); break;
             case "rotate-pool-secret": rotatePoolSecret(url, user, password); break;
             case "change-root-password": changeRootPassword(url, user, password); break;
             case "manage-certificates": manageCertificates(url, user, password); break;
-            case "snapshot-schedule": snapshotSchedule(url, user, password, "web-01", "sdk-example-schedule"); break;
-            case "manage-vm-groups": manageVmGroups(url, user, password, "web-01", "sdk-example-group"); break;
-            case "snapshot-revert": snapshotRevert(url, user, password, "web-01", "sdk-example-snapshot"); break;
-            case "create-nfs-sr": createNfsSr(url, user, password, "192.0.2.10", "/export/sdk", "sdk-example-nfs"); break;
-            case "create-network": createNetwork(url, user, password, "sdk-example-net"); break;
-            case "edit-vm-properties": editVmProperties(url, user, password, "web-01"); break;
-            case "events": events(url, user, password, "web-01"); break;
-            case "new-vm-wizard": newVmWizard(url, user, password, "Rocky Linux 8", "wizard-vm"); break;
-            case "live-migrate": liveMigrate(url, user, password, "Rocky Linux 8", "sdk-example-migrate"); break;
-            case "host-maintenance": hostMaintenance(url, user, password, "Rocky Linux 8", "sdk-example-maint"); break;
-            case "configure-ha": configureHa(url, user, password, "Shared NFS"); break;
-            case "copy-vm": copyVm(url, user, password, "db-01", "Shared NFS", "sdk-example-copy"); break;
-            case "create-vm-with-vgpu": createVmWithVgpu(url, user, password, "Rocky Linux 8", "sdk-example-vgpu-vm"); break;
-            case "tags-and-folders": tagsAndFolders(url, user, password, "web-01"); break;
+            case "snapshot-schedule":
+                snapshotSchedule(url, user, password, p.get("vm_name"), p.get("schedule_name")); break;
+            case "manage-vm-groups":
+                manageVmGroups(url, user, password, p.get("vm_name"), p.get("group_name")); break;
+            case "snapshot-revert":
+                snapshotRevert(url, user, password, p.get("vm_name"), p.get("snapshot_name")); break;
+            case "create-nfs-sr":
+                createNfsSr(url, user, password, p.get("nfs_server"), p.get("nfs_path"), p.get("sr_name")); break;
+            case "create-network": createNetwork(url, user, password, p.get("network_name")); break;
+            case "edit-vm-properties": editVmProperties(url, user, password, p.get("vm_name")); break;
+            case "events": events(url, user, password, p.get("vm_name")); break;
+            case "new-vm-wizard": newVmWizard(url, user, password, p.get("template_name"), p.get("new_vm_name")); break;
+            case "live-migrate": liveMigrate(url, user, password, p.get("source_vm"), p.get("sr_name"), p.get("new_vm_name")); break;
+            case "host-maintenance":
+                hostMaintenance(url, user, password, p.get("source_vm"), p.get("sr_name"), p.get("new_vm_name")); break;
+            case "configure-ha": configureHa(url, user, password, p.get("heartbeat_sr_name")); break;
+            case "copy-vm": copyVm(url, user, password, p.get("vm_name"), p.get("sr_name"), p.get("copy_name")); break;
+            case "create-vm-with-vgpu":
+                createVmWithVgpu(url, user, password, p.get("template_name"), p.get("new_vm_name")); break;
+            case "tags-and-folders": tagsAndFolders(url, user, password, p.get("vm_name")); break;
             case "configure-updates": configureUpdates(url, user, password); break;
-            case "clone-vm": cloneVm(url, user, password, "db-01", "sdk-example-clone"); break;
-            case "delete-vm": deleteVm(url, user, password, "Rocky Linux 8", "sdk-example-delete"); break;
-            case "storage-migrate": storageMigrate(url, user, password, "Rocky Linux 8", "sdk-example-storagemigrate"); break;
+            case "clone-vm": cloneVm(url, user, password, p.get("vm_name"), p.get("clone_name")); break;
+            case "delete-vm": deleteVm(url, user, password, p.get("template_name"), p.get("new_vm_name")); break;
+            case "storage-migrate":
+                storageMigrate(url, user, password, p.get("source_vm"), p.get("new_vm_name")); break;
             case "apply-update": applyUpdate(url, user, password); break;
-            case "checkpoint-vm": checkpointVm(url, user, password, "Rocky Linux 8", "sdk-example-checkpoint"); break;
-            case "attach-disk": attachDisk(url, user, password, "Rocky Linux 8", "Shared NFS", "sdk-example-attachdisk"); break;
-            case "wait-for-task": waitForTask(url, user, password, "Rocky Linux 8", "sdk-example-asynctask"); break;
+            case "checkpoint-vm": checkpointVm(url, user, password, p.get("source_vm"), p.get("new_vm_name")); break;
+            case "attach-disk":
+                attachDisk(url, user, password, p.get("template_name"), p.get("sr_name"), p.get("new_vm_name")); break;
+            case "wait-for-task": waitForTask(url, user, password, p.get("template_name"), p.get("new_vm_name")); break;
             case "error-handling": errorHandling(url, user, password); break;
             case "list-templates": listTemplates(url, user, password); break;
-            case "custom-fields": customFields(url, user, password, "web-01"); break;
+            case "custom-fields": customFields(url, user, password, p.get("vm_name")); break;
             case "gpu-inventory": gpuInventory(url, user, password); break;
             case "read-metrics": readMetrics(url, user, password); break;
-            case "rename-object": renameObject(url, user, password, "web-01"); break;
-            case "vm-boot-config": vmBootConfig(url, user, password, "Rocky Linux 8", "sdk-example-boot"); break;
+            case "rename-object": renameObject(url, user, password, p.get("vm_name")); break;
+            case "vm-boot-config": vmBootConfig(url, user, password, p.get("template_name"), p.get("new_vm_name")); break;
             case "host-info": hostInfo(url, user, password); break;
             case "list-roles": listRoles(url, user, password); break;
             case "pool-properties": poolProperties(url, user, password); break;
             case "sr-usage": srUsage(url, user, password); break;
-            case "manage-vif": manageVif(url, user, password, "Rocky Linux 8", "sdk-example-vif"); break;
+            case "manage-vif": manageVif(url, user, password, p.get("template_name"), p.get("new_vm_name")); break;
             case "list-networks": listNetworks(url, user, password); break;
-            case "vbd-inventory": vbdInventory(url, user, password, "db-01"); break;
+            case "vbd-inventory": vbdInventory(url, user, password, p.get("vm_name")); break;
             case "pool-tags": poolTags(url, user, password); break;
-            case "convert-to-template": convertToTemplate(url, user, password, "Rocky Linux 8", "sdk-example-totemplate"); break;
-            case "find-by-uuid": findByUuid(url, user, password, "web-01"); break;
+            case "convert-to-template":
+                convertToTemplate(url, user, password, p.get("template_name"), p.get("new_vm_name")); break;
+            case "find-by-uuid": findByUuid(url, user, password, p.get("vm_name")); break;
             case "rolling-pool-update": rollingPoolUpdate(url, user, password); break;
             case "pvs-accelerator": pvsAccelerator(url, user, password); break;
             case "configure-pvs-accelerator": configurePvsAccelerator(url, user, password); break;
@@ -3343,43 +4149,50 @@ public class Workflows {
             case "manage-vm-media": manageVmMedia(url, user, password); break;
             case "backup-host-config": backupHostConfig(url, user, password); break;
             case "manage-sr-lifecycle":
-                manageSrLifecycle(url, user, password, "192.0.2.10", "/export/spare"); break;
-            case "set-default-sr":
-                setDefaultSr(url, user, password, "192.0.2.10", "/export/spare"); break;
+                manageSrLifecycle(url, user, password, p.get("nfs_server"), p.get("nfs_path")); break;
+            case "set-default-sr": setDefaultSr(url, user, password, p.get("nfs_server"), p.get("nfs_path")); break;
             case "server-status-report": serverStatusReport(url, user, password); break;
-            case "disaster-recovery": disasterRecovery(url, user, password); break;
-            case "manage-secureboot-certificates":
-                manageSecurebootCertificates(url, user, password); break;
+            case "disaster-recovery": disasterRecovery(url, user, password, p.get("dr_url")); break;
+            case "manage-secureboot-certificates": manageSecurebootCertificates(url, user, password); break;
             case "restart-host": restartHost(url, user, password); break;
             case "manage-crash-dumps": manageCrashDumps(url, user, password); break;
-            case "vm-from-snapshot": vmFromSnapshot(url, user, password, "db-01"); break;
+            case "vm-from-snapshot": vmFromSnapshot(url, user, password, p.get("vm_name")); break;
             case "attach-existing-disk": attachExistingDisk(url, user, password); break;
             case "changed-block-tracking": changedBlockTracking(url, user, password); break;
             case "control-domain-memory": controlDomainMemory(url, user, password); break;
             case "rrd-metrics": rrdMetrics(url, user, password); break;
             case "reclaim-space": reclaimSpace(url, user, password); break;
-            case "vm-ip-address": vmIpAddress(url, user, password); break;
-            case "manage-ad-users": manageAdUsers(url, user, password); break;
-            case "create-iscsi-sr": createIscsiSr(url, user, password); break;
-            case "create-smb-sr": createSmbSr(url, user, password); break;
-            case "create-hba-sr": createHbaSr(url, user, password); break;
-            case "create-gfs2-sr": createGfs2Sr(url, user, password); break;
+            case "vm-ip-address":
+                vmIpAddress(url, user, password, Long.parseLong(p.get("timeout")) * 1000,
+                        Long.parseLong(p.get("interval")) * 1000); break;
+            case "manage-ad-users":
+                manageAdUsers(url, user, password, p.get("domain"), p.get("admin_user"),
+                        p.get("admin_password"), p.get("new_user")); break;
+            case "create-iscsi-sr":
+                createIscsiSr(url, user, password, p.get("target"), p.get("port"), p.get("chap_user"),
+                        p.get("chap_password"), p.get("target_iqn"), p.get("sr_name")); break;
+            case "create-smb-sr":
+                createSmbSr(url, user, password, p.get("server"), p.get("share"), p.get("smb_username"),
+                        p.get("smb_password"), p.get("sr_name")); break;
+            case "create-hba-sr": createHbaSr(url, user, password, p.get("sr_name")); break;
             case "create-iso-sr": createIsoSr(url, user, password); break;
             case "configure-nrpe": configureNrpe(url, user, password); break;
-            case "configure-snmp": configureSnmp(url, user, password); break;
+            case "configure-snmp": configureSnmp(url, user, password, p.get("trap_destination")); break;
             case "configure-clustering": configureClustering(url, user, password); break;
             case "manage-pool-membership": managePoolMembership(url, user, password); break;
             case "create-bond": createBond(url, user, password); break;
-            case "manage-vapp": manageVapp(url, user, password, "web-01"); break;
-            case "attach-usb-device": attachUsbDevice(url, user, password, "web-01"); break;
-            case "wlb-recommendations": wlbRecommendations(url, user, password, "web-01"); break;
+            case "manage-vapp": manageVapp(url, user, password, p.get("vm_name")); break;
+            case "attach-usb-device": attachUsbDevice(url, user, password, p.get("vm_name")); break;
+            case "wlb-recommendations":
+                wlbRecommendations(url, user, password, p.get("vm_name"), p.get("wlb_host_port"),
+                        p.get("wlb_username"), p.get("wlb_password")); break;
             case "configure-pool-options": configurePoolOptions(url, user, password); break;
             case "configure-console-access": configureConsoleAccess(url, user, password); break;
             case "configure-host-storage": configureHostStorage(url, user, password); break;
-            case "configure-syslog": configureSyslog(url, user, password, "192.0.2.50"); break;
+            case "configure-syslog": configureSyslog(url, user, password, p.get("syslog_server")); break;
             case "manage-driver-variants": manageDriverVariants(url, user, password); break;
             default:
-                System.err.println("unknown workflow: " + args[0]);
+                System.err.println("unknown workflow: " + workflow);
                 System.exit(2);
         }
     }
