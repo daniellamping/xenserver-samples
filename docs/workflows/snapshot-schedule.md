@@ -308,7 +308,7 @@ w_snapshot_schedule() {
     echo "Created schedule: $vmss"
 
     xe vm-param-set uuid=$vm snapshot-schedule=$vmss
-    echo "Members:          $(count_csv "$(xe vmss-param-get uuid=$vmss param-name=VMs)")"
+    echo "Members:          $(count_csv "$(set_to_csv "$(xe vmss-param-get uuid=$vmss param-name=VMs)")")"
 
     # xe has no command to run a schedule on demand (the API's VMSS.snapshot_now has no CLI form), so it
     # takes its first snapshot when it next falls due, and from then on keeps the newest retained-snapshots.
@@ -324,7 +324,7 @@ w_snapshot_schedule() {
 <details><summary>Sample output</summary>
 
 ```text
-Created schedule: 00000001-0000-0000-210a-000000000000
+Created schedule: 00000001-0000-0000-190a-000000000000
 Members:          1
 Keeps:            2 snapshot(s)
 OK: snapshot-schedule

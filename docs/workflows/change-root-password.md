@@ -140,6 +140,14 @@ func changeRootPassword(url, user, password string) {
 	// authenticated.
 	check(session.ChangePassword(password, temporary))
 	fmt.Println("Password changed.")
+	// Whatever happens next, put the password back: a failure part-way would otherwise leave root on
+	// the temporary one.
+	restored := false
+	defer func() {
+		if !restored {
+			session.ChangePassword(temporary, password)
+		}
+	}()
 
 	// The existing session stays valid afterwards - only NEW connections need the new password.
 	pools, err := xenapi.Pool.GetAll(session)
@@ -150,13 +158,15 @@ func changeRootPassword(url, user, password string) {
 	// xapi_session.ml) - any string would also be accepted, so there is no "wrong old password is
 	// rejected" failure to demonstrate here. The real gate is upstream of that: only a session
 	// authenticated as the local superuser may call this at all. The Go binding keeps its session
-	// id private, so check that the same way the RRD/export examples obtain one of their own.
-	sid := rawLogin(url, user, password)
+	// id private, so check that the same way the RRD/export examples obtain one of their own - with
+	// the NEW password, which is the one any new connection needs now.
+	sid := rawLogin(url, user, temporary)
 	isSuperuser := rawRPC(url, "session.get_is_local_superuser", sid, sid)
 	fmt.Printf("Allowed because session.is_local_superuser = %s\n", isSuperuser)
 	rawRPC(url, "session.logout", sid)
 
 	check(session.ChangePassword(temporary, password))
+	restored = true
 	fmt.Println("Password restored.")
 	fmt.Println("OK: change-root-password")
 	session.Logout()
@@ -231,13 +241,20 @@ w_change_root_password() {
     # though you are already authenticated - but a root session's old_pwd is never actually checked
     # (CA-13567): the only real gate is that the SESSION itself has to be a local superuser's, which this
     # one necessarily is. There is no "wrong old password is rejected" demonstration worth making here.
-    xe user-password-change old="$pass" new=xe-example-temp-password
+    original=$pass temporary=xe-example-temp-password
+    xe user-password-change old="$original" new=$temporary
     echo "Password changed."
+    # Unlike an SDK session, xe has no session to keep: every command logs in afresh, so from here on
+    # it needs the NEW password - including the command that changes it back. And restore it however the
+    # script ends (set -e exits on the first failure), or root would be left on the temporary password.
+    pass=$temporary
+    trap 'pass=$temporary; xe user-password-change old=$temporary new="$original" >/dev/null 2>&1' EXIT
 
-    # The existing session stays valid; only new connections need the new password.
-    echo "Session still usable: $(count_csv "$(xe pool-list --minimal)")"
+    echo "New logins work with the new password: $(count_csv "$(xe pool-list --minimal)") pool"
 
-    xe user-password-change old=xe-example-temp-password new="$pass"
+    xe user-password-change old=$temporary new="$original"
+    pass=$original
+    trap - EXIT
     echo "Password restored."
     echo "OK: change-root-password"
 }
@@ -247,7 +264,7 @@ w_change_root_password() {
 
 ```text
 Password changed.
-Session still usable: 1
+New logins work with the new password: 1 pool
 Password restored.
 OK: change-root-password
 ```

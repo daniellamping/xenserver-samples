@@ -284,23 +284,92 @@ function Get-SelfSignedCertPem {
 }
 
 function Reconnect-AfterMasterChange {
-    # Wait out a pool-wide xapi restart (pool.designate_new_master) and reconnect. XenRT's own helper
-    # for this call treats the connection dropping as the expected, successful outcome and then waits
-    # several minutes before trusting the pool again, rather than retrying immediately - do the same.
+    # Wait out a pool-wide xapi restart (pool.designate_new_master) and reconnect.
+    #
+    # designate_new_master returns BEFORE the change: for a while the old coordinator still answers,
+    # and still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+    # enough - keep reconnecting until the pool names the new coordinator (by uuid; Connect-Example
+    # follows HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits
+    # minutes before trusting the pool again.
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
         [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$NewMasterUuid,
         [int]$TimeoutSeconds = 600,
         [int]$IntervalSeconds = 5
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastError = $null
     while ((Get-Date) -lt $deadline) {
-        try { return Connect-Example -Url $Url -UserName $UserName -Password $Password }
-        catch { $lastError = $_; Start-Sleep -Seconds $IntervalSeconds }
+        try {
+            $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
+            $master = (Get-XenPool | Select-Object -First 1).master
+            # The new coordinator answers before the pool has settled - calls made too soon fail
+            # (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+            # live and enabled.
+            $settled = (Get-XenHost -Ref $master.opaque_ref).uuid -eq $NewMasterUuid -and
+                -not (Get-XenHost | Where-Object {
+                    -not $_.enabled -or -not (Get-XenHostMetrics -Ref $_.metrics.opaque_ref).live
+                })
+            if ($settled) { return $session }
+            $session | Disconnect-XenServer
+            $lastError = "the pool has not settled under the new coordinator"
+        }
+        catch { $lastError = $_ }
+        Start-Sleep -Seconds $IntervalSeconds
     }
     throw "the pool did not come back after the master change: $lastError"
+}
+
+function Enable-WhenBooted {
+    # Re-enable a host that has just come back. It reports itself live before xapi on it has finished
+    # starting, and until then Enable fails HOST_STILL_BOOTING - so retry that.
+    param($XenHost, [int]$TimeoutSeconds = 600, [int]$IntervalSeconds = 10)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try { $XenHost | Invoke-XenHost -XenAction Enable; return }
+        catch {
+            $ex = $_.Exception
+            while ($ex -and -not $ex.ErrorDescription) { $ex = $ex.InnerException }
+            if (-not ($ex -and $ex.ErrorDescription -and $ex.ErrorDescription[0] -eq "HOST_STILL_BOOTING") `
+                    -or (Get-Date) -gt $deadline) {
+                throw
+            }
+            Start-Sleep -Seconds $IntervalSeconds
+        }
+    }
+}
+
+function Wait-ForRestart {
+    # Wait for a host to come back from a reboot (Key "boot_time") or toolstack restart
+    # ("agent_start_time"): until that other_config entry differs from -Before and the host is live.
+    # Reconnects every time round, because the host restarting may be the coordinator this session
+    # talks to; returns the new session.
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$UserName,
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$HostUuid,
+        [Parameter(Mandatory = $true)][string]$Key,
+        $Before,
+        [int]$TimeoutSeconds = 1800,
+        [int]$IntervalSeconds = 10
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try {
+            $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
+            $xenHost = Get-XenHost -Uuid $HostUuid
+            if ($xenHost.other_config[$Key] -ne $Before -and (Get-HostLive $xenHost)) { return $session }
+            $session | Disconnect-XenServer
+        }
+        catch {
+            # down, or xapi still starting: a connection error or any XenAPI failure, keep retrying.
+        }
+        if ((Get-Date) -gt $deadline) { throw "host $HostUuid did not come back in time" }
+        Start-Sleep -Seconds $IntervalSeconds
+    }
 }
 
 # --- 1. Connect & inventory ------------------------------------------------------------
@@ -432,7 +501,7 @@ function Invoke-ManageVmDisks {
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
         [Parameter(Mandatory = $true)][string]$Password,
-        [Parameter(Mandatory = $true)][string]$TemplateName,
+        [Parameter(Mandatory = $true)][string]$SourceVm,
         [Parameter(Mandatory = $true)][string]$SrName,
         [string]$NewVmName = "sdk-example-vm-disks"
     )
@@ -443,20 +512,22 @@ function Invoke-ManageVmDisks {
     # matching XenCenter's own "deactivate" action, which only ever targets additional disks, and tidy
     # up afterwards so the example is repeatable. No shrink: real SR backends refuse one outright
     # (SR_BACKEND_FAILURE_79), so this only ever grows.
+    #
+    # Plugging and unplugging a disk on a running VM needs the guest's PV drivers
+    # (VM_MISSING_PV_DRIVERS otherwise), so the VM is a throwaway copy of SourceVm, a VM with a guest OS
+    # and PV drivers.
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
-    $template = Get-XenVM -Name $TemplateName | Where-Object { $_.is_a_template } | Select-Object -First 1
-    if (-not $template) { throw "No template named '$TemplateName' was found." }
-    $vm = $template | Invoke-XenVM -XenAction Clone -NewName $NewVmName -PassThru
-    Invoke-VmProvision -Ref $vm.opaque_ref
+    $vm = Copy-OfGuest -SourceVmName $SourceVm -NewVmName $NewVmName
     $ref = $vm.opaque_ref
     $vm | Invoke-XenVM -XenAction Start
+    Wait-GuestAgent -Ref $ref
 
     $sr = Get-XenSR -Name $SrName | Select-Object -First 1
     if (-not $sr) { throw "No SR named '$SrName' was found." }
     $vdi = New-XenVDI -NameLabel "sdk-example-data-disk" -SR $sr -VirtualSize 4GB `
         -Type user -Sharable $false -ReadOnly $false -PassThru
     $device = (Get-XenVMProperty -Ref $ref -XenProperty AllowedVBDDevices)[0]
-    $vbd = New-XenVBD -VM (Get-XenVM -Ref $ref) -VDI $vdi -Userdevice $device `
+    $vbd = New-XenVBD -VM (Get-XenVM -Ref $ref) -VDI $vdi -Userdevice $device -Bootable $false `
         -Mode RW -Type Disk -Empty $false -PassThru
     $vbd | Invoke-XenVBD -XenAction Plug
     Write-Host "Disk attached:  $((Get-XenVBD -Ref $vbd.opaque_ref).currently_attached)"
@@ -473,10 +544,19 @@ function Invoke-ManageVmDisks {
     Write-Host "After plug:     $((Get-XenVBD -Ref $vbd.opaque_ref).currently_attached)"
 
     # Growing a disk that is attached and live is a DIFFERENT action, not a flag on the same one:
-    # ResizeOnline tells the storage layer the guest is using the disk while it grows.
-    $grown = [int64](Get-XenVDI -Ref $vdi.opaque_ref).virtual_size + 1GB
-    Invoke-XenVDI -Ref $vdi.opaque_ref -XenAction ResizeOnline -Size $grown
-    Write-Host "Grown online:   $((Get-XenVDI -Ref $vdi.opaque_ref).virtual_size) bytes"
+    # ResizeOnline tells the storage layer the guest is using the disk while it grows. Only some
+    # storage drivers can (none of a stock XenServer 9's do), and the rest refuse with
+    # SR_OPERATION_NOT_SUPPORTED - so ask the SR's driver (its SM record's features) first.
+    $srType = (Get-XenSR -Ref $sr.opaque_ref).type
+    $features = (Get-XenSM | Where-Object { $_.type -eq $srType } | Select-Object -First 1).features
+    if ($features -and $features.ContainsKey("VDI_RESIZE_ONLINE")) {
+        $grown = [int64](Get-XenVDI -Ref $vdi.opaque_ref).virtual_size + 1GB
+        Invoke-XenVDI -Ref $vdi.opaque_ref -XenAction ResizeOnline -Size $grown
+        Write-Host "Grown online:   $((Get-XenVDI -Ref $vdi.opaque_ref).virtual_size) bytes"
+    }
+    else {
+        Write-Host "Grown online:   not supported by $srType storage; unplug, resize, plug as above"
+    }
 
     $vm | Invoke-XenVM -XenAction HardShutdown
     Remove-VmAndDisks -Ref $ref
@@ -1278,26 +1358,42 @@ function Invoke-TagsAndFolders {
 #   Invoke-TagsAndFolders -Url https://xenserver -UserName root -Password $password -VmName 'web-01'
 
 # --- 16. Configure updates (CDN) ------------------------------------------------------
+function New-UpdateRepositories {
+    # Introduce the pool's update repositories the way XenCenter does: the release's base packages
+    # (Update=$false) and its update stream (Update=$true, which pool.sync_updates needs - otherwise
+    # NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so
+    # these are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}.
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][string]$RepoUrl,
+        [Parameter(Mandatory = $true)][string]$SourceUrl
+    )
+    return @("base", "normal") | ForEach-Object {
+        $stage = $_
+        # Repository.introduce is a static-style create, so pass the NULL ref for the (ignored)
+        # instance param.
+        Invoke-XenRepository -Ref 'OpaqueRef:NULL' -XenAction Introduce -NameLabel "sdk-example-$stage" `
+            -NameDescription "SDK example $stage repository" -BinaryUrl "$RepoUrl/$stage" `
+            -SourceUrl "$SourceUrl/$stage" -Update ($stage -ne "base") -GpgkeyPath '' -PassThru
+    }
+}
+
 function Invoke-ConfigureUpdates {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$RepoUrl,
+        [Parameter(Mandatory = $true)][string]$SourceUrl
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
-    # Repository.introduce is a static-style create, so pass the NULL ref for the (ignored) instance
-    # param. Update=$true: without it this introduces only a base package mirror, not an actual *update*
-    # repository - pool.sync_updates needs one with Update enabled (NO_REPOSITORY_ENABLED otherwise),
-    # which is exactly what apply-update and rolling-pool-update rely on.
-    $repo = Invoke-XenRepository -Ref 'OpaqueRef:NULL' -XenAction Introduce -NameLabel 'sdk-cdn' `
-        -NameDescription 'SDK example repository' -BinaryUrl 'https://cdn.example/base' `
-        -SourceUrl 'https://cdn.example/source' -Update $true -GpgkeyPath '' -PassThru
-    Write-Host "Introduced repository: $($repo.name_label)"
+    $repos = @(New-UpdateRepositories -Session $session -RepoUrl $RepoUrl -SourceUrl $SourceUrl)
+    Write-Host "Introduced repositories: $(($repos | ForEach-Object { $_.name_label }) -join ', ')"
 
     $pool = Get-XenPool | Select-Object -First 1
     # Remember the pool's own repositories, to put them back afterwards.
     $previous = @((Get-XenPool -Ref $pool.opaque_ref).repositories | ForEach-Object { $_.opaque_ref })
-    $pool | Set-XenPool -Repositories @($repo.opaque_ref)
+    $pool | Set-XenPool -Repositories @($repos | ForEach-Object { $_.opaque_ref })
     $pool | Set-XenPool -UpdateSyncEnabled $true
     $p = Get-XenPool -Ref $pool.opaque_ref
     Write-Host "Pool repositories: $($p.repositories.Count); auto-sync enabled: $($p.update_sync_enabled)"
@@ -1305,12 +1401,13 @@ function Invoke-ConfigureUpdates {
     # Tidy up so the example is repeatable.
     $pool | Set-XenPool -UpdateSyncEnabled $false
     $pool | Set-XenPool -Repositories $previous
-    $repo | Invoke-XenRepository -XenAction Forget
+    $repos | ForEach-Object { $_ | Invoke-XenRepository -XenAction Forget }
     Write-Host "OK: configure-updates"
     $session | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-ConfigureUpdates -Url https://xenserver -UserName root -Password $password
+#   Invoke-ConfigureUpdates -Url https://xenserver -UserName root -Password $password `
+#       -RepoUrl https://repo.ops.xenserver.com/xs9 -SourceUrl https://repo-src.ops.xenserver.com/xs9
 
 # --- 17. Clone a VM (fast, copy-on-write) ---------------------------------------------
 function Invoke-CloneVm {
@@ -1433,7 +1530,9 @@ function Invoke-ApplyUpdate {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$RepoUrl,
+        [Parameter(Mandatory = $true)][string]$SourceUrl
     )
     # pool.sync_updates needs at least one repository with Update enabled (NO_REPOSITORY_ENABLED
     # otherwise) - introduce and attach a throwaway one, and forget it again afterwards. Applying a
@@ -1444,12 +1543,10 @@ function Invoke-ApplyUpdate {
     # records guidance) - not unconditionally after every apply.
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $pool = Get-XenPool | Select-Object -First 1
-    $repo = Invoke-XenRepository -Ref 'OpaqueRef:NULL' -XenAction Introduce -NameLabel 'sdk-cdn' `
-        -NameDescription 'SDK example repository' -BinaryUrl 'https://cdn.example/base' `
-        -SourceUrl 'https://cdn.example/source' -Update $true -GpgkeyPath '' -PassThru
+    $repos = @(New-UpdateRepositories -Session $session -RepoUrl $RepoUrl -SourceUrl $SourceUrl)
     # Remember the pool's own repositories, to put them back afterwards.
     $previous = @((Get-XenPool -Ref $pool.opaque_ref).repositories | ForEach-Object { $_.opaque_ref })
-    $pool | Set-XenPool -Repositories @($repo.opaque_ref)
+    $pool | Set-XenPool -Repositories @($repos | ForEach-Object { $_.opaque_ref })
     try {
         # Sync the pool's update metadata; -PassThru returns the hash identifying the synced set.
         $hash = $pool | Invoke-XenPool -XenAction SyncUpdates -PassThru
@@ -1475,23 +1572,35 @@ function Invoke-ApplyUpdate {
             }
             $guidance = @((Get-XenHost -Ref $xenHost.opaque_ref).pending_guidances)
             Write-Host "  $($xenHost.name_label): applied; pending guidance = [$($guidance -join ', ')]"
-            if ($guidance -contains "reboot_host") {
-                $xenHost | Invoke-XenHost -XenAction Reboot
+            if ($guidance -contains "reboot_host" -or $guidance -contains "restart_toolstack") {
+                # As in rolling-pool-update: either restart returns before it has happened, and the
+                # coordinator's takes this session with it - so wait for it, reconnecting.
+                $key = if ($guidance -contains "reboot_host") { "boot_time" } else { "agent_start_time" }
+                $before = (Get-XenHost -Ref $xenHost.opaque_ref).other_config[$key]
+                if ($key -eq "boot_time") {
+                    $xenHost | Invoke-XenHost -XenAction Reboot
+                }
+                else {
+                    $xenHost | Invoke-XenHost -XenAction RestartAgent
+                }
+                $session = Wait-ForRestart -Url $Url -UserName $UserName -Password $Password `
+                    -HostUuid $xenHost.uuid -Key $key -Before $before
             }
-            elseif ($guidance -contains "restart_toolstack") {
-                $xenHost | Invoke-XenHost -XenAction RestartAgent
-            }
+            # apply_updates disables the host while it works (auto_enable: a restart puts it back) - with no
+            # restart to do, nothing re-enables it. Return it to service either way.
+            Enable-WhenBooted -XenHost $xenHost
         }
     }
     finally {
         $pool | Set-XenPool -Repositories $previous
-        $repo | Invoke-XenRepository -XenAction Forget
+        $repos | ForEach-Object { $_ | Invoke-XenRepository -XenAction Forget }
     }
     Write-Host "OK: apply-update"
     $session | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-ApplyUpdate -Url https://xenserver -UserName root -Password $password
+#   Invoke-ApplyUpdate -Url https://xenserver -UserName root -Password $password `
+#       -RepoUrl https://repo.ops.xenserver.com/xs9 -SourceUrl https://repo-src.ops.xenserver.com/xs9
 
 # --- 21. Checkpoint & revert ---------------------------------------------------------
 function Invoke-CheckpointVm {
@@ -1557,7 +1666,7 @@ function Invoke-AttachDisk {
     $vdi = New-XenVDI -NameLabel "sdk-example-data-disk" -SR $sr -VirtualSize 8GB `
         -Type user -Sharable $false -ReadOnly $false -PassThru
     $device = (Get-XenVMProperty -Ref $ref -XenProperty AllowedVBDDevices)[0]
-    New-XenVBD -VM (Get-XenVM -Ref $ref) -VDI $vdi -Userdevice $device `
+    New-XenVBD -VM (Get-XenVM -Ref $ref) -VDI $vdi -Userdevice $device -Bootable $false `
         -Mode RW -Type Disk -Empty $false | Out-Null
     Write-Host "Attached an 8 GiB disk on $($sr.name_label) as device $device"
     Write-Host "VM now has $(@((Get-XenVM -Ref $ref).VBDs).Count) VBD(s)"
@@ -2063,7 +2172,9 @@ function Invoke-RollingPoolUpdate {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$RepoUrl,
+        [Parameter(Mandatory = $true)][string]$SourceUrl
     )
     # Needs an enabled update repository the same way apply-update does - introduce and attach a
     # throwaway one, forget it again afterwards. Modern xapi (>=23.18.0) doesn't reboot a host for you:
@@ -2071,12 +2182,10 @@ function Invoke-RollingPoolUpdate {
     # batch actually asks for it.
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $pool = Get-XenPool | Select-Object -First 1
-    $repo = Invoke-XenRepository -Ref 'OpaqueRef:NULL' -XenAction Introduce -NameLabel 'sdk-cdn' `
-        -NameDescription 'SDK example repository' -BinaryUrl 'https://cdn.example/base' `
-        -SourceUrl 'https://cdn.example/source' -Update $true -GpgkeyPath '' -PassThru
+    $repos = @(New-UpdateRepositories -Session $session -RepoUrl $RepoUrl -SourceUrl $SourceUrl)
     # Remember the pool's own repositories, to put them back afterwards.
     $previous = @((Get-XenPool -Ref $pool.opaque_ref).repositories | ForEach-Object { $_.opaque_ref })
-    $pool | Set-XenPool -Repositories @($repo.opaque_ref)
+    $pool | Set-XenPool -Repositories @($repos | ForEach-Object { $_.opaque_ref })
     try {
         $hash = $pool | Invoke-XenPool -XenAction SyncUpdates -PassThru
         Write-Host "Synced updates; hash length $($hash.Length)"
@@ -2090,24 +2199,34 @@ function Invoke-RollingPoolUpdate {
             $xenHost | Invoke-XenHost -XenAction ApplyUpdates -Hash $hash  # apply the synced updates
             $guidance = @((Get-XenHost -Ref $xenHost.opaque_ref).pending_guidances)
             Write-Host "  applied; pending guidance = [$($guidance -join ', ')]"
-            if ($guidance -contains "reboot_host") {
-                $xenHost | Invoke-XenHost -XenAction Reboot     # reboot into the updated software
+            if ($guidance -contains "reboot_host" -or $guidance -contains "restart_toolstack") {
+                # Either restart returns before it has happened, and if this host is the coordinator it
+                # takes this session with it - so note when the host last started, restart it, and
+                # reconnect until it reports a newer start and is live again.
+                $key = if ($guidance -contains "reboot_host") { "boot_time" } else { "agent_start_time" }
+                $before = $xenHost.other_config[$key]
+                if ($key -eq "boot_time") {
+                    $xenHost | Invoke-XenHost -XenAction Reboot     # reboot into the updated software
+                }
+                else {
+                    $xenHost | Invoke-XenHost -XenAction RestartAgent
+                }
+                $session = Wait-ForRestart -Url $Url -UserName $UserName -Password $Password `
+                    -HostUuid $xenHost.uuid -Key $key -Before $before
             }
-            elseif ($guidance -contains "restart_toolstack") {
-                $xenHost | Invoke-XenHost -XenAction RestartAgent
-            }
-            $xenHost | Invoke-XenHost -XenAction Enable     # return the host to service
+            Enable-WhenBooted -XenHost $xenHost   # return the host to service
         }
     }
     finally {
         $pool | Set-XenPool -Repositories $previous
-        $repo | Invoke-XenRepository -XenAction Forget
+        $repos | ForEach-Object { $_ | Invoke-XenRepository -XenAction Forget }
     }
     Write-Host "OK: rolling-pool-update"
     $session | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-RollingPoolUpdate -Url https://xenserver -UserName root -Password $password
+#   Invoke-RollingPoolUpdate -Url https://xenserver -UserName root -Password $password `
+#       -RepoUrl https://repo.ops.xenserver.com/xs9 -SourceUrl https://repo-src.ops.xenserver.com/xs9
 
 # --- 42. Cross-pool copy a VM -------------------------------------------------------------------------
 function Invoke-CrossPoolCopyVm {
@@ -2116,19 +2235,27 @@ function Invoke-CrossPoolCopyVm {
         [Parameter(Mandatory = $true)][string]$UserName,
         [Parameter(Mandatory = $true)][string]$Password,
         [Parameter(Mandatory = $true)][string]$DestUrl,
-        [string]$VmName = "db-01"
+        [string]$VmName = "db-01",
+        # The destination pool's credentials, if they differ from the source's.
+        [string]$DestUserName = $UserName,
+        [string]$DestPassword = $Password
     )
     # Two pools, so two sessions. Every cmdlet takes -SessionOpaqueRef, so we drive each pool explicitly
     # (Connect-Example sets a default session too, but being explicit keeps the two pools apart).
     $source = Connect-Example -Url $Url -UserName $UserName -Password $Password
-    $dest = Connect-Example -Url $DestUrl -UserName $UserName -Password $Password
+    $dest = Connect-Example -Url $DestUrl -UserName $DestUserName -Password $DestPassword
     $srcRef = $source.opaque_ref
     $dstRef = $dest.opaque_ref
 
     # Destination: choose a host, network and SR, then ask for a receiver token (a string->string map).
-    $destHost = Get-XenHost -SessionOpaqueRef $dstRef | Select-Object -First 1
-    $destNet = Get-XenNetwork -SessionOpaqueRef $dstRef | Select-Object -First 1
-    $destSr = Get-XenSR -SessionOpaqueRef $dstRef -Name "Shared NFS" | Select-Object -First 1
+    # The disks go to the destination pool's default SR and the data travels over the host's management
+    # network - one both pools can certainly reach (the first network listed may well not be).
+    $destPool = Get-XenPool -SessionOpaqueRef $dstRef | Select-Object -First 1
+    $destHost = Get-XenHost -SessionOpaqueRef $dstRef -Ref $destPool.master.opaque_ref
+    $destSr = Get-XenSR -SessionOpaqueRef $dstRef -Ref $destPool.default_SR.opaque_ref
+    $managementPif = Get-XenPIF -SessionOpaqueRef $dstRef |
+        Where-Object { $_.management -and $_.host.opaque_ref -eq $destHost.opaque_ref } | Select-Object -First 1
+    $destNet = Get-XenNetwork -SessionOpaqueRef $dstRef -Ref $managementPif.network.opaque_ref
     $receiver = $destHost | Invoke-XenHost -SessionOpaqueRef $dstRef -XenAction MigrateReceive `
         -Network $destNet -Options @{} -PassThru
 
@@ -2162,7 +2289,8 @@ function Invoke-CrossPoolCopyVm {
     $dest | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-CrossPoolCopyVm -Url https://poolA -UserName root -Password $password -DestUrl https://poolB
+#   Invoke-CrossPoolCopyVm -Url https://poolA -UserName root -Password $password -DestUrl https://poolB `
+#       [-DestUserName root -DestPassword $destPassword] [-VmName db-01]
 
 # --- 43. PVS Accelerator inventory ------------------------------------------------------------------
 function Invoke-PvsAccelerator {
@@ -2315,14 +2443,18 @@ function Invoke-ManageAdUsers {
         [string]$Domain = "",
         [string]$AdminUser = "alice",
         [string]$AdminPassword = "Password1",
-        [string]$NewUser = "alice"
+        [string]$NewUser = "alice",
+        [string]$Ldaps = "false"
     )
     # Needs a real, reachable AD domain controller - enable_external_auth fails at the very first call
     # (DNS/LDAP/Kerberos) without one, so Domain/AdminUser/AdminPassword have to identify a real domain
-    # to join. NewUser is the account to grant a role to; its subject identity is looked up against the
-    # directory just joined, so it has to be a real account there too. The simulator models a single-
-    # user, domain-less fake directory (hence the empty Domain default) - override every one of these on
-    # a real pool.
+    # to join. Before joining, every host must resolve the domain (point its DNS at a domain controller)
+    # and keep its clock close to the DC's (Kerberos). Current Windows DCs want LDAPS (Ldaps="true"),
+    # which also needs the pool to trust the DC's CA certificate (pool.install_trusted_certificate with
+    # purpose "ldaps"). NewUser is the account to grant a role to; its subject identity is looked up
+    # against the directory, so it has to be a real account there too. A pool already joined to this
+    # domain is used as it is - and left joined. The simulator models a single-user, domain-less fake
+    # directory (hence the empty Domain default) - override every one of these on a real pool.
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     # The compiled module's AD cmdlets are awkward to script, so the AD calls go over JSON-RPC (the module
     # already trusts the server cert after Connect) — the same approach as the events example.
@@ -2333,9 +2465,16 @@ function Invoke-ManageAdUsers {
         $r.result
     }
 
-    $pool = (Rpc "pool.get_all" @())[0]
-    Rpc "pool.enable_external_auth" @($pool, @{ user = $AdminUser; pass = $AdminPassword; ldaps = "false" }, $Domain, "AD") | Out-Null
-    Write-Host "Joined domain: $(if ($Domain) { $Domain } else { "(none - simulator's fake directory)" })"
+    $pool = @(Rpc "pool.get_all" @())[0]
+    $coordinator = Rpc "pool.get_master" @($pool)
+    $alreadyJoined = $Domain -and (Rpc "host.get_external_auth_type" @($coordinator)) -eq "AD" `
+        -and (Rpc "host.get_external_auth_service_name" @($coordinator)) -ieq $Domain
+    if ($alreadyJoined) {
+        Write-Host "Already joined to domain: $Domain"
+    } else {
+        Rpc "pool.enable_external_auth" @($pool, @{ user = $AdminUser; pass = $AdminPassword; ldaps = $Ldaps }, $Domain, "AD") | Out-Null
+        Write-Host "Joined domain: $(if ($Domain) { $Domain } else { "(none - simulator's fake directory)" })"
+    }
 
     # Add an AD user as a subject and grant it the pool-admin role (found via the Get-XenRole cmdlet,
     # simpler/more idiomatic than filtering Get-XenRole's own roles - matches what
@@ -2361,7 +2500,11 @@ function Invoke-ManageAdUsers {
     # Tidy up (remove the role assignment, then the subject).
     Rpc "subject.remove_from_roles" @($subject, $adminRole.opaque_ref) | Out-Null
     Rpc "subject.destroy" @($subject) | Out-Null
-    Rpc "pool.disable_external_auth" @($pool, @{}) | Out-Null
+    if (-not $alreadyJoined) {
+        # Leave the way it was found. Passing the admin credentials also removes the pool's computer
+        # accounts from the directory; with {} they stay behind in AD.
+        Rpc "pool.disable_external_auth" @($pool, @{ user = $AdminUser; pass = $AdminPassword }) | Out-Null
+    }
     Write-Host "OK: manage-ad-users"
     $session | Disconnect-XenServer
 }
@@ -2440,8 +2583,8 @@ function Invoke-CreateSmbSr {
 
     $secret = New-XenSecret -Value $SmbPassword -OtherConfig @{} -PassThru
     $deviceConfig = @{
-        server          = $Server
-        serverpath      = $Share
+        # server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
+        server          = "//$Server$Share"
         username        = $SmbUsername
         password_secret = $secret.uuid
     }
@@ -2463,18 +2606,23 @@ function Invoke-CreateHbaSr {
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
         [Parameter(Mandatory = $true)][string]$Password,
+        [string]$ScsiId = "",
         [string]$SrName = "sdk-example-hba"
     )
     # Connect a shared SR to a fibre-channel (HBA) LUN, discovering it the way the New SR wizard does:
     # probing with no SCSIid fails on purpose and lists every LUN the backend can see.
     #
-    # SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
+    # SR.create formats the chosen LUN - this is destructive. On shared FC storage a host sees LUNs other
+    # hosts are using, so name the one that is yours (-ScsiId); with none, the first LUN listed is taken,
+    # which is only right on a dedicated test target.
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $xenHost = Get-XenHost | Select-Object -First 1
 
     # The root element varies by backend; find BlockDevice entries by tag wherever they are.
     $devlistXml = [xml](Invoke-ProbeForFailure -XenHostRef $xenHost.opaque_ref -DeviceConfig @{} -SmType lvmohba)
-    $device = $devlistXml.SelectSingleNode("//BlockDevice")
+    $device = $devlistXml.SelectNodes("//BlockDevice") |
+        Where-Object { -not $ScsiId -or $_.SCSIid -eq $ScsiId } | Select-Object -First 1
+    if (-not $device) { throw "no LUN with SCSIid $ScsiId is visible to this host" }
     $scsiId = $device.SCSIid
     $path = $device.path
     Write-Host "Discovered LUN: SCSIid $scsiId on $path"
@@ -2495,17 +2643,19 @@ function Invoke-CreateHbaSr {
 
 # --- 51. Create an ISO library SR ----------------------------------------------------
 function Invoke-CreateIsoSr {
+    # Connect an ISO-library SR to a file share of ISO images (here an NFS export, Location
+    # "server:/path").
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$Location
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $xenHost = Get-XenHost | Select-Object -First 1
-    # Connect an ISO-library SR to a file share of ISO images (here an NFS export).
-    $deviceConfig = @{ location = "192.0.2.10:/isos"; type = "nfs_iso" }
+    $deviceConfig = @{ location = $Location; type = "nfs_iso" }
     $sr = New-XenSR -XenHost $xenHost -DeviceConfig $deviceConfig -PhysicalSize 0 `
-        -NameLabel "sdk-iso-sr" -NameDescription "ISO library created by the SDK example" `
+        -NameLabel "sdk-example-iso" -NameDescription "ISO library created by the SDK example" `
         -Type "iso" -ContentType "iso" -Shared $true -PassThru
     Write-Host "Created ISO SR: $($sr.uuid)"
     Invoke-DetachAndForgetSr -Ref $sr.opaque_ref
@@ -2614,7 +2764,9 @@ function Invoke-ManageVapp {
     Invoke-XenVMAppliance -VMAppliance $vapp -XenAction Start -Paused $false
     Write-Host "Started:        $((Get-XenVM -Name $VmName).power_state)"
 
-    Invoke-XenVMAppliance -VMAppliance $vapp -XenAction CleanShutdown
+    # Shutdown tries each VM's clean shutdown and falls back to a hard one. CleanShutdown alone fails
+    # OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+    Invoke-XenVMAppliance -VMAppliance $vapp -XenAction Shutdown
     Write-Host "Shut down:      $((Get-XenVM -Name $VmName).power_state)"
 
     Set-XenVM -VM (Get-XenVM -Name $VmName) -Appliance "OpaqueRef:NULL"
@@ -2664,48 +2816,85 @@ function Invoke-WlbRecommendations {
         [string]$VmName = "web-01",
         [string]$WlbHostPort = "wlb.example:8012",
         [string]$WlbUsername = "wlbuser",
-        [string]$WlbPassword = "wlbpass"
+        [string]$WlbPassword = "wlbpass",
+        [string]$WlbCertificate = ""
     )
     # Needs a real, reachable WLB appliance: InitializeWlb makes a synchronous HTTP call to it and raises
     # WLB_CONNECTION_REFUSED/WLB_CONNECTION_RESET if it can't connect - there is no way to fake this with
     # a placeholder. WlbHostPort is host:port, with NO URL scheme - that is the real wire format
     # (xe pool-initialize-wlb wlb_url="10.x.x.x:30601" ...), not a URL.
+    #
+    # The pool checks the appliance's TLS certificate (wlb_verify_cert), and only against the
+    # certificates installed with -XenAction CertificateInstall - not InstallTrustedCertificate's. A
+    # fresh appliance has a self-signed one, so pass it as WlbCertificate (a PEM file): without it
+    # InitializeWlb fails with INTERNAL_ERROR "Connection failed: configuration failed." and no hint
+    # that the certificate is the reason.
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $pool = Get-XenPool | Select-Object -First 1
 
+    $certName = ""
+    if ($WlbCertificate) {
+        $certName = "sdk-example-wlb.pem"
+        Invoke-XenPool -Ref $pool.opaque_ref -XenAction CertificateInstall `
+            -NameParam $certName -Cert (Get-Content -Raw $WlbCertificate)   # pool-wide: no -Pool/-Ref target
+    }
     Invoke-XenPool -Ref $pool.opaque_ref -XenAction InitializeWlb `
         -WlbUrl $WlbHostPort -WlbUsername $WlbUsername -WlbPassword $WlbPassword `
         -XenserverUsername $UserName -XenserverPassword $Password
-    Write-Host "WLB: $((Get-XenPool | Select-Object -First 1).wlb_url)"
+    try {
+        # Initializing connects the pool to the appliance but leaves balancing off: every WLB call
+        # after this would fail WLB_DISABLED until it's switched on.
+        Set-XenPool -Pool $pool -WlbEnabled $true
+        Write-Host "WLB: $((Get-XenPool | Select-Object -First 1).wlb_url)"
 
-    # Read BY POSITION, and the two calls do not share a shape. The pool's are keyed by VM and say
-    # where to move it: [0] "wlb", [1] the destination host's UUID (a uuid, not a ref), [2] and [3]
-    # ids, [4] the reason.
-    # -PassThru: without it Invoke-Xen* runs the action and emits nothing, so a value-returning
-    # action looks like it returned null.
-    $poolRecs = Invoke-XenPool -Ref $pool.opaque_ref -XenAction RetrieveWlbRecommendations -PassThru
-    foreach ($entry in $poolRecs.GetEnumerator()) {
-        $fields = @($entry.Value)
-        $name = (Get-XenVM -Ref $entry.Key).name_label
-        Write-Host "  move $name -> host $($fields[1]) ($($fields[4]))"
+        # Read BY POSITION, and the two calls do not share a shape. The pool's are keyed by VM and say
+        # where to move it: [0] "wlb", [1] the destination host's UUID (a uuid, not a ref), [2] and [3]
+        # ids, [4] the reason.
+        # -PassThru: without it Invoke-Xen* runs the action and emits nothing, so a value-returning
+        # action looks like it returned null.
+        $poolRecs = Invoke-XenPool -Ref $pool.opaque_ref -XenAction RetrieveWlbRecommendations -PassThru
+        foreach ($entry in $poolRecs.GetEnumerator()) {
+            $fields = @($entry.Value)
+            $name = (Get-XenVM -Ref $entry.Key).name_label
+            Write-Host "  move $name -> host $($fields[1]) ($($fields[4]))"
+        }
+
+        # A VM's own are keyed by host and star-rate each destination: [0] "wlb", [1] the rating -
+        # higher is better (a real appliance rated hosts 6.1 here, so not capped at XenCenter's five
+        # stars). Right after connecting, the appliance is still discovering the pool and answers
+        # WLB_INTERNAL_ERROR 4024 ("Pool discovery has not been started"), 4025 ("... has not been
+        # completed"), then 4016 ("WLB does not have current metrics") - keep asking for a while.
+        $vm = Get-XenVM -Name $VmName
+        $deadline = (Get-Date).AddMinutes(10)
+        while ($true) {
+            try { $vmRecs = Invoke-XenVM -Ref $vm.opaque_ref -XenAction RetrieveWlbRecommendations -PassThru; break }
+            catch {
+                $ex = $_.Exception
+                while ($ex -and -not $ex.ErrorDescription) { $ex = $ex.InnerException }
+                if (-not ($ex -and $ex.ErrorDescription -and $ex.ErrorDescription[0] -eq "WLB_INTERNAL_ERROR" `
+                        -and $ex.ErrorDescription[1] -in "4024", "4025", "4016") -or (Get-Date) -gt $deadline) {
+                    throw
+                }
+                Start-Sleep -Seconds 15
+            }
+        }
+        foreach ($entry in $vmRecs.GetEnumerator()) {
+            $fields = @($entry.Value)
+            Write-Host "  $((Get-XenHost -Ref $entry.Key).name_label) rated $($fields[1])"
+        }
+
+        # The appliance's own settings are read and written as one flat map of strings. Send a nightly
+        # reporting schedule, then read the configuration back to confirm it took.
+        Invoke-XenPool -Ref $pool.opaque_ref -XenAction SendWlbConfiguration -Config @{ ReportingCronString = "0 3 * * *" }
+        $config = Invoke-XenPool -Ref $pool.opaque_ref -XenAction RetrieveWlbConfiguration -PassThru
+        $pairs = $config.GetEnumerator() | Sort-Object Key | ForEach-Object { "$($_.Key)=$($_.Value)" }
+        Write-Host "  appliance configuration: $($pairs -join ', ')"
     }
-
-    # A VM's own are keyed by host and star-rate each destination: [0] "wlb", [1] the rating.
-    $vm = Get-XenVM -Name $VmName
-    $vmRecs = Invoke-XenVM -Ref $vm.opaque_ref -XenAction RetrieveWlbRecommendations -PassThru
-    foreach ($entry in $vmRecs.GetEnumerator()) {
-        $fields = @($entry.Value)
-        Write-Host "  $((Get-XenHost -Ref $entry.Key).name_label) rated $($fields[1])"
+    finally {
+        # Disconnect from the appliance however the above went, or the pool stays attached to it.
+        Invoke-XenPool -Ref $pool.opaque_ref -XenAction DeconfigureWlb
+        if ($certName) { Invoke-XenPool -Ref $pool.opaque_ref -XenAction CertificateUninstall -NameParam $certName }
     }
-
-    # The appliance's own settings are read and written as one flat map of strings. Send a nightly
-    # reporting schedule, then read the configuration back to confirm it took.
-    Invoke-XenPool -Ref $pool.opaque_ref -XenAction SendWlbConfiguration -Config @{ ReportingCronString = "0 3 * * *" }
-    $config = Invoke-XenPool -Ref $pool.opaque_ref -XenAction RetrieveWlbConfiguration -PassThru
-    $pairs = $config.GetEnumerator() | Sort-Object Key | ForEach-Object { "$($_.Key)=$($_.Value)" }
-    Write-Host "  appliance configuration: $($pairs -join ', ')"
-
-    Invoke-XenPool -Ref $pool.opaque_ref -XenAction DeconfigureWlb
     Write-Host "OK: wlb-recommendations"
     $session | Disconnect-XenServer
 }
@@ -2775,7 +2964,8 @@ function Invoke-ManagePoolMembership {
     Invoke-XenPool -Ref $pool.opaque_ref -XenAction DesignateNewMaster -XenHost $other.opaque_ref
     Write-Host "Promoting:   $($other.name_label) (xapi restarts pool-wide; reconnecting)"
 
-    $session = Reconnect-AfterMasterChange -Url $Url -UserName $UserName -Password $Password
+    $session = Reconnect-AfterMasterChange -Url $Url -UserName $UserName -Password $Password `
+        -NewMasterUuid $other.uuid
     $pool = Get-XenPool | Select-Object -First 1
     Write-Host "Promoted:    $((Get-XenHost -Ref $pool.master.opaque_ref).name_label)"
 
@@ -2784,7 +2974,8 @@ function Invoke-ManagePoolMembership {
     Invoke-XenPool -Ref $pool.opaque_ref -XenAction DesignateNewMaster -XenHost $originalRef
     Write-Host "Restoring:   $($original.name_label) (reconnecting again)"
 
-    $session = Reconnect-AfterMasterChange -Url $Url -UserName $UserName -Password $Password
+    $session = Reconnect-AfterMasterChange -Url $Url -UserName $UserName -Password $Password `
+        -NewMasterUuid $original.uuid
     $pool = Get-XenPool | Select-Object -First 1
     Write-Host "Restored:    $((Get-XenHost -Ref $pool.master.opaque_ref).name_label)"
 
@@ -2811,6 +3002,9 @@ function Invoke-CreateBond {
     # the bond master — on a real host that is how you lose the connection you are working over.
     $spares = Get-XenPIF | Where-Object { $_.host -eq $xenHost.opaque_ref -and -not $_.management -and $_.physical } |
         Select-Object -First 2
+    if (@($spares).Count -lt 2) {
+        throw "$($xenHost.name_label) has $(@($spares).Count) spare NIC(s); a bond needs two that aren't the management interface"
+    }
     Write-Host "Bonding:      $(($spares | ForEach-Object { $_.device }) -join ', ')"
 
     # The bond needs a network to sit on.
@@ -2833,9 +3027,27 @@ function Invoke-ConfigurePvsAccelerator {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$VmName
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
+
+    # Check the VM first, before creating anything: it needs a NIC for the proxy to sit on. It need not
+    # be running - a proxy on a halted VM just reports "stopped" until it starts.
+    $vm = Get-XenVM -Name $VmName |
+        Where-Object { -not $_.is_a_template -and -not $_.is_control_domain -and -not $_.is_a_snapshot } |
+        Select-Object -First 1
+    if (-not $vm) { throw "No VM named '$VmName' was found." }
+    # A proxy may only sit on the VM's LOWEST-numbered NIC, so sort by device rather than taking the
+    # first VIF — the list comes back in creation order, which is the same thing only by luck.
+    $vif = $vm.VIFs | ForEach-Object { Get-XenVIF -Ref $_.opaque_ref } |
+        Sort-Object { [int]$_.device } | Select-Object -First 1
+    if (-not $vif) { throw "$VmName has no network interface to accelerate" }
+    # ... and one that no site accelerates yet (a VIF takes one proxy: PVS_PROXY_ALREADY_PRESENT).
+    $existing = Get-XenPVSProxy | Where-Object { $_.VIF.opaque_ref -eq $vif.opaque_ref } | Select-Object -First 1
+    if ($existing) {
+        throw "$VmName is already accelerated by site '$((Get-XenPVSSite -Ref $existing.site.opaque_ref).name_label)'"
+    }
 
     # PVS_site.introduce and PVS_server.introduce are CONSTRUCTORS, and every parameter set of
     # Invoke-XenPVSSite / Invoke-XenPVSServer identifies an object that ALREADY EXISTS (-PVSSite / -Ref /
@@ -2845,7 +3057,7 @@ function Invoke-ConfigurePvsAccelerator {
     # Same shape as Cluster.pool_create in configure-clustering — so, same answer: call the method over
     # JSON-RPC. Still pure PowerShell; no [XenAPI.*]:: statics.
     $site = Invoke-XenMethod -Session $session -Method 'PVS_site.introduce' `
-        -Params @('sdk-pvs-farm', 'Created by the SDK examples', '')
+        -Params @('sdk-example-pvs', 'Created by the SDK examples', '')
     Invoke-XenMethod -Session $session -Method 'PVS_server.introduce' `
         -Params @(@('10.62.0.90'), 6910, 6930, $site) | Out-Null
 
@@ -2861,15 +3073,6 @@ function Invoke-ConfigurePvsAccelerator {
             -Size 10GB | Out-Null
     }
 
-    # A proxy may only sit on the VM's LOWEST-numbered NIC, so sort by device rather than taking the
-    # first VIF — the list comes back in creation order, which is the same thing only by luck.
-    $accelerated = @(Get-XenPVSProxy | ForEach-Object { (Get-XenVIF -Ref $_.VIF.opaque_ref).VM.opaque_ref })
-    $vm = Get-XenVM | Where-Object {
-        -not $_.is_a_template -and -not $_.is_control_domain -and -not $_.is_a_snapshot -and
-        $_.power_state -eq 'Running' -and $_.VIFs.Count -gt 0 -and $accelerated -notcontains $_.opaque_ref
-    } | Select-Object -First 1
-    $vif = $vm.VIFs | ForEach-Object { Get-XenVIF -Ref $_.opaque_ref } |
-        Sort-Object { [int]$_.device } | Select-Object -First 1
     $proxy = New-XenPVSProxy -Site $site -VIF $vif.opaque_ref -PassThru
 
     $record = Get-XenPVSSite -Ref $site
@@ -2891,7 +3094,7 @@ function Invoke-ConfigurePvsAccelerator {
     $session | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-ConfigurePvsAccelerator -Url https://xenserver -UserName root -Password $password
+#   Invoke-ConfigurePvsAccelerator -Url https://xenserver -UserName root -Password $password -VmName 'db-01'
 
 # --- Manage SSH access -----------------------------------------------------------------
 function Invoke-ManageSshAccess {
@@ -3068,16 +3271,20 @@ function Invoke-ExportImportVm {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [string]$VmName = 'db-01'
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
 
-    # Only a halted VM can be exported: its disks must not be changing underneath the copy.
-    $vm = Get-XenVM | Where-Object {
-        -not $_.is_a_template -and -not $_.is_control_domain -and -not $_.is_a_snapshot -and
-        $_.power_state -eq 'Halted'
-    } | Select-Object -First 1
-    Write-Host "Exporting $($vm.name_label)"
+    # Name the VM: an export carries every block of its disks, so which VM matters (a large one takes a
+    # long time, and fills the disk). Only a halted VM can be exported: its disks must not be changing
+    # underneath the copy.
+    $vm = Get-XenVM -Name $VmName |
+        Where-Object { -not $_.is_a_template -and -not $_.is_control_domain -and -not $_.is_a_snapshot } |
+        Select-Object -First 1
+    if (-not $vm) { throw "No VM named '$VmName' was found." }
+    if ($vm.power_state -ne 'Halted') { throw "$VmName must be halted to be exported" }
+    Write-Host "Exporting $VmName"
 
     # Export and import are HTTP transfers alongside the API rather than API calls, so the session id
     # travels in the query string. Still pure PowerShell: Connect-Example has already trusted the
@@ -3085,41 +3292,50 @@ function Invoke-ExportImportVm {
     # A unique file, not a fixed name: an export is a real file on disk and two of them running at
     # once would otherwise fight over it.
     $path = Join-Path ([IO.Path]::GetTempPath()) "sdk-example-export-$([guid]::NewGuid().Guid).xva"
-    Invoke-WebRequest -Uri "$Url/export?session_id=$($session.opaque_ref)&uuid=$($vm.uuid)" `
-        -OutFile $path -UseBasicParsing
-    Write-Host ("  wrote {0:N1} MiB to {1}" -f ((Get-Item $path).Length / 1MB), (Split-Path $path -Leaf))
-
-    # An XVA is a tar: ova.xml describes the VM, and the disk blocks follow in 1 MiB pieces, each with
-    # its own checksum.
-    $names = Get-TarEntryName -Path $path
-    Write-Host ("  archive holds {0} and {1} disk block(s)" -f
-        $names[0], (@($names | Where-Object { -not $_.EndsWith('.checksum') }).Count - 1))
-
-    # The imported VM's ref is NOT in the /import response body on a real host - the only place it
-    # appears is the task named in the task_id query parameter, so create one, pass it, and read the
-    # task's result once the upload finishes, the same pattern backup-host-config/wait-for-task use.
-    $task = New-XenTask -Label 'vm_import' -Description "importing $($vm.name_label) back" -PassThru
     try {
-        Invoke-WebRequest -Uri "$Url/import?session_id=$($session.opaque_ref)&task_id=$($task.opaque_ref)" `
-            -Method Put -InFile $path -UseBasicParsing | Out-Null
-        while ((Get-XenTask -Ref $task.opaque_ref).status -eq 'pending') { Start-Sleep -Milliseconds 500 }
-        $finished = Get-XenTask -Ref $task.opaque_ref
-        if ($finished.status -ne 'success') { throw "import failed: $($finished.error_info -join ' ')" }
-        $imported = $finished.result.Replace('<value>', '').Replace('</value>', '').Trim()
+        # Stream both directions: -OutFile/-InFile stream to and from the file rather than buffering the
+        # whole transfer in memory, as a real VM's export can be gigabytes.
+        Invoke-WebRequest -Uri "$Url/export?session_id=$($session.opaque_ref)&uuid=$($vm.uuid)" `
+            -OutFile $path -UseBasicParsing
+        Write-Host ("  wrote {0:N1} MiB to {1}" -f ((Get-Item $path).Length / 1MB), (Split-Path $path -Leaf))
+
+        # An XVA is a tar: ova.xml describes the VM, and the disk blocks follow in 1 MiB pieces, each with
+        # its own checksum.
+        $names = Get-TarEntryName -Path $path
+        Write-Host ("  archive holds {0} and {1} disk block(s)" -f
+            $names[0], (@($names | Where-Object { -not $_.EndsWith('.checksum') }).Count - 1))
+
+        # The imported VM's ref is NOT in the /import response body on a real host - the only place it
+        # appears is the task named in the task_id query parameter, so create one, pass it, and read the
+        # task's result once the upload finishes, the same pattern backup-host-config/wait-for-task use.
+        $task = New-XenTask -Label 'vm_import' -Description "importing $VmName back" -PassThru
+        try {
+            Invoke-WebRequest -Uri "$Url/import?session_id=$($session.opaque_ref)&task_id=$($task.opaque_ref)" `
+                -Method Put -InFile $path -UseBasicParsing | Out-Null
+            while ((Get-XenTask -Ref $task.opaque_ref).status -eq 'pending') { Start-Sleep -Milliseconds 500 }
+            $finished = Get-XenTask -Ref $task.opaque_ref
+            if ($finished.status -ne 'success') { throw "import failed: $($finished.error_info -join ' ')" }
+            # The result lists the imported VMs (<value><array><data>OpaqueRef:...</data></array></value>
+            # on a real host), so take the first reference in it.
+            $imported = [regex]::Match($finished.result, 'OpaqueRef:[^<]+').Value
+        }
+        finally {
+            Remove-XenTask -Ref $task.opaque_ref
+        }
+        Write-Host "  imported as $((Get-XenVM -Ref $imported).name_label)"
+
+        # The import brought its own disks along; destroy those too, not just the VM record.
+        Remove-VmAndDisks -Ref $imported
+        Write-Host "OK: export-import-vm"
     }
     finally {
-        Remove-XenTask -Ref $task.opaque_ref
+        # Always clean up the file, on failure too: a real export is gigabytes, not worth leaving behind.
+        Remove-Item $path -ErrorAction SilentlyContinue
     }
-    Write-Host "  imported as $((Get-XenVM -Ref $imported).name_label)"
-
-    # The import brought its own disks along; destroy those too, not just the VM record.
-    Remove-VmAndDisks -Ref $imported
-    Remove-Item $path
-    Write-Host "OK: export-import-vm"
     $session | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-ExportImportVm -Url https://xenserver -UserName root -Password $password
+#   Invoke-ExportImportVm -Url https://xenserver -UserName root -Password $password -VmName db-01
 
 function Get-TarEntryName {
     # A tar's entry names, read from the format itself: the name is the first 100 bytes of each 512-byte
@@ -3261,6 +3477,12 @@ function Invoke-BackupHostConfig {
     # restores the WRONG host, not the one named by ref=. ref= is kept in the query string purely for
     # log-readability (a real host ignores it; it is not what makes this correct). Still pure
     # PowerShell: Connect-Example has already trusted the server's certificate.
+    #
+    # -OutFile/-InFile below already stream straight to/from disk rather than buffering the whole file,
+    # and there is no idle-connection step to take after the transfer (unlike the Python/Java ports):
+    # this module's cmdlets dispatch through the C# binding's Session/JsonRpcClient, whose
+    # PerformPostRequest opens a brand-new HttpClient per XenAPI call and disposes it immediately
+    # afterwards - there is no kept-alive session connection that a long transfer could leave idle.
     $path = Join-Path ([IO.Path]::GetTempPath()) "sdk-example-host-$([guid]::NewGuid().Guid).backup"
     Invoke-WebRequest -UseBasicParsing -OutFile $path -TimeoutSec 10 `
         -Uri "$hostUrl/host_backup?session_id=$($session.opaque_ref)&ref=$($vmHost.opaque_ref)"
@@ -3454,16 +3676,20 @@ function Invoke-ServerStatusReport {
     # host's verbs, and this is not one of them.
     $catalogue = [xml](Get-XenHostProperty -XenHost $xenHost -XenProperty SystemStatusCapabilities)
     $keys = @()
+    $defaults = @()
     foreach ($capability in $catalogue.'system-status-capabilities'.capability) {
         $keys += $capability.key
+        if ($capability.'default-checked' -eq 'yes') { $defaults += $capability.key }
         Write-Host ("  {0,-22} max {1,9} bytes  default={2,-3} pii={3}" -f
             $capability.key, $capability.'max-size', $capability.'default-checked', $capability.pii)
     }
 
     # The download is an HTTP transfer alongside the API, so the session id travels in the query string.
     # Still pure PowerShell: Connect-Example has already trusted the server's certificate.
-    $whole = Get-StatusReportSize -Url $Url -Session $session -Entries $keys
-    Write-Host ("everything ({0} sections): {1} bytes" -f $keys.Count, $whole)
+    # Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+    # section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+    $whole = Get-StatusReportSize -Url $Url -Session $session -Entries $defaults
+    Write-Host ("default sections ({0} of {1}): {2} bytes" -f $defaults.Count, $keys.Count, $whole)
 
     # Pick a real, small section from the host's own catalogue rather than assuming a name: the
     # catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client list,
@@ -3481,12 +3707,19 @@ function Invoke-ServerStatusReport {
 }
 
 function Get-StatusReportSize {
-    # Downloads the bundle for the given capability keys (a tar archive) and reports its size.
+    # Downloads the bundle for the given capability keys (a tar archive) to a temp file, streaming it - a
+    # report can be large - and returns its size. This example then deletes it; you'd keep it.
     param([string]$Url, $Session, [string[]]$Entries)
-    $response = Invoke-WebRequest -UseBasicParsing `
-        -Uri ("$Url/system-status?session_id=$($Session.opaque_ref)&output=tar" +
-              "&entries=$($Entries -join ',')")
-    $response.Content.Length
+    $path = Join-Path ([IO.Path]::GetTempPath()) "sdk-example-status-$([guid]::NewGuid().Guid).tar"
+    try {
+        Invoke-WebRequest -UseBasicParsing -OutFile $path `
+            -Uri ("$Url/system-status?session_id=$($Session.opaque_ref)&output=tar" +
+                  "&entries=$($Entries -join ',')")
+        (Get-Item $path).Length
+    }
+    finally {
+        Remove-Item $path -ErrorAction SilentlyContinue
+    }
 }
 # Run it:
 #   Invoke-ServerStatusReport -Url https://xenserver -UserName root -Password $password
@@ -3665,13 +3898,13 @@ function Invoke-RestartHost {
     Write-Host "  evacuated:  guests=$(Measure-HostGuest $xenHost)"
 
     $xenHost | Invoke-XenHost -XenAction Reboot
-    # A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long as
-    # XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the reboot to
-    # get underway, then explicitly re-enables - nothing else does that for us, not even the reboot
-    # itself: disabling does not clear itself, not even across a reboot (host_auto_enable /
-    # host_disabled_until_reboot are cleared only by an explicit Enable call).
-    Start-Sleep -Seconds 5
-    $xenHost | Invoke-XenHost -XenAction Enable
+    # A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+    # host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+    # itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+    # never does - so enable it explicitly rather than depend on either.
+    Wait-HostLive -XenHost $xenHost -Want $false -TimeoutSeconds 600
+    Wait-HostLive -XenHost $xenHost -Want $true -TimeoutSeconds 1200 -IntervalSeconds 10
+    Enable-WhenBooted -XenHost $xenHost
     Write-Host "  rebooted, re-enabled: enabled=$((Get-XenHost -Ref $xenHost.opaque_ref).enabled)"
 
     # The other ending: off, and back on out of band - but only demonstrated if that is actually
@@ -3684,9 +3917,9 @@ function Invoke-RestartHost {
         Wait-HostLive -XenHost $xenHost -Want $false
         Write-Host "  shut down:  live=$(Get-HostLive $xenHost)"
         $xenHost | Invoke-XenHost -XenAction PowerOn
-        Wait-HostLive -XenHost $xenHost -Want $true
+        Wait-HostLive -XenHost $xenHost -Want $true -TimeoutSeconds 1200 -IntervalSeconds 10
         Write-Host "  powered on: live=$(Get-HostLive $xenHost)"
-        $xenHost | Invoke-XenHost -XenAction Enable
+        Enable-WhenBooted -XenHost $xenHost
         Write-Host "  re-enabled: enabled=$((Get-XenHost -Ref $xenHost.opaque_ref).enabled)"
     }
     else {
@@ -4036,13 +4269,17 @@ function Invoke-ManageDriverVariants {
 
     # Select a variant explicitly. It becomes the selected one immediately; whether it is also active
     # depends on whether the hardware is present and the driver already loaded. Host_driver.select
-    # refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE), and variant order isn't
-    # guaranteed to put the usable one first - pick the first one that reports present, falling back to
-    # variants[0] only if none do.
-    $target = $drivers | Sort-Object name | Select-Object -First 1
-    $variant = $target.variants |
-        Where-Object { (Get-XenDriverVariant -Ref $_.opaque_ref).hardware_present } | Select-Object -First 1
-    if (-not $variant) { $variant = $target.variants[0] }
+    # refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE) - and a host lists
+    # drivers for plenty of devices it doesn't have - so pick a driver for hardware this host actually
+    # has, and one of its variants that is usable.
+    $usable = @($drivers | Sort-Object name | ForEach-Object {
+        $driver = $_
+        $driver.variants | Where-Object { (Get-XenDriverVariant -Ref $_.opaque_ref).hardware_present } |
+            ForEach-Object { [pscustomobject]@{ Driver = $driver; Variant = $_ } }
+    })
+    if (-not $usable) { throw "no driver on $($xenHost.name_label) has a variant for hardware it has" }
+    $target = $usable[0].Driver
+    $variant = $usable[0].Variant
     Invoke-XenHostDriver -Ref $target.opaque_ref -XenAction Select -Variant $variant
     $after = Get-XenHostDriver -Ref $target.opaque_ref
     Write-Host "  $($after.name): selected $(Get-DriverVariantName $after.selected_variant), active $(Get-DriverVariantName $after.active_variant)"
@@ -4068,14 +4305,18 @@ function Get-DriverVariantName {
 # named parameter - the equivalent of Python's _wf(fn, **defaults) wrapper. The command line accepts
 # key=value arguments after the password (captured in $WorkflowArgs above), overriding that workflow's
 # default for the named parameter. In your own scripts you would call these functions directly (see the
-# "Run it:" line under each) rather than through this dispatcher. cross-pool-copy-vm keeps its existing
-# fixed 4-arg form (the destination pool URL), unchanged.
+# "Run it:" line under each) rather than through this dispatcher. cross-pool-copy-vm keeps its own
+# positional form: the destination pool URL, then optionally that pool's credentials (if they differ from
+# the source's) and the VM to copy.
 if ($Workflow -eq "cross-pool-copy-vm") {
-    if (-not $WorkflowArgs -or $WorkflowArgs.Count -lt 1) {
-        Write-Error "usage: workflows.ps1 cross-pool-copy-vm <url> <user> <password> <destUrl>"
+    if (-not $WorkflowArgs -or $WorkflowArgs.Count -notin 1, 3, 4) {
+        Write-Error "usage: workflows.ps1 cross-pool-copy-vm <url> <user> <password> <destUrl> [<destUser> <destPassword> [<vmName>]]"
         exit 2
     }
-    Invoke-CrossPoolCopyVm -Url $Url -UserName $UserName -Password $Password -DestUrl $WorkflowArgs[0]
+    $copyArgs = @{ Url = $Url; UserName = $UserName; Password = $Password; DestUrl = $WorkflowArgs[0] }
+    if ($WorkflowArgs.Count -ge 3) { $copyArgs.DestUserName = $WorkflowArgs[1]; $copyArgs.DestPassword = $WorkflowArgs[2] }
+    if ($WorkflowArgs.Count -eq 4) { $copyArgs.VmName = $WorkflowArgs[3] }
+    Invoke-CrossPoolCopyVm @copyArgs
     exit 0
 }
 
@@ -4083,7 +4324,7 @@ $WORKFLOWS = @{
     "connect-inventory"              = @{ Function = "Invoke-ConnectInventory";             Defaults = @{} }
     "create-vm"                      = @{ Function = "Invoke-CreateVm";                     Defaults = @{ TemplateName = "Rocky Linux 8" } }
     "vm-lifecycle"                   = @{ Function = "Invoke-VmLifecycle";                  Defaults = @{ SourceVm = "web-01" } }
-    "manage-vm-disks"                = @{ Function = "Invoke-ManageVmDisks";                Defaults = @{ TemplateName = "Rocky Linux 8"; SrName = "Shared NFS" } }
+    "manage-vm-disks"                = @{ Function = "Invoke-ManageVmDisks";                Defaults = @{ SourceVm = "web-01"; SrName = "Shared NFS" } }
     "dismiss-alerts"                 = @{ Function = "Invoke-DismissAlerts";                Defaults = @{} }
     "host-power-on"                  = @{ Function = "Invoke-HostPowerOn";                  Defaults = @{} }
     "rotate-pool-secret"             = @{ Function = "Invoke-RotatePoolSecret";             Defaults = @{} }
@@ -4103,11 +4344,11 @@ $WORKFLOWS = @{
     "copy-vm"                        = @{ Function = "Invoke-CopyVm";                       Defaults = @{ VmName = "db-01"; SrName = "Shared NFS" } }
     "create-vm-with-vgpu"            = @{ Function = "Invoke-CreateVmWithVgpu";             Defaults = @{ TemplateName = "Rocky Linux 8" } }
     "tags-and-folders"               = @{ Function = "Invoke-TagsAndFolders";               Defaults = @{ VmName = "web-01" } }
-    "configure-updates"              = @{ Function = "Invoke-ConfigureUpdates";             Defaults = @{} }
+    "configure-updates"              = @{ Function = "Invoke-ConfigureUpdates";             Defaults = @{ RepoUrl = "https://repo.ops.xenserver.com/xs9"; SourceUrl = "https://repo-src.ops.xenserver.com/xs9" } }
     "clone-vm"                       = @{ Function = "Invoke-CloneVm";                      Defaults = @{ VmName = "db-01" } }
     "delete-vm"                      = @{ Function = "Invoke-DeleteVm";                     Defaults = @{ TemplateName = "Rocky Linux 8" } }
     "storage-migrate"                = @{ Function = "Invoke-StorageMigrate";               Defaults = @{ SourceVm = "web-01" } }
-    "apply-update"                   = @{ Function = "Invoke-ApplyUpdate";                  Defaults = @{} }
+    "apply-update"                   = @{ Function = "Invoke-ApplyUpdate";                  Defaults = @{ RepoUrl = "https://repo.ops.xenserver.com/xs9"; SourceUrl = "https://repo-src.ops.xenserver.com/xs9" } }
     "checkpoint-vm"                  = @{ Function = "Invoke-CheckpointVm";                 Defaults = @{ SourceVm = "web-01" } }
     "attach-disk"                    = @{ Function = "Invoke-AttachDisk";                   Defaults = @{ TemplateName = "Rocky Linux 8"; SrName = "Shared NFS" } }
     "wait-for-task"                  = @{ Function = "Invoke-WaitForTask";                  Defaults = @{ TemplateName = "Rocky Linux 8" } }
@@ -4128,9 +4369,9 @@ $WORKFLOWS = @{
     "pool-tags"                      = @{ Function = "Invoke-PoolTags";                     Defaults = @{} }
     "convert-to-template"            = @{ Function = "Invoke-ConvertToTemplate";            Defaults = @{ TemplateName = "Rocky Linux 8" } }
     "find-by-uuid"                   = @{ Function = "Invoke-FindByUuid";                   Defaults = @{ VmName = "web-01" } }
-    "rolling-pool-update"            = @{ Function = "Invoke-RollingPoolUpdate";            Defaults = @{} }
+    "rolling-pool-update"            = @{ Function = "Invoke-RollingPoolUpdate";            Defaults = @{ RepoUrl = "https://repo.ops.xenserver.com/xs9"; SourceUrl = "https://repo-src.ops.xenserver.com/xs9" } }
     "pvs-accelerator"                = @{ Function = "Invoke-PvsAccelerator";               Defaults = @{} }
-    "configure-pvs-accelerator"      = @{ Function = "Invoke-ConfigurePvsAccelerator";      Defaults = @{} }
+    "configure-pvs-accelerator"      = @{ Function = "Invoke-ConfigurePvsAccelerator";      Defaults = @{ VmName = "db-01" } }
     "manage-ssh-access"              = @{ Function = "Invoke-ManageSshAccess";              Defaults = @{} }
     "manage-vtpm"                    = @{ Function = "Invoke-ManageVtpm";                   Defaults = @{} }
     "configure-dynamic-memory"       = @{ Function = "Invoke-ConfigureDynamicMemory";       Defaults = @{} }
@@ -4150,17 +4391,17 @@ $WORKFLOWS = @{
     "manage-driver-variants"         = @{ Function = "Invoke-ManageDriverVariants";         Defaults = @{} }
     "vm-from-snapshot"               = @{ Function = "Invoke-VmFromSnapshot";               Defaults = @{ VmName = "db-01" } }
     "attach-existing-disk"           = @{ Function = "Invoke-AttachExistingDisk";           Defaults = @{} }
-    "export-import-vm"               = @{ Function = "Invoke-ExportImportVm";               Defaults = @{} }
+    "export-import-vm"               = @{ Function = "Invoke-ExportImportVm";               Defaults = @{ VmName = "db-01" } }
     "changed-block-tracking"         = @{ Function = "Invoke-ChangedBlockTracking";         Defaults = @{} }
     "control-domain-memory"          = @{ Function = "Invoke-ControlDomainMemory";          Defaults = @{} }
     "rrd-metrics"                    = @{ Function = "Invoke-RrdMetrics";                   Defaults = @{} }
     "reclaim-space"                  = @{ Function = "Invoke-ReclaimSpace";                 Defaults = @{} }
     "vm-ip-address"                  = @{ Function = "Invoke-VmIpAddress";                  Defaults = @{} }
-    "manage-ad-users"                = @{ Function = "Invoke-ManageAdUsers";                Defaults = @{ Domain = ""; AdminUser = "alice"; AdminPassword = "Password1"; NewUser = "alice" } }
+    "manage-ad-users"                = @{ Function = "Invoke-ManageAdUsers";                Defaults = @{ Domain = ""; AdminUser = "alice"; AdminPassword = "Password1"; NewUser = "alice"; Ldaps = "false" } }
     "create-iscsi-sr"                = @{ Function = "Invoke-CreateIscsiSr";                Defaults = @{ Target = "192.0.2.30" } }
     "create-smb-sr"                  = @{ Function = "Invoke-CreateSmbSr";                  Defaults = @{ Server = "192.0.2.40"; Share = "/vmstore"; SmbUsername = "Administrator"; SmbPassword = "Password1" } }
     "create-hba-sr"                  = @{ Function = "Invoke-CreateHbaSr";                  Defaults = @{} }
-    "create-iso-sr"                  = @{ Function = "Invoke-CreateIsoSr";                  Defaults = @{} }
+    "create-iso-sr"                  = @{ Function = "Invoke-CreateIsoSr";                  Defaults = @{ Location = "192.0.2.10:/isos" } }
     "configure-nrpe"                 = @{ Function = "Invoke-ConfigureNrpe";                Defaults = @{} }
     "configure-snmp"                 = @{ Function = "Invoke-ConfigureSnmp";                Defaults = @{ TrapDestination = "192.0.2.50" } }
     "configure-clustering"           = @{ Function = "Invoke-ConfigureClustering";          Defaults = @{} }
@@ -4168,7 +4409,7 @@ $WORKFLOWS = @{
     "create-bond"                    = @{ Function = "Invoke-CreateBond";                   Defaults = @{} }
     "manage-vapp"                    = @{ Function = "Invoke-ManageVapp";                   Defaults = @{ VmName = "web-01" } }
     "attach-usb-device"              = @{ Function = "Invoke-AttachUsbDevice";              Defaults = @{ VmName = "web-01" } }
-    "wlb-recommendations"            = @{ Function = "Invoke-WlbRecommendations";           Defaults = @{ VmName = "web-01"; WlbHostPort = "wlb.example:8012"; WlbUsername = "wlbuser"; WlbPassword = "wlbpass" } }
+    "wlb-recommendations"            = @{ Function = "Invoke-WlbRecommendations";           Defaults = @{ VmName = "web-01"; WlbHostPort = "wlb.example:8012"; WlbUsername = "wlbuser"; WlbPassword = "wlbpass"; WlbCertificate = "" } }
 }
 
 if (-not $WORKFLOWS.ContainsKey($Workflow)) {

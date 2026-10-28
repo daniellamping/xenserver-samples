@@ -16,8 +16,8 @@
 # iSCSI target address, an AD domain, a second pool to recover into - and take them as extra key=value
 # arguments after the password, overriding that workflow's default for the named parameter (e.g.
 # `create-iscsi-sr <url> <user> <pw> target=10.1.2.3`, `disaster-recovery <url> <user> <pw>
-# dr_url=https://standby-pool`). cross-pool-copy-vm keeps its own fixed 4-argument form instead
-# (<src> <user> <pw> <destUrl>): it has no other parameters.
+# dr_url=https://standby-pool`). cross-pool-copy-vm keeps its own positional form instead
+# (<src> <user> <pw> <destUrl> [<destUser> <destPassword> [<vmName>]]).
 set -e
 
 # Under Git Bash/MSYS, an argument that looks like a Unix path (e.g. serverpath=/export/vol1) gets
@@ -25,8 +25,10 @@ set -e
 # never local files, so disable that conversion for the whole script.
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'
 
-workflow="$1"; url="$2"; user="$3"; pass="$4"; desturl="$5"   # desturl: only cross-pool-copy-vm uses it
-if [ "$workflow" = "cross-pool-copy-vm" ]; then shift 5; else shift 4; fi
+workflow="$1"; url="$2"; user="$3"; pass="$4"
+if [ "$workflow" = "cross-pool-copy-vm" ]; then   # only cross-pool-copy-vm takes these
+    desturl="$5"; destuser="${6:-$user}"; destpass="${7:-$pass}"; copy_vm="${8:-db-01}"; shift $#
+else shift 4; fi
 
 # Every remaining argument is a key=value override of that workflow's own defaults (chosen to work
 # against the simulator), the same story the other languages' dispatchers tell. `param` reads one back,
@@ -80,6 +82,10 @@ first_csv()  { echo "${1%%,*}"; }                       # first element of a com
 count_csv()  { local IFS=,; set -- $1; echo $#; }       # number of elements (0 for empty)
 each_csv()   { local IFS=,; set -- $1; printf '%s\n' "$@"; }   # one element per line, for `for`
 nth_csv()    { local n=$2 IFS=,; set -- $1; shift $((n - 1)); echo "$1"; }  # Nth element, 1-based
+# A set-valued FIELD (vm-param-get param-name=VBDs, allowed-VBD-devices, ...) is printed "a; b; c" - with
+# or without --minimal, which only turns a LIST of objects into a comma-separated line. Convert it, so the
+# helpers above work on both.
+set_to_csv() { echo "${1//; /,}"; }
 
 shared_sr() { first_csv "$(xe sr-list name-label="Shared NFS" --minimal)"; }
 first_host() { first_csv "$(xe host-list --minimal)"; }
@@ -166,14 +172,21 @@ self_signed_cert() {
 }
 
 # Wait out a pool-wide xapi restart (pool-designate-new-master) and find the new coordinator's address,
-# updating $host - xe does not follow HOST_IS_SLAVE itself (see the probe at the top of this script), and
-# the old coordinator's own xapi is briefly down while it restarts, so this is the same bounded wait/retry
-# XenRT's own helper for this call does, rather than retrying immediately.
+# updating $host - xe does not follow HOST_IS_SLAVE itself (see the probe at the top of this script).
+#
+# pool-designate-new-master returns BEFORE the change: for a while the old coordinator still answers, and
+# still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not enough -
+# keep reconnecting until the pool names the new coordinator (by uuid) AND every host is back, enabled and
+# live. XenRT's own helper likewise waits minutes before trusting the pool again.
 reconnect_after_master_change() {
-    local timeout=600 interval=5 probe
+    local new_master_uuid=$1 timeout=600 interval=5 probe
     local deadline=$((SECONDS + timeout))
     while [ $SECONDS -lt $deadline ]; do
-        if probe=$(xe pool-list --minimal 2>&1); then return 0; fi
+        # Called as an if-condition, so set -e does not end the script when one of its xe calls fails -
+        # and while xapi restarts across the pool, any of them can.
+        if probe=$(xe pool-list --minimal 2>&1) && pool_settled_under "$new_master_uuid" "$probe"; then
+            return 0
+        fi
         if [[ $probe =~ (Master|Coordinator)\ IP\ address:\ ([0-9A-Fa-f.:]+) ]]; then
             host=${BASH_REMATCH[2]}
         fi
@@ -183,17 +196,72 @@ reconnect_after_master_change() {
     return 1
 }
 
+# True once the pool (uuid $2) names $1 as its coordinator AND every host is back, enabled and live. The
+# new coordinator answers before the pool has settled - calls made too soon fail (HANDLE_INVALID on the
+# operation's own task) - hence the second half.
+pool_settled_under() {
+    local master h
+    master=$(xe pool-param-get uuid="$(first_csv "$2")" param-name=master) || return 1
+    [ "$master" = "$1" ] || return 1
+    for h in $(each_csv "$(xe host-list --minimal)"); do
+        [ "$(xe host-param-get uuid=$h param-name=enabled)" = "true" ] || return 1
+        [ "$(host_live "$h")" = "true" ] || return 1
+    done
+}
+
 # Poll host_metrics.live until it matches, rather than issuing the next power command immediately - real
 # out-of-band power control has no retry of its own, so a script that doesn't wait can issue a second
 # command while the first is still in flight.
 wait_for_host_live() {
-    local h=$1 want=$2 timeout=60 interval=2
+    local h=$1 want=$2 timeout=${3:-60} interval=${4:-2}
     local deadline=$((SECONDS + timeout))
     while [ "$(host_live "$h")" != "$want" ]; do
         if [ $SECONDS -gt $deadline ]; then
             echo "host did not reach live=$want in time" >&2
             return 1
         fi
+        sleep "$interval"
+    done
+}
+
+# Wait for a host to come back from a reboot (key "boot_time") or toolstack restart
+# ("agent_start_time"): until that other-config entry differs from $before and the host is live. Follows
+# HOST_IS_SLAVE-style coordinator redirection (updating the global $host, the same way the top-of-script
+# probe and reconnect_after_master_change do) in case the host restarting is the coordinator xe is
+# currently talking to.
+wait_for_restart() {
+    local host_uuid=$1 key=$2 before=$3 timeout=${4:-1800} interval=${5:-10} probe
+    local deadline=$((SECONDS + timeout))
+    while true; do
+        if probe=$(xe host-param-get uuid=$host_uuid param-name=other-config param-key=$key 2>&1); then
+            if [ "$probe" != "$before" ] && [ "$(host_live "$host_uuid")" = "true" ]; then
+                return 0
+            fi
+        elif [[ $probe =~ (Master|Coordinator)\ IP\ address:\ ([0-9A-Fa-f.:]+) ]]; then
+            host=${BASH_REMATCH[2]}
+        fi
+        if [ $SECONDS -gt $deadline ]; then
+            echo "host $host_uuid did not come back in time" >&2
+            return 1
+        fi
+        sleep "$interval"
+    done
+}
+
+# Re-enable a host that has just come back. It reports itself live before xapi on it has finished
+# starting, and until then host-enable fails HOST_STILL_BOOTING - so retry that.
+enable_when_booted() {
+    local h=$1 timeout=600 interval=10 err
+    local deadline=$((SECONDS + timeout))
+    while true; do
+        if err=$(xe host-enable uuid=$h 2>&1); then return 0; fi
+        # xe prints the error's message, not its code: HOST_STILL_BOOTING reads "The host toolstack is
+        # still initialising".
+        case "$err" in
+            *STILL_BOOTING*|*"still initialising"*) ;;
+            *) echo "$err" >&2; return 1 ;;
+        esac
+        if [ $SECONDS -gt $deadline ]; then echo "$err" >&2; return 1; fi
         sleep "$interval"
     done
 }
@@ -240,7 +308,7 @@ wait_for_guest_agent() {
 # storage-migrate already demonstrates.
 move_disks_to_sr() {
     local vm=$1 sr_ref=$2 vbd vdi
-    for vbd in $(each_csv "$(xe vm-param-get uuid=$vm param-name=VBDs --minimal)"); do
+    for vbd in $(each_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=VBDs)")"); do
         [ "$(xe vbd-param-get uuid=$vbd param-name=type)" = "Disk" ] || continue
         vdi=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid)
         if [ "$(xe vdi-param-get uuid=$vdi param-name=sr-uuid)" != "$sr_ref" ]; then
@@ -320,16 +388,20 @@ w_vm_lifecycle() {
 # disk this example adds to its own throwaway VM instead, matching XenCenter's own "deactivate" action,
 # which only ever targets additional disks, and tidy up afterwards so the example is repeatable. No
 # shrink: real SR backends refuse one outright (SR_BACKEND_FAILURE_79), so this only ever grows.
+#
+# Plugging and unplugging a disk on a running VM needs the guest's PV drivers (VM_MISSING_PV_DRIVERS
+# otherwise), so the VM is a throwaway copy of source_vm, a VM with a guest OS and PV drivers.
 w_manage_vm_disks() {
-    local template sr_name sr device
-    template=$(param template_name "Rocky Linux 8")
+    local source_vm sr_name sr device sr_type sm
+    source_vm=$(param source_vm "web-01")
     sr_name=$(param sr_name "Shared NFS")
     sr=$(first_csv "$(xe sr-list name-label="$sr_name" --minimal)")
-    vm=$(xe vm-install template="$template" new-name-label=xe-example-vm-disks sr-uuid=$(shared_sr))
+    vm=$(copy_of_guest "$source_vm" "xe-example-vm-disks")
     xe vm-start uuid=$vm
+    wait_for_guest_agent "$vm"
 
     vdi=$(xe vdi-create sr-uuid=$sr name-label=xe-example-data-disk virtual-size=4GiB type=user)
-    device=$(first_csv "$(xe vm-param-get uuid=$vm param-name=allowed-VBD-devices --minimal)")
+    device=$(first_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=allowed-VBD-devices)")")
     vbd=$(xe vbd-create vm-uuid=$vm vdi-uuid=$vdi device=$device type=Disk mode=RW)
     xe vbd-plug uuid=$vbd
     echo "Disk attached:  $(xe vbd-param-get uuid=$vbd param-name=currently-attached)"
@@ -345,16 +417,26 @@ w_manage_vm_disks() {
     xe vbd-plug uuid=$vbd
     echo "After plug:     $(xe vbd-param-get uuid=$vbd param-name=currently-attached)"
 
-    # Growing a disk that is attached and live is a DIFFERENT call, not a flag on the same one:
-    # online=true tells the storage layer the guest is using the disk while it grows.
-    grown=$(( $(xe vdi-param-get uuid=$vdi param-name=virtual-size) + 1073741824 ))
-    xe vdi-resize uuid=$vdi disk-size=$grown online=true
-    echo "Grown online:   $(xe vdi-param-get uuid=$vdi param-name=virtual-size) bytes"
+    # Growing a disk that is attached and live is a DIFFERENT call, not a flag on the same one: online=true
+    # tells the storage layer the guest is using the disk while it grows. Only some storage drivers can
+    # (none of a stock XenServer 9's do), and the rest refuse with SR_OPERATION_NOT_SUPPORTED - so ask the
+    # SR's driver (its SM record's features) first.
+    sr_type=$(xe sr-param-get uuid=$sr param-name=type)
+    sm=$(first_csv "$(xe sm-list type=$sr_type --minimal)")
+    if [ -n "$sm" ] && xe sm-param-get uuid=$sm param-name=features param-key=VDI_RESIZE_ONLINE >/dev/null 2>&1; then
+        grown=$(( $(xe vdi-param-get uuid=$vdi param-name=virtual-size) + 1073741824 ))
+        xe vdi-resize uuid=$vdi disk-size=$grown online=true
+        echo "Grown online:   $(xe vdi-param-get uuid=$vdi param-name=virtual-size) bytes"
+    else
+        echo "Grown online:   not supported by $sr_type storage; unplug, resize, plug as above"
+    fi
 
-    # Tidy up so the example is repeatable: vm-uninstall destroys the VM and the disks it owns, including
-    # the data disk just created.
+    # Tidy up so the example is repeatable. vm-uninstall destroys the VM and only the disks it OWNS (VBD
+    # other-config:owner, which vm-install sets) - not one attached later with a plain vbd-create, so
+    # destroy the data disk too.
     xe vm-shutdown uuid=$vm force=true
     xe vm-uninstall uuid=$vm force=true
+    xe vdi-destroy uuid=$vdi
     echo "OK: manage-vm-disks"
 }
 
@@ -408,13 +490,20 @@ w_change_root_password() {
     # though you are already authenticated - but a root session's old_pwd is never actually checked
     # (CA-13567): the only real gate is that the SESSION itself has to be a local superuser's, which this
     # one necessarily is. There is no "wrong old password is rejected" demonstration worth making here.
-    xe user-password-change old="$pass" new=xe-example-temp-password
+    original=$pass temporary=xe-example-temp-password
+    xe user-password-change old="$original" new=$temporary
     echo "Password changed."
+    # Unlike an SDK session, xe has no session to keep: every command logs in afresh, so from here on
+    # it needs the NEW password - including the command that changes it back. And restore it however the
+    # script ends (set -e exits on the first failure), or root would be left on the temporary password.
+    pass=$temporary
+    trap 'pass=$temporary; xe user-password-change old=$temporary new="$original" >/dev/null 2>&1' EXIT
 
-    # The existing session stays valid; only new connections need the new password.
-    echo "Session still usable: $(count_csv "$(xe pool-list --minimal)")"
+    echo "New logins work with the new password: $(count_csv "$(xe pool-list --minimal)") pool"
 
-    xe user-password-change old=xe-example-temp-password new="$pass"
+    xe user-password-change old=$temporary new="$original"
+    pass=$original
+    trap - EXIT
     echo "Password restored."
     echo "OK: change-root-password"
 }
@@ -473,7 +562,7 @@ w_snapshot_schedule() {
     echo "Created schedule: $vmss"
 
     xe vm-param-set uuid=$vm snapshot-schedule=$vmss
-    echo "Members:          $(count_csv "$(xe vmss-param-get uuid=$vmss param-name=VMs)")"
+    echo "Members:          $(count_csv "$(set_to_csv "$(xe vmss-param-get uuid=$vmss param-name=VMs)")")"
 
     # xe has no command to run a schedule on demand (the API's VMSS.snapshot_now has no CLI form), so it
     # takes its first snapshot when it next falls due, and from then on keeps the newest retained-snapshots.
@@ -494,7 +583,7 @@ w_manage_vm_groups() {
 
     # Membership is written from the VM side, and read back from the group side.
     xe vm-param-set uuid=$vm groups=$group
-    echo "Group members:  $(count_csv "$(xe vm-group-param-get uuid=$group param-name=vm-uuids)")"
+    echo "Group members:  $(count_csv "$(set_to_csv "$(xe vm-group-param-get uuid=$group param-name=vm-uuids)")")"
 
     # vm-group-destroy already clears the group from every member VM on its own - no need to remove
     # membership ourselves first.
@@ -583,9 +672,11 @@ w_new_vm_wizard() {
     echo "power-state: $(xe vm-param-get uuid=$vm param-name=power-state)"
     echo "vCPUs:       $(xe vm-param-get uuid=$vm param-name=VCPUs-max)"
     # Tidy up so the example is repeatable: stop the VM, then vm-uninstall destroys it and the disks it
-    # owns (vm-destroy would leave the disks behind).
+    # owns (vm-destroy would leave the disks behind). It owns only the template's disks - vm-install marks
+    # those (VBD other-config:owner) - not one added with a plain vbd-create, so destroy that one too.
     xe vm-shutdown uuid=$vm force=true
     xe vm-uninstall uuid=$vm force=true
+    xe vdi-destroy uuid=$vdi
     echo "OK: new-vm-wizard"
 }
 
@@ -698,14 +789,21 @@ w_copy_vm() {
 
 # --- 14. Create a VM with a vGPU ---
 w_create_vm_with_vgpu() {
-    group=$(first_csv "$(xe gpu-group-list --minimal)")
-    type=""
-    vtypes=$(xe gpu-group-param-get uuid=$group param-name=supported-VGPU-types --minimal)
-    for t in ${vtypes//,/ }; do
-        if [ "$(xe vgpu-type-param-get uuid=$t param-name=model-name)" != "passthrough" ]; then type=$t; break; fi
+    # A GPU group that offers a real (non-passthrough) vGPU type, and that type. Not simply the first
+    # group: a host's onboard display adapter is a GPU group too, with no vGPU types at all.
+    group="" type=""
+    for g in $(each_csv "$(xe gpu-group-list --minimal)"); do
+        vtypes=$(set_to_csv "$(xe gpu-group-param-get uuid=$g param-name=supported-VGPU-types)")
+        for t in ${vtypes//,/ }; do
+            if [ "$(xe vgpu-type-param-get uuid=$t param-name=model-name)" != "passthrough" ]; then
+                group=$g; type=$t; break 2
+            fi
+        done
     done
+    [ -n "$type" ] || { echo "no GPU group offers a vGPU type (is the GPU vendor's host driver installed?)" >&2; return 1; }
     local template=$(param template_name "Rocky Linux 8")
-    vm=$(xe vm-install template="$template" new-name-label=xe-example-vgpu sr-uuid=$(shared_sr))
+    # No sr-uuid: the template's disks go to the pool's default SR, as VM.provision does.
+    vm=$(xe vm-install template="$template" new-name-label=xe-example-vgpu)
     vgpu=$(xe vgpu-create vm-uuid=$vm gpu-group-uuid=$group vgpu-type-uuid=$type)
     echo "Created vGPU: $vgpu of type $(xe vgpu-type-param-get uuid=$type param-name=model-name)"
     # Tidy up so the example is repeatable: the vGPU, then the VM and the disks it owns.
@@ -729,20 +827,47 @@ w_tags_and_folders() {
     echo "OK: tags-and-folders"
 }
 
+# Introduce the pool's update repositories the way XenCenter does: the release's base packages
+# (update=false) and its update stream (update=true, which pool-sync-updates needs - otherwise
+# NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so these
+# are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}. Echoes both repository
+# uuids, one per line.
+introduce_update_repositories() {
+    local repo_url=$1 source_url=$2 stage
+    for stage in base normal; do
+        xe repository-introduce name-label="sdk-example-$stage" \
+            name-description="SDK example $stage repository" \
+            binary-url="$repo_url/$stage" source-url="$source_url/$stage" \
+            update=$([ "$stage" = base ] && echo false || echo true)
+    done
+}
+
 # --- 16. Configure updates (CDN) ---
 w_configure_updates() {
+    local repo_url source_url repos repo_list names pool before
+    repo_url=$(param repo_url "https://repo.ops.xenserver.com/xs9")
+    source_url=$(param source_url "https://repo-src.ops.xenserver.com/xs9")
     pool=$(xe pool-list --minimal)
-    # update=true: without it this introduces only a base package mirror, not an actual *update*
-    # repository - pool-sync-updates needs one with update=true enabled (NO_REPOSITORY_ENABLED
-    # otherwise), which is exactly what apply-update and rolling-pool-update rely on.
-    repo=$(xe repository-introduce name-label=xe-cdn binary-url=https://cdn.example/base \
-        source-url=https://cdn.example/source update=true)
-    echo "Introduced repository: $(xe repository-param-get uuid=$repo param-name=name-label)"
+    repos=$(introduce_update_repositories "$repo_url" "$source_url")
+    repo_list="" names=""
+    for r in $repos; do
+        repo_list="${repo_list:+$repo_list,}$r"
+        names="${names:+$names, }$(xe repository-param-get uuid=$r param-name=name-label)"
+    done
+    echo "Introduced repositories: $names"
+
+    # Remember the pool's own repositories, to put them back afterwards. A set reads back "a; b" and is
+    # set as "a,b".
+    before=$(xe pool-param-get uuid=$pool param-name=repositories)
+    xe pool-param-set uuid=$pool repositories=$repo_list
     # The pool's update-sync-enabled is read-only to param-set; xe switches it with its own command.
     xe pool-set-update-sync-enabled value=true
-    echo "Auto-sync enabled: $(xe pool-param-get uuid=$pool param-name=update-sync-enabled)"
+    echo "Pool repositories: $(count_csv "$repo_list"); auto-sync enabled: $(xe pool-param-get uuid=$pool param-name=update-sync-enabled)"
+
+    # Tidy up so the example is repeatable.
     xe pool-set-update-sync-enabled value=false
-    xe repository-forget uuid=$repo
+    xe pool-param-set uuid=$pool repositories="${before//; /,}"
+    for r in $repos; do xe repository-forget uuid=$r; done
     echo "OK: configure-updates"
 }
 
@@ -804,22 +929,22 @@ w_storage_migrate() {
 
 # --- 20. Apply updates from the CDN ---
 # pool-sync-updates needs at least one repository with update=true enabled (NO_REPOSITORY_ENABLED
-# otherwise) - introduce one and forget it again afterwards. Unlike the SDK languages, xe has no command
-# for pool.set_repositories (the "repositories" field is DynamicRO; there is no CLI setter at all) - and
-# none is needed: the real corpus (XenRT job 4762371) never attaches one either, it just introduces the
-# repository with update=true and calls pool-sync-updates straight away. Applying a batch whose mandatory
-# guidance needs an evacuation fails with HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are
-# moved off first; handle that rather than assuming an update batch never asks for one.
+# otherwise) - introduce the base and update repositories and attach both, remembering what was there to
+# put it back afterwards (the "repositories" field is DynamicRO at the API level, but xe's generic
+# pool-param-set still writes it - a set reads back "a; b" and is set as "a,b"), forgetting the throwaway
+# ones again afterwards. Applying a batch whose mandatory guidance needs an evacuation fails with
+# HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are moved off first; handle that rather than
+# assuming an update batch never asks for one.
 w_apply_update() {
-    local repo pool before hash err guidance
-    repo=$(xe repository-introduce name-label=xe-cdn binary-url=https://cdn.example/base \
-        source-url=https://cdn.example/source update=true)
-    # pool-sync-updates syncs the pool's ENABLED repositories, and repository-introduce doesn't enable
-    # anything (NO_REPOSITORY_ENABLED otherwise). xe has no add-one command: set the pool's whole list,
-    # remembering what was there to put it back afterwards. A set reads back "a; b" and is set as "a,b".
+    local repo_url source_url repos repo_list pool before hash err guidance
+    repo_url=$(param repo_url "https://repo.ops.xenserver.com/xs9")
+    source_url=$(param source_url "https://repo-src.ops.xenserver.com/xs9")
+    repos=$(introduce_update_repositories "$repo_url" "$source_url")
+    repo_list=""
+    for r in $repos; do repo_list="${repo_list:+$repo_list,}$r"; done
     pool=$(xe pool-list --minimal)
     before=$(xe pool-param-get uuid=$pool param-name=repositories)
-    xe pool-param-set uuid=$pool repositories=$repo
+    xe pool-param-set uuid=$pool repositories=$repo_list
 
     hash=$(xe pool-sync-updates)
     echo "Synced updates (hash length ${#hash})"
@@ -836,19 +961,28 @@ w_apply_update() {
                 *) echo "$err" >&2; exit 1 ;;
             esac
         fi
-        guidance=$(xe host-param-get uuid=$h param-name=pending-guidances)
+        guidance=$(set_to_csv "$(xe host-param-get uuid=$h param-name=pending-guidances)")
         echo "  $(xe host-param-get uuid=$h param-name=name-label): applied; pending guidance = [$guidance]"
         # Modern xapi (>=23.18.0) doesn't reboot a host for you: it only records guidance, so only act
         # when the applied batch actually asked for it. A reboot restarts the toolstack too, so
         # reboot_host (checked first) covers restart_toolstack as well; xe has no separate command to
         # restart just the toolstack, so note it rather than silently doing nothing in that rarer case.
         case ",$guidance," in
-            *,reboot_host,*) xe host-reboot uuid=$h ;;
+            *,reboot_host,*)
+                # As in rolling-pool-update: the reboot returns before it has happened, and the
+                # coordinator's takes the connection with it - so wait for a newer boot time.
+                before_key=$(xe host-param-get uuid=$h param-name=other-config param-key=boot_time 2>/dev/null) || true
+                xe host-reboot uuid=$h
+                wait_for_restart "$h" boot_time "$before_key"
+                ;;
             *,restart_toolstack,*) echo "    (restart_toolstack requested; xe has no command for that alone)" ;;
         esac
+        # apply-updates disables the host while it works (auto_enable: a restart puts it back) - with no
+        # restart to do, nothing re-enables it. Return it to service either way.
+        enable_when_booted "$h"
     done
     xe pool-param-set uuid=$pool repositories="${before//; /,}"
-    xe repository-forget uuid=$repo
+    for r in $repos; do xe repository-forget uuid=$r; done
     echo "OK: apply-update"
 }
 
@@ -883,9 +1017,11 @@ w_attach_disk() {
     vm=$(xe vm-install template="$template" new-name-label=xe-example-attachdisk sr-uuid=$(shared_sr))
     vdi=$(xe vdi-create sr-uuid=$(shared_sr) name-label=xe-example-data-disk virtual-size=8GiB type=user)
     xe vbd-create vm-uuid=$vm vdi-uuid=$vdi device=1 type=Disk mode=RW >/dev/null
-    echo "Attached an 8 GiB disk; VM now has $(count_csv "$(xe vm-param-get uuid=$vm param-name=VBDs --minimal)") VBD(s)"
-    # Tidy up: vm-uninstall destroys the VM and the disks it owns, including the one just attached.
+    echo "Attached an 8 GiB disk; VM now has $(count_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=VBDs)")") VBD(s)"
+    # Tidy up: vm-uninstall destroys the VM and the disks it OWNS (VBD other-config:owner, which vm-install
+    # sets on the template's disks) - not the one just attached, so destroy that too.
     xe vm-uninstall uuid=$vm force=true
+    xe vdi-destroy uuid=$vdi
     echo "OK: attach-disk"
 }
 
@@ -930,7 +1066,7 @@ w_gpu_inventory() {
     echo "GPU groups:"
     groups=$(xe gpu-group-list --minimal)
     for g in ${groups//,/ }; do
-        vtypes=$(xe gpu-group-param-get uuid=$g param-name=supported-VGPU-types --minimal)
+        vtypes=$(set_to_csv "$(xe gpu-group-param-get uuid=$g param-name=supported-VGPU-types)")
         models=""
         for t in ${vtypes//,/ }; do models="$models $(xe vgpu-type-param-get uuid=$t param-name=model-name)"; done
         echo "  - $(xe gpu-group-param-get uuid=$g param-name=name-label): vGPU types:$models"
@@ -940,7 +1076,7 @@ w_gpu_inventory() {
     # full before using the next, breadth-first spreads them out.
     group=$(first_csv "$groups")
     before=$(xe gpu-group-param-get uuid=$group param-name=allocation-algorithm)
-    xe gpu-group-param-set uuid=$group allocation-algorithm=breadth_first
+    xe gpu-group-param-set uuid=$group allocation-algorithm=breadth-first
     echo "Allocation:      $before -> $(xe gpu-group-param-get uuid=$group param-name=allocation-algorithm)"
     xe gpu-group-param-set uuid=$group allocation-algorithm=$before
     echo "OK: gpu-inventory"
@@ -1045,9 +1181,9 @@ w_manage_vif() {
     local template=$(param template_name "Rocky Linux 8") device
     vm=$(xe vm-install template="$template" new-name-label=xe-example-vif sr-uuid=$(shared_sr))
     net=$(first_csv "$(xe network-list --minimal)")
-    device=$(first_csv "$(xe vm-param-get uuid=$vm param-name=allowed-VIF-devices --minimal)")
+    device=$(first_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=allowed-VIF-devices)")")
     vif=$(xe vif-create vm-uuid=$vm network-uuid=$net device=$device)
-    echo "Attached a VIF; VM now has $(count_csv "$(xe vm-param-get uuid=$vm param-name=VIFs --minimal)") NIC(s)"
+    echo "Attached a VIF; VM now has $(count_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=VIFs)")") NIC(s)"
     xe vif-destroy uuid=$vif
     # Tidy up so the example is repeatable: vm-uninstall destroys the VM and the disks it owns (vm-destroy
     # would leave the disks behind).
@@ -1066,7 +1202,7 @@ w_list_networks() {
 w_vbd_inventory() {
     vm=$(vm_uuid db-01)
     echo "Disks of db-01:"
-    vbds=$(xe vm-param-get uuid=$vm param-name=VBDs --minimal)
+    vbds=$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=VBDs)")
     for vbd in ${vbds//,/ }; do
         if [ "$(xe vbd-param-get uuid=$vbd param-name=type)" = "Disk" ]; then
             vdi=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid)
@@ -1105,20 +1241,23 @@ w_find_by_uuid() {
 }
 
 # --- Rolling pool update --------------------------------------------------------------
-# Needs an enabled update repository the same way apply-update does - introduce one, forget it again
-# afterwards (xe has no command to attach it to the pool; none is needed, see apply-update). Modern xapi
-# (>=23.18.0) doesn't reboot a host for you: it only records pending guidance, so only reboot when the
-# applied batch actually asks for it.
+# Needs an enabled update repository the same way apply-update does - introduce the base and update
+# repositories and attach both, forget them again afterwards. Modern xapi (>=23.18.0) doesn't reboot a
+# host for you: it only records pending guidance, so only reboot (xe has no remote toolstack-restart
+# command, see apply-update) when the applied batch actually asks for it.
 w_rolling_pool_update() {
-    local repo pool before hash guidance
-    repo=$(xe repository-introduce name-label=xe-cdn binary-url=https://cdn.example/base \
-        source-url=https://cdn.example/source update=true)
+    local repo_url source_url repos repo_list pool before hash guidance before_key
+    repo_url=$(param repo_url "https://repo.ops.xenserver.com/xs9")
+    source_url=$(param source_url "https://repo-src.ops.xenserver.com/xs9")
+    repos=$(introduce_update_repositories "$repo_url" "$source_url")
+    repo_list=""
+    for r in $repos; do repo_list="${repo_list:+$repo_list,}$r"; done
     # pool-sync-updates syncs the pool's ENABLED repositories, and repository-introduce doesn't enable
-    # anything (NO_REPOSITORY_ENABLED otherwise). xe has no add-one command: set the pool's whole list,
-    # remembering what was there to put it back afterwards. A set reads back "a; b" and is set as "a,b".
+    # anything (NO_REPOSITORY_ENABLED otherwise). Remember what was there to put it back afterwards. A
+    # set reads back "a; b" and is set as "a,b".
     pool=$(xe pool-list --minimal)
     before=$(xe pool-param-get uuid=$pool param-name=repositories)
-    xe pool-param-set uuid=$pool repositories=$repo
+    xe pool-param-set uuid=$pool repositories=$repo_list
     hash=$(xe pool-sync-updates)
     echo "Synced updates (hash length ${#hash})"
     # Rolling pattern: disable -> evacuate -> apply -> reboot (only if asked) -> re-enable, one host at a time.
@@ -1127,15 +1266,25 @@ w_rolling_pool_update() {
         xe host-disable uuid=$h
         xe host-evacuate uuid=$h
         xe host-apply-updates uuid=$h hash=$hash
-        guidance=$(xe host-param-get uuid=$h param-name=pending-guidances)
+        guidance=$(set_to_csv "$(xe host-param-get uuid=$h param-name=pending-guidances)")
         echo "  applied; pending guidance = $guidance"
         case ",$guidance," in
-            *,reboot_host,*) xe host-reboot uuid=$h ;;
+            *,reboot_host,*)
+                # The reboot returns before it has happened, and if this host is the coordinator it takes
+                # the connection with it - so note when it last booted, reboot it, and wait until it
+                # reports a newer boot time and is live again before re-enabling it.
+                before_key=$(xe host-param-get uuid=$h param-name=other-config param-key=boot_time 2>/dev/null) || true
+                xe host-reboot uuid=$h
+                wait_for_restart "$h" boot_time "$before_key"
+                ;;
+            *,restart_toolstack,*)
+                echo "    (restart_toolstack requested; xe has no command for that alone)"
+                ;;
         esac
-        xe host-enable uuid=$h
+        enable_when_booted "$h"
     done
     xe pool-param-set uuid=$pool repositories="${before//; /,}"
-    xe repository-forget uuid=$repo
+    for r in $repos; do xe repository-forget uuid=$r; done
     echo "OK: rolling-pool-update"
 }
 
@@ -1144,10 +1293,10 @@ w_cross_pool_copy_vm() {
     # Copy a VM to another pool (Storage XenMotion copy). Real xe does the whole cross-pool dance
     # itself given the destination master's address + credentials; copy=true leaves the source intact.
     dest_host=${desturl#*://}; dest_host=${dest_host%%/*}; dest_host=${dest_host%%:*}
-    vm=$(vm_uuid db-01)
-    xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$user remote-password=$pass copy=true
-    still=$([ -n "$(vm_uuid db-01)" ] && echo True || echo False)
-    echo "Sent 'db-01' to $dest_host (copy); source still present: $still"
+    vm=$(vm_uuid "$copy_vm")
+    xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$destuser remote-password=$destpass copy=true
+    still=$([ -n "$(vm_uuid "$copy_vm")" ] && echo True || echo False)
+    echo "Sent '$copy_vm' to $dest_host (copy); source still present: $still"
     echo "OK: cross-pool-copy-vm"
 }
 
@@ -1194,7 +1343,7 @@ w_reclaim_space() {
     # via the trim plugin - XenCenter's "Reclaim freed space".
     sr=$(first_csv "$(xe sr-list type=lvm --minimal)")
     # A host with a live (plugged) connection to the SR runs the plugin.
-    pbd=$(first_csv "$(xe sr-param-get uuid=$sr param-name=PBDs)")
+    pbd=$(first_csv "$(set_to_csv "$(xe sr-param-get uuid=$sr param-name=PBDs)")")
     h=$(xe pbd-param-get uuid=$pbd param-name=host)
     result=$(xe host-call-plugin host-uuid=$h plugin=trim fn=do_trim args:sr_uuid=$sr)
     echo "  reclaimed freed space on $sr: $result"
@@ -1221,21 +1370,35 @@ w_vm_ip_address() {
 # --- 47. Manage Active Directory users ---
 # Needs a real, reachable AD domain controller - pool-enable-external-auth fails at the very first call
 # (DNS/LDAP/Kerberos) without one, so domain/admin_user/admin_password have to identify a real domain to
-# join. new_user is the account to grant a role to; its subject identity is looked up against the
-# directory just joined, so it has to be a real account there too. The simulator models a single-user,
-# domain-less fake directory (hence the empty domain default) - override every one of these on a real pool.
+# join. Before joining, every host must resolve the domain (point its DNS at a domain controller) and
+# keep its clock close to the DC's (Kerberos). Current Windows DCs want LDAPS (ldaps=true), which also
+# needs the pool to trust the DC's CA certificate (pool-certificate-install ... purpose=ldaps, i.e.
+# install_trusted_certificate). new_user is the account to grant a role to; its subject identity is
+# looked up against the directory, so it has to be a real account there too. A pool already joined to
+# this domain is used as it is - and left joined. The simulator models a single-user, domain-less fake
+# directory (hence the empty domain default) - override every one of these on a real pool.
 w_manage_ad_users() {
-    local domain admin_user admin_password new_user subject_name
+    local domain admin_user admin_password new_user ldaps subject_name master auth_type auth_service already_joined=false
     domain=$(param domain "")
     admin_user=$(param admin_user "alice")
     admin_password=$(param admin_password "Password1")
     new_user=$(param new_user "alice")
+    ldaps=$(param ldaps "false")
     subject_name=$new_user; [ -n "$domain" ] && subject_name="$new_user@$domain"
 
     pool=$(xe pool-list --minimal)
-    xe pool-enable-external-auth uuid=$pool auth-type=AD service-name="$domain" \
-        config:user="$admin_user" config:pass="$admin_password" config:ldaps=false
-    echo "Joined domain: ${domain:-(none - the simulators fake directory)}"
+    master=$(xe pool-param-get uuid=$pool param-name=master)
+    auth_type=$(xe host-param-get uuid=$master param-name=external-auth-type)
+    auth_service=$(xe host-param-get uuid=$master param-name=external-auth-service-name)
+    if [ -n "$domain" ] && [ "$auth_type" = "AD" ] \
+        && [ "${auth_service,,}" = "${domain,,}" ]; then
+        already_joined=true
+        echo "Already joined to domain: $domain"
+    else
+        xe pool-enable-external-auth uuid=$pool auth-type=AD service-name="$domain" \
+            config:user="$admin_user" config:pass="$admin_password" config:ldaps=$ldaps
+        echo "Joined domain: ${domain:-(none - the simulators fake directory)}"
+    fi
     subj=$(xe subject-add subject-name="$subject_name")
     xe subject-role-add uuid=$subj role-name=pool-admin
     name=$(xe subject-param-get uuid=$subj param-name=other-config param-key=subject-displayname)
@@ -1248,7 +1411,11 @@ w_manage_ad_users() {
     echo "  logged out $name"
 
     xe subject-remove subject-uuid=$subj
-    xe pool-disable-external-auth uuid=$pool
+    if [ "$already_joined" = false ]; then
+        # Leave the way it was found. Passing the admin credentials also removes the pool's computer
+        # accounts from the directory; without them they stay behind in AD.
+        xe pool-disable-external-auth uuid=$pool config:user="$admin_user" config:pass="$admin_password"
+    fi
     echo "OK: manage-ad-users"
 }
 
@@ -1305,7 +1472,7 @@ w_create_smb_sr() {
     # (0/3 real captured sr-create calls for this type use plaintext).
     secret=$(xe secret-create value="$smb_password")
     sr=$(xe sr-create host-uuid=$(first_host) type=smb name-label="$sr_name" shared=true \
-        device-config:server="$server" device-config:serverpath="$share" \
+        device-config:server="//$server$share" \
         device-config:username="$smb_username" device-config:password_secret=$secret)
     echo "Created SMB SR: $sr ($(( $(xe sr-param-get uuid=$sr param-name=physical-size) / 1024 / 1024 / 1024 )) GiB)"
     detach_and_forget_sr $sr
@@ -1322,8 +1489,17 @@ w_create_hba_sr() {
     sr_name=$(param sr_name "xe-example-hba")
     h=$(first_host)
     xml=$(probe_for_failure lvmohba host-uuid="$h")
-    block=${xml#*<BlockDevice>}; block="<BlockDevice>${block%%</BlockDevice>*}"
-    scsi_id=$(xml_tag_text "$block" SCSIid)
+    # sr-create formats the LUN: on shared FC storage name yours (scsi_id=); with none, the first is taken.
+    local want rest
+    want=$(param scsi_id "")
+    rest=$xml
+    while [[ $rest == *"<BlockDevice>"* ]]; do
+        block=${rest#*<BlockDevice>}; rest=${block#*</BlockDevice>}; block="<BlockDevice>${block%%</BlockDevice>*}"
+        scsi_id=$(xml_tag_text "$block" SCSIid)
+        [ -z "$want" ] || [ "$scsi_id" = "$want" ] && break
+        scsi_id=""
+    done
+    [ -n "$scsi_id" ] || { echo "no LUN with SCSIid $want is visible to this host" >&2; return 1; }
     path=$(xml_tag_text "$block" path)
     echo "Discovered LUN: SCSIid $scsi_id on $path"
 
@@ -1338,9 +1514,12 @@ w_create_hba_sr() {
 
 # --- 51. Create an ISO library SR ---
 w_create_iso_sr() {
-    # Connect an ISO-library SR to a file share of ISO images (here an NFS export).
+    # Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+    # "server:/path").
+    local location
+    location=$(param location "192.0.2.10:/isos")
     sr=$(xe sr-create host-uuid=$(first_host) type=iso name-label=xe-example-iso content-type=iso \
-        device-config:location=192.0.2.10:/isos device-config:type=nfs_iso shared=true)
+        device-config:location="$location" device-config:type=nfs_iso shared=true)
     echo "Created ISO SR: $sr"
     detach_and_forget_sr $sr
     echo "OK: create-iso-sr"
@@ -1395,7 +1574,9 @@ w_manage_vapp() {
     xe appliance-start uuid="$vapp_uuid"
     echo "Started:        $(xe vm-list uuid="$vm_uuid" params=power-state --minimal)"
 
-    xe appliance-shutdown uuid="$vapp_uuid"
+    # A plain appliance-shutdown is clean only, and fails OPERATION_PARTIALLY_FAILED if any member can't
+    # shut down cleanly (no guest OS or PV drivers); force=true shuts the members down hard.
+    xe appliance-shutdown uuid="$vapp_uuid" force=true
     echo "Shut down:      $(xe vm-list uuid="$vm_uuid" params=power-state --minimal)"
 
     xe vm-param-set uuid="$vm_uuid" appliance=
@@ -1434,24 +1615,71 @@ w_attach_usb_device() {
 # NO URL scheme - that is the real wire format (confirmed from XenRT logs), not a URL; the old hard-coded
 # value had an incorrect "https://" prefix. Also note: this command's own parameter names are an
 # exception to xe's usual hyphenated convention - they are genuinely underscored on the wire.
+#
+# The pool checks the appliance's TLS certificate (wlb-verify-cert), and only against the certificates
+# installed with pool-certificate-install - not pool-install-trusted-certificate's (a different store).
+# A fresh appliance has a self-signed one, so pass it as wlb_certificate (a PEM file): without it
+# pool-initialize-wlb fails with "Connection failed: configuration failed." and no hint that the
+# certificate is the reason. pool-certificate-install is deprecated for pool-install-ca-certificate, but
+# it is the same call either way (xapi_pool.ml aliases them) - and it names the certificate after the
+# file's own basename rather than taking a name= parameter, so the file is copied to the name wanted
+# for uninstalling it again.
 w_wlb_recommendations() {
-    local wlb_host_port wlb_username wlb_password
+    local vm_name wlb_host_port wlb_username wlb_password wlb_certificate vm pool out deadline
+    # Not local: the EXIT trap below reads it after this function has returned.
+    wlb_cert_name=""
+    vm_name=$(param vm_name "web-01")
     wlb_host_port=$(param wlb_host_port "wlb.example:8012")
     wlb_username=$(param wlb_username "wlbuser")
     wlb_password=$(param wlb_password "wlbpass")
+    wlb_certificate=$(param wlb_certificate "")
+
+    if [ -n "$wlb_certificate" ]; then
+        wlb_cert_name=sdk-example-wlb.pem
+        cp "$wlb_certificate" "$wlb_cert_name"
+        xe pool-certificate-install filename="$wlb_cert_name"
+        rm -f "$wlb_cert_name"
+    fi
     xe pool-initialize-wlb wlb_url="$wlb_host_port" wlb_username="$wlb_username" \
         wlb_password="$wlb_password" xenserver_username="$user" xenserver_password="$pass"
+
+    # Disconnect from the appliance however the rest of this goes, or the pool stays attached to it. This
+    # script dispatches to exactly one workflow and then exits, so an EXIT trap is bash's try/finally.
+    trap 'xe pool-deconfigure-wlb; [ -z "$wlb_cert_name" ] || xe pool-certificate-uninstall name="$wlb_cert_name"' EXIT
+
+    # Initializing connects the pool to the appliance but leaves balancing off: every WLB call after this
+    # would fail WLB_DISABLED until it's switched on.
+    pool=$(xe pool-list --minimal)
+    xe pool-param-set uuid=$pool wlb-enabled=true
     echo "WLB: $(xe pool-list params=wlb-url --minimal)"
 
     # One line per recommendation, keyed by VM: "wlb", the destination host UUID, two ids, the reason.
     xe pool-retrieve-wlb-recommendations
+
+    # A VM's own recommendations are keyed by host and star-rate each as a destination - higher is better
+    # (a real appliance rated hosts 6.1 here, so not capped at XenCenter's five stars). Right after
+    # connecting, the appliance is still discovering the pool: WLB_INTERNAL_ERROR 4024 ("Pool discovery has
+    # not been started"), 4025 ("... has not been completed"), then 4016 ("WLB does not have current
+    # metrics") - keep asking for a while. xe prints the error's message, not its
+    # code, so match on the text.
+    vm=$(vm_uuid "$vm_name")
+    deadline=$((SECONDS + 600))
+    while true; do
+        if out=$(xe vm-retrieve-wlb-recommendations uuid=$vm 2>&1); then break; fi
+        case "$out" in
+            *4024*|*4025*|*"Pool discovery has not been"*|*4016*|*"does not have current metrics"*) ;;
+            *) echo "$out" >&2; exit 1 ;;
+        esac
+        if [ $SECONDS -gt $deadline ]; then echo "$out" >&2; exit 1; fi
+        sleep 15
+    done
+    printf '%s\n' "$out"
 
     # The appliance's own settings are read and written as one flat map of strings. Send a nightly
     # reporting schedule, then read the configuration back to confirm it took.
     xe pool-send-wlb-configuration config:ReportingCronString="0 3 * * *"
     echo "  appliance configuration: $(xe pool-retrieve-wlb-configuration)"
 
-    xe pool-deconfigure-wlb
     echo "OK: wlb-recommendations"
 }
 
@@ -1496,17 +1724,21 @@ w_manage_pool_membership() {
     # xapi pool-wide, so the connection this script is using does not survive it: reconnect (a bounded
     # wait/retry, the same way XenRT's own helper for this call does) before touching the pool again,
     # rather than assuming the next xe call will just work.
+    # Names first: once the switch starts, the address this script talks to may already be a supporter.
+    local other_name original_name
+    other_name=$(xe host-list uuid="$other" params=name-label --minimal)
+    original_name=$(xe host-list uuid="$original" params=name-label --minimal)
     xe pool-designate-new-master host-uuid="$other"
-    echo "Promoting:   $(xe host-list uuid="$other" params=name-label --minimal) (xapi restarts pool-wide; reconnecting)"
-    reconnect_after_master_change
-    echo "Promoted:    $(xe host-list uuid="$other" params=name-label --minimal)"
+    echo "Promoting:   $other_name (xapi restarts pool-wide; reconnecting)"
+    reconnect_after_master_change "$other"
+    echo "Promoted:    $other_name"
 
     # Put it back. Ejecting a member (pool-eject) is the other half of this surface and is deliberately
     # not shown: it cannot be undone from the pool, because rejoining is initiated by the ejected host.
     xe pool-designate-new-master host-uuid="$original"
-    echo "Restoring:   $(xe host-list uuid="$original" params=name-label --minimal) (reconnecting again)"
-    reconnect_after_master_change
-    echo "Restored:    $(xe host-list uuid="$original" params=name-label --minimal)"
+    echo "Restoring:   $original_name (reconnecting again)"
+    reconnect_after_master_change "$original"
+    echo "Restored:    $original_name"
     echo "OK: manage-pool-membership"
 }
 
@@ -1525,6 +1757,10 @@ w_create_bond() {
     # Spare NICs only. A bond that includes the management interface moves the management address onto
     # the bond master - on a real host that is how you lose the connection you are working over.
     spares=$(xe pif-list host-uuid="$host_uuid" management=false physical=true --minimal)
+    if [ "$(count_csv "$spares")" -lt 2 ]; then
+        echo "$(xe host-param-get uuid=$host_uuid param-name=name-label) has $(count_csv "$spares") spare NIC(s); a bond needs two that aren't the management interface" >&2
+        return 1
+    fi
     spares="$(first_csv "$spares"),$(nth_csv "$spares" 2)"
     echo "Bonding:      $spares"
 
@@ -1542,7 +1778,26 @@ w_create_bond() {
 
 # --- Configure PVS Accelerator ---
 w_configure_pvs_accelerator() {
-    site=$(xe pvs-site-introduce name-label=sdk-pvs-farm name-description="Created by the SDK examples")
+    local vm_name vm vif
+    vm_name=$(param vm_name "db-01")
+    # Check the VM first, before creating anything: it needs a NIC for the proxy to sit on, and one that
+    # no site accelerates yet (a VIF takes one proxy: PVS_PROXY_ALREADY_PRESENT). It need not be running
+    # - a proxy on a halted VM just reports "stopped" until it starts.
+    vm=$(vm_uuid "$vm_name")
+    name=$(xe vm-param-get uuid=$vm param-name=name-label)
+    vif=$(lowest_device_vif "$vm")
+    if [ -z "$vif" ]; then
+        echo "$vm_name has no network interface to accelerate" >&2
+        return 1
+    fi
+    existing=$(xe pvs-proxy-list vif-uuid=$vif --minimal)
+    if [ -n "$existing" ]; then
+        existing_site=$(xe pvs-proxy-param-get uuid=$existing param-name=site-uuid)
+        echo "$vm_name is already accelerated by site '$(xe pvs-site-param-get uuid=$existing_site param-name=name-label)'" >&2
+        return 1
+    fi
+
+    site=$(xe pvs-site-introduce name-label=sdk-example-pvs name-description="Created by the SDK examples")
     xe pvs-server-introduce addresses=10.62.0.90 first-port=6910 last-port=6930 pvs-site-uuid="$site" >/dev/null
 
     # The read cache must be on LOCAL storage: keeping reads off the network is the point, so a cache
@@ -1557,21 +1812,10 @@ w_configure_pvs_accelerator() {
         done
     done
 
-    # A proxy may only sit on the VM's LOWEST-numbered NIC, and only one proxy may sit on a NIC — so
-    # skip VMs the pool already accelerates and sort what is left by device.
-    taken=""
-    for proxy in $(each_csv "$(xe pvs-proxy-list --minimal)"); do
-        vif=$(xe pvs-proxy-param-get uuid=$proxy param-name=vif-uuid)
-        taken="$taken $(xe vif-param-get uuid=$vif param-name=vm-uuid)"
-    done
-    for vm in $(each_csv "$(xe vm-list power-state=running is-control-domain=false --minimal)"); do
-        case "$taken" in *"$vm"*) continue ;; esac
-        vif=$(xe vif-list vm-uuid=$vm params=uuid,device --minimal | sort_by_device)
-        [ -n "$vif" ] || continue
-        proxy=$(xe pvs-proxy-create pvs-site-uuid="$site" vif-uuid="$vif")
-        name=$(xe vm-param-get uuid=$vm param-name=name-label)
-        break
-    done
+    # A proxy may only sit on the VM's LOWEST-numbered NIC, hence sorting by device above rather than
+    # just taking the first VIF listed — the list comes back in creation order, which is the same thing
+    # only by luck.
+    proxy=$(xe pvs-proxy-create pvs-site-uuid="$site" vif-uuid="$vif")
 
     # Scoped to THIS site: the pool may already have one, and counting pool-wide would report its
     # caches and servers as though this example had made them.
@@ -1593,15 +1837,13 @@ w_configure_pvs_accelerator() {
     echo "OK: configure-pvs-accelerator"
 }
 
-# Read "uuid,device,uuid,device,..." pairs on stdin and echo the uuid with the lowest device. Bash
-# builtins only: on Windows every pipe stage is a process launch, and this runs once per VM.
-sort_by_device() {
-    local pairs best_uuid="" best_dev=""
-    read -r pairs
-    local IFS=,; set -- $pairs
-    while [ $# -ge 2 ]; do
-        if [ -z "$best_dev" ] || [ "$2" -lt "$best_dev" ]; then best_uuid=$1; best_dev=$2; fi
-        shift 2
+# The VIF with the lowest device number on a VM. (vif-list --minimal prints only uuids even when params=
+# names more fields, so each VIF's device is read on its own.)
+lowest_device_vif() {
+    local vif dev best_uuid="" best_dev=""
+    for vif in $(each_csv "$(xe vif-list vm-uuid=$1 --minimal)"); do
+        dev=$(xe vif-param-get uuid=$vif param-name=device)
+        if [ -z "$best_dev" ] || [ "$dev" -lt "$best_dev" ]; then best_uuid=$vif; best_dev=$dev; fi
     done
     echo "$best_uuid"
 }
@@ -1663,7 +1905,7 @@ w_manage_vtpm() {
     vtpm=$(xe vtpm-create vm-uuid=$vm is-unique=false)
     echo "  unique to this VM:   $(xe vtpm-param-get uuid=$vtpm param-name=is_unique)"
     echo "  protected:           $(xe vtpm-param-get uuid=$vtpm param-name=is_protected)"
-    echo "  VM now has $(count_csv "$(xe vm-param-get uuid=$vm param-name=vtpms --minimal)") vTPM(s)"
+    echo "  VM now has $(count_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=vtpms)")") vTPM(s)"
 
     # The VM advertises whether another can be added; once it has one, it cannot.
     case "$(xe vm-param-get uuid=$vm param-name=allowed-operations)" in
@@ -1671,8 +1913,8 @@ w_manage_vtpm() {
         *)             echo "  can add another:     false" ;;
     esac
 
-    xe vtpm-destroy uuid=$vtpm
-    echo "  after removal:       $(count_csv "$(xe vm-param-get uuid=$vm param-name=vtpms --minimal)") vTPM(s)"
+    xe vtpm-destroy uuid=$vtpm --force       # xe insists: the vTPM's secrets are destroyed with it
+    echo "  after removal:       $(count_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=vtpms)")") vTPM(s)"
     echo "OK: manage-vtpm"
 }
 
@@ -1728,17 +1970,27 @@ first_disk_vdi() {
 
 # --- Export and import a VM ---
 w_export_import_vm() {
-    # Only a halted VM can be exported: its disks must not be changing underneath the copy.
-    vm=$(nth_csv "$(xe vm-list power-state=halted --minimal)" 1)
-    echo "Exporting $(xe vm-param-get uuid=$vm param-name=name-label)"
+    vm_name=$(param vm_name "db-01")
+    # Name the VM: an export carries every block of its disks, so which VM matters (a large one takes a
+    # long time, and fills the disk). Only a halted VM can be exported: its disks must not be changing
+    # underneath the copy.
+    vm=$(vm_uuid "$vm_name")
+    [ "$(xe vm-param-get uuid=$vm param-name=power-state)" = "halted" ] ||
+        { echo "$vm_name must be halted to be exported" >&2; exit 1; }
+    echo "Exporting $vm_name"
 
     # Relative to the working directory: xe.exe and this script must agree on the path, and a Windows
     # temp directory spelled with backslashes would not survive the trip through both.
     file="cli-export.xva"
+    # Always clean up the file, on failure too: a real export is gigabytes, not worth leaving behind.
+    trap 'rm -f "$file"' EXIT
     # xe does the HTTP transfer itself: the server answers the command by telling the client to GET
     # /export, and xe writes the file. Nothing streams down the CLI connection.
     xe vm-export uuid=$vm filename="$file"
     size=$(stat -c %s "$file" 2>/dev/null || wc -c < "$file")
+    # Check the file, not xe's exit status: Windows xe.exe reports a failed transfer ("Export failed")
+    # and still exits 0.
+    [ "${size:-0}" -gt 0 ] || { echo "the export produced no data" >&2; exit 1; }
     echo "  wrote $((size / 1024 / 1024)) MiB to $(basename "$file")"
 
     # The SDK languages have to create a task, pass its id as /import?task_id=, and poll it themselves to
@@ -1749,7 +2001,6 @@ w_export_import_vm() {
 
     # The import brought its own disks along; vm-uninstall destroys those too, not just the VM record.
     xe vm-uninstall uuid=$imported force=true
-    rm -f "$file"
     echo "OK: export-import-vm"
 }
 
@@ -1798,8 +2049,7 @@ w_manage_vm_media() {
 
     # A CD drive is a VBD like any other, distinguished by type=CD; created without a disk it arrives
     # empty, and the media is whichever VDI it is later pointed at.
-    # --minimal, because without it xe prints a list as "1; 2; 3" and nth_csv would hand back the lot.
-    device=$(nth_csv "$(xe vm-param-get uuid=$vm param-name=allowed-VBD-devices --minimal)" 1)
+    device=$(first_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=allowed-VBD-devices)")")
     drive=$(xe vbd-create vm-uuid=$vm device=$device type=CD mode=RO)
     echo "  drive $device is empty: $(xe vbd-param-get uuid=$drive param-name=empty)"
 
@@ -1861,8 +2111,9 @@ w_backup_host_config() {
 
 # --- Detach, reattach and forget storage ---
 w_manage_sr_lifecycle() {
-    sr=$(xe sr-create name-label=cli-example-lifecycle type=nfs content-type=user shared=true \
-        device-config:server=192.0.2.10 device-config:serverpath=/export/spare device-config:nfsversion=3)
+    sr=$(xe sr-create name-label=xe-example-lifecycle type=nfs content-type=user shared=true \
+        device-config:server="$(param nfs_server 192.0.2.10)" \
+        device-config:serverpath="$(param nfs_path /export/spare)" device-config:nfsversion=3)
 
     # There is no sr-detach: a shared SR is joined to each host by one PBD, and detaching the SR means
     # unplugging every one of them. That is why an SR can be attached on some hosts and not others.
@@ -1904,17 +2155,18 @@ w_set_default_sr() {
     # where host crash dumps land. Capture each - a pool that has never suspended or crashed anything can
     # legitimately leave the latter two unset, so restoring all three from the default would quietly
     # invent settings that were not there. xe prints and accepts these as UUIDs.
-    before=$(xe pool-param-get uuid=$pool param-name=default-SR)
-    before_suspend=$(xe pool-param-get uuid=$pool param-name=suspend-image-SR)
-    before_crash=$(xe pool-param-get uuid=$pool param-name=crash-dump-SR)
+    before=$(pool_sr_setting $pool default-SR)
+    before_suspend=$(pool_sr_setting $pool suspend-image-SR)
+    before_crash=$(pool_sr_setting $pool crash-dump-SR)
     echo "default storage:  $(sr_label "$before")"
     echo "  suspend images: $(sr_label "$before_suspend")"
     echo "  crash dumps:    $(sr_label "$before_crash")"
 
     # Somewhere to switch to. The pool default has to be reachable from every host, so it is shared
     # storage; a local SR would strand any VM whose disk landed on the wrong host.
-    sr=$(xe sr-create name-label=cli-example-default type=nfs content-type=user shared=true \
-        device-config:server=192.0.2.10 device-config:serverpath=/export/spare device-config:nfsversion=3)
+    sr=$(xe sr-create name-label=xe-example-default type=nfs content-type=user shared=true \
+        device-config:server="$(param nfs_server 192.0.2.10)" \
+        device-config:serverpath="$(param nfs_path /export/spare)" device-config:nfsversion=3)
     xe pool-param-set uuid=$pool default-SR=$sr suspend-image-SR=$sr crash-dump-SR=$sr
     echo "  switched to:    $(sr_label "$(xe pool-param-get uuid=$pool param-name=default-SR)")"
 
@@ -1942,6 +2194,16 @@ sr_label() {
     if [ -z "$1" ]; then echo "(none)"; else xe sr-param-get uuid=$1 param-name=name-label; fi
 }
 
+# One of the pool's SR settings, as a uuid or "" when unset. xe prints an unset reference as
+# "<not in database>", but setting one takes "" to mean unset - so map one to the other, or the value
+# read cannot be written back.
+pool_sr_setting() {
+    local v
+    v=$(xe pool-param-get uuid=$1 param-name=$2)
+    [ "$v" = "<not in database>" ] && v=""
+    echo "$v"
+}
+
 # --- Collect a server status report ---
 w_server_status_report() {
     # Each host answers for itself, so which one you ask decides whose logs you get - support normally
@@ -1954,6 +2216,7 @@ w_server_status_report() {
     # whether it may contain personal data, so you can decide what to collect before collecting it.
     capabilities=$(xe host-get-system-status-capabilities uuid=$target)
     keys=""
+    defaults=""
     # Split the XML on '<' with bash's own field splitting rather than spawning a parser: each element
     # starts a field, and the ones we want begin `capability key="..."`.
     old_ifs=$IFS; IFS='<'
@@ -1962,18 +2225,22 @@ w_server_status_report() {
             capability\ *)
                 key=$(xml_attr "$element" key)
                 keys="${keys:+$keys,}$key"
+                default_checked=$(xml_attr "$element" default-checked)
+                [ "$default_checked" = "yes" ] && defaults="${defaults:+$defaults,}$key"
                 printf '  %-22s max %9s bytes  default=%-3s pii=%s\n' \
                     "$key" "$(xml_attr "$element" max-size)" \
-                    "$(xml_attr "$element" default-checked)" "$(xml_attr "$element" pii)"
+                    "$default_checked" "$(xml_attr "$element" pii)"
                 ;;
         esac
     done
     IFS=$old_ifs
 
     rm -f cli-status-all.tar cli-status-config.tar
-    xe host-get-system-status uuid=$target filename=cli-status-all.tar entries="$keys"
+    # Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+    # section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+    xe host-get-system-status uuid=$target filename=cli-status-all.tar entries="$defaults"
     whole=$(stat -c %s cli-status-all.tar)
-    echo "everything ($(count_csv "$keys") sections): $whole bytes"
+    echo "default sections ($(count_csv "$defaults") of $(count_csv "$keys")): $whole bytes"
 
     # Pick a real, small section from the host's own catalogue rather than assuming a name: the catalogue
     # is server-defined (xen-bugtool's own --capabilities output), not a fixed client list, and
@@ -2120,12 +2387,13 @@ w_restart_host() {
     echo "  evacuated:  guests=$(count_host_guest $target)"
 
     xe host-reboot uuid=$target
-    # A real reboot takes minutes; a production tool would poll host-metrics-live/boot_time for as long as
-    # XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the reboot to
-    # get underway, then explicitly re-enables - nothing else re-enables a host that was explicitly
-    # disabled, not even the reboot itself.
-    sleep 5
-    xe host-enable uuid=$target
+    # A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+    # host-metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+    # itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+    # never does - so enable it explicitly rather than depend on either.
+    wait_for_host_live "$target" false 600
+    wait_for_host_live "$target" true 1200 10
+    enable_when_booted "$target"
     echo "  rebooted, re-enabled: enabled=$(xe host-param-get uuid=$target param-name=enabled)"
 
     # The other ending: off, and back on out of band - but only demonstrated if that is actually
@@ -2137,9 +2405,9 @@ w_restart_host() {
         wait_for_host_live "$target" false
         echo "  shut down:  live=$(host_live $target)"
         xe host-power-on uuid=$target
-        wait_for_host_live "$target" true
+        wait_for_host_live "$target" true 1200 10
         echo "  powered on: live=$(host_live $target)"
-        xe host-enable uuid=$target
+        enable_when_booted "$target"
         echo "  re-enabled: enabled=$(xe host-param-get uuid=$target param-name=enabled)"
     else
         echo "  skipping shutdown/power-on: no out-of-band power-on mode is configured on this host"
@@ -2150,13 +2418,13 @@ w_restart_host() {
 # Resident VMs excluding the control domain, which never moves.
 count_host_guest() {
     local n=0
-    for vm in $(each_csv "$(xe host-param-get uuid=$1 param-name=resident-VMs)"); do
+    for vm in $(each_csv "$(set_to_csv "$(xe host-param-get uuid=$1 param-name=resident-VMs)")"); do
         if [ "$(xe vm-param-get uuid=$vm param-name=is-control-domain)" != "true" ]; then n=$((n + 1)); fi
     done
     echo $n
 }
 
-host_live() { xe host-metrics-param-get uuid=$(xe host-param-get uuid=$1 param-name=metrics) param-name=live; }
+host_live() { xe host-param-get uuid=$1 param-name=host-metrics-live; }
 
 # --- Create a VM and a template from a snapshot ---
 w_vm_from_snapshot() {
@@ -2194,16 +2462,18 @@ w_attach_existing_disk() {
     vdi=$(xe vdi-create sr-uuid=$sr name-label=xe-example-portable-disk virtual-size=4294967296 type=user)
     echo "Disk $(xe vdi-param-get uuid=$vdi param-name=name-label) created on $(xe sr-param-get uuid=$sr param-name=name-label)"
 
-    vbd=$(xe vbd-create vm-uuid=$first vdi-uuid=$vdi device=3 type=Disk mode=RW)
+    device=$(first_csv "$(set_to_csv "$(xe vm-param-get uuid=$first param-name=allowed-VBD-devices)")")
+    vbd=$(xe vbd-create vm-uuid=$first vdi-uuid=$vdi device=$device type=Disk mode=RW)
     echo "  attached to $(xe vm-param-get uuid=$first param-name=name-label)"
 
     # Destroying the VBD detaches the disk; the disk itself is untouched and keeps its data.
     xe vbd-destroy uuid=$vbd
     echo "  detached:   the disk still exists ($(xe vdi-param-get uuid=$vdi param-name=virtual-size) bytes)"
 
-    vbd2=$(xe vbd-create vm-uuid=$second vdi-uuid=$vdi device=3 type=Disk mode=RW)
+    device=$(first_csv "$(set_to_csv "$(xe vm-param-get uuid=$second param-name=allowed-VBD-devices)")")
+    vbd2=$(xe vbd-create vm-uuid=$second vdi-uuid=$vdi device=$device type=Disk mode=RW)
     echo "  attached to $(xe vm-param-get uuid=$second param-name=name-label)"
-    echo "  the disk is on $(count_csv "$(xe vdi-param-get uuid=$vdi param-name=vbds)") VM(s)"
+    echo "  the disk is on $(count_csv "$(set_to_csv "$(xe vdi-param-get uuid=$vdi param-name=vbds)")") VM(s)"
 
     xe vbd-destroy uuid=$vbd2
     xe vdi-destroy uuid=$vdi
@@ -2363,11 +2633,17 @@ w_manage_driver_variants() {
     drivers=$(xe hostdriver-list host-uuid=$host_uuid --minimal)
     echo "$hname has $(count_csv "$drivers") driver(s)"
 
+    # Sort by name (one xe call per driver to read it, same as the pairs read below) so the printed
+    # order and the selection below agree.
+    sorted_drivers=$( (for d in $(each_csv "$drivers"); do
+        printf '%s\t%s\n' "$(xe hostdriver-param-get uuid=$d param-name=name)" "$d"
+    done) | sort | cut -f2)
+
     # hostdriver-param-get has no "variants-uuid" field (only "variants", a printable name/version
     # summary) - the actual Driver_variant records behind it are found the normal CLI way, with the
     # generic hostdriver-variant-list filtered on driver-uuid=.
     n=0
-    for d in $(each_csv "$drivers"); do
+    for d in $sorted_drivers; do
         n=$((n + 1)); [ "$n" -gt 3 ] && break
         dname=$(xe hostdriver-param-get uuid=$d param-name=name)
         dtype=$(xe hostdriver-param-get uuid=$d param-name=type)
@@ -2376,21 +2652,25 @@ w_manage_driver_variants() {
         printf '  %-14s %-10s %d variant(s), active=%s\n' "$dname" "$dtype" "$nvariants" "${active:-(none)}"
     done
 
-    # Select a variant explicitly. It becomes the selected one immediately; whether it is also
-    # active depends on whether the hardware is present and the driver already loaded.
-    driver=$(first_csv "$drivers")
-    dname=$(xe hostdriver-param-get uuid=$driver param-name=name)
-    # Don't blindly pick the first variant: hostdriver-select on a no-hardware variant raises
-    # HOST_DRIVER_NO_HARDWARE, so pick the first one whose hardware is actually present (field "hw-present",
-    # not "hardware-present"), falling back to the first variant only if none report present.
-    variants=$(xe hostdriver-variant-list driver-uuid=$driver --minimal)
-    variant=""
-    for v in $(each_csv "$variants"); do
-        if [ "$(xe hostdriver-variant-param-get uuid=$v param-name=hw-present)" = "true" ]; then
-            variant=$v; break
-        fi
+    # Select a variant explicitly. It becomes the selected one immediately; whether it is also active
+    # depends on whether the hardware is present and the driver already loaded. hostdriver-select on a
+    # no-hardware variant raises HOST_DRIVER_NO_HARDWARE - and a host lists drivers for plenty of devices
+    # it doesn't have - so pick a driver for hardware this host actually has, and one of its variants
+    # that is usable (field "hw-present", not "hardware-present"): the first (driver, variant) pair,
+    # across all drivers sorted by name, whose variant reports present.
+    driver="" variant=""
+    for d in $sorted_drivers; do
+        for v in $(each_csv "$(xe hostdriver-variant-list driver-uuid=$d --minimal)"); do
+            if [ "$(xe hostdriver-variant-param-get uuid=$v param-name=hw-present)" = "true" ]; then
+                driver=$d; variant=$v; break 2
+            fi
+        done
     done
-    [ -n "$variant" ] || variant=$(first_csv "$variants")
+    if [ -z "$driver" ]; then
+        echo "no driver on $hname has a variant for hardware it has" >&2
+        return 1
+    fi
+    dname=$(xe hostdriver-param-get uuid=$driver param-name=name)
     variant_name=$(xe hostdriver-variant-param-get uuid=$variant param-name=name)
     xe hostdriver-select uuid=$driver variant-name="$variant_name"
     selected=$(xe hostdriver-param-get uuid=$driver param-name=selected-variant)

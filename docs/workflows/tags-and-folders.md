@@ -239,6 +239,21 @@ w_tags_and_folders() {
     xe vm-param-remove uuid=$vm param-name=other-config param-key=folder
     echo "OK: tags-and-folders"
 }
+
+# Introduce the pool's update repositories the way XenCenter does: the release's base packages
+# (update=false) and its update stream (update=true, which pool-sync-updates needs - otherwise
+# NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so these
+# are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}. Echoes both repository
+# uuids, one per line.
+introduce_update_repositories() {
+    local repo_url=$1 source_url=$2 stage
+    for stage in base normal; do
+        xe repository-introduce name-label="sdk-example-$stage" \
+            name-description="SDK example $stage repository" \
+            binary-url="$repo_url/$stage" source-url="$source_url/$stage" \
+            update=$([ "$stage" = base ] && echo false || echo true)
+    done
+}
 ```
 
 <details><summary>Sample output</summary>

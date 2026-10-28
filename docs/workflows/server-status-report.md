@@ -22,18 +22,23 @@ private static void ServerStatusReport(string url, string user, string password)
     // whether it may contain personal data, so a client can offer an informed choice rather than
     // hard-coding the list.
     var keys = new List<string>();
+    var defaults = new List<string>();
     foreach (var capability in XDocument.Parse(
                  Host.get_system_status_capabilities(session, host)).Root!.Elements())
     {
-        keys.Add((string)capability.Attribute("key")!);
-        Console.WriteLine($"  {(string)capability.Attribute("key")!,-22} "
+        var key = (string)capability.Attribute("key")!;
+        keys.Add(key);
+        if ((string)capability.Attribute("default-checked")! == "yes") defaults.Add(key);
+        Console.WriteLine($"  {key,-22} "
                           + $"max {(string)capability.Attribute("max-size")!,9} bytes  "
                           + $"default={(string)capability.Attribute("default-checked")!,-3} "
                           + $"pii={(string)capability.Attribute("pii")!}");
     }
 
-    var whole = FetchStatusReport(session, url, keys);
-    Console.WriteLine($"everything ({keys.Count} sections): {whole} bytes");
+    // Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+    // section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+    var whole = FetchStatusReport(session, url, defaults);
+    Console.WriteLine($"default sections ({defaults.Count} of {keys.Count}): {whole} bytes");
 
     // Pick a real, small section from the host's own catalogue rather than assuming a name: the
     // catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
@@ -48,16 +53,33 @@ private static void ServerStatusReport(string url, string user, string password)
     session.logout();
 }
 
-/// <summary>Download the bundle for the given capability keys (a tar archive) and report its size.</summary>
-private static int FetchStatusReport(Session session, string url, IEnumerable<string> entries)
+/// <summary>
+/// Download the bundle for the given capability keys (a tar archive) to a temp file, streaming it - a
+/// report can be large - and return its size. This example then deletes it; you'd keep it.
+/// </summary>
+private static long FetchStatusReport(Session session, string url, IEnumerable<string> entries)
 {
-    using var client = InsecureHttpClient();
-    // A full report (all sections) can take well over the default 5-minute client timeout on a real
-    // host with a lot to report on; this download alone gets a much longer allowance.
-    client.Timeout = TimeSpan.FromMinutes(30);
-    return client.GetByteArrayAsync(
-        $"{url}/system-status?session_id={session.opaque_ref}&output=tar"
-        + $"&entries={string.Join(",", entries)}").Result.Length;
+    var path = Path.Combine(Path.GetTempPath(), $"sdk-example-status-{Guid.NewGuid():N}.tar");
+    try
+    {
+        using var client = InsecureHttpClient();
+        // A full report (all sections) can take well over the default 5-minute client timeout on a
+        // real host with a lot to report on; this download alone gets a much longer allowance.
+        client.Timeout = TimeSpan.FromMinutes(30);
+        using var response = client.GetAsync(
+            $"{url}/system-status?session_id={session.opaque_ref}&output=tar"
+            + $"&entries={string.Join(",", entries)}",
+            HttpCompletionOption.ResponseHeadersRead).Result;
+        response.EnsureSuccessStatusCode();
+        using (var httpStream = response.Content.ReadAsStreamAsync().Result)
+        using (var fileStream = File.Create(path))
+            httpStream.CopyTo(fileStream);
+        return new FileInfo(path).Length;
+    }
+    finally
+    {
+        File.Delete(path);
+    }
 }
 // Run it:
 //   ServerStatusReport("https://xenserver", "root", password);
@@ -113,7 +135,7 @@ Status report for sdk-host1
   xapi                   max     16384 bytes  default=yes pii=yes
   xcp-rrdd-plugins       max  13107200 bytes  default=yes pii=maybe
   v6d                    max   1638400 bytes  default=yes pii=maybe
-everything (46 sections): 11264 bytes
+default sections (46 of 46): 11264 bytes
 firstboot only:   2048 bytes
 OK: server-status-report
 ```
@@ -139,23 +161,27 @@ def server_status_report(url, username, password):
     host = x.pool.get_master(x.pool.get_all()[0])
     print("Status report for %s" % x.host.get_name_label(host))
 
-    keys = []
+    keys, defaults = [], []
     for capability in ET.fromstring(x.host.get_system_status_capabilities(host)):
         keys.append(capability.get("key"))
+        if capability.get("default-checked") == "yes":
+            defaults.append(capability.get("key"))
         print("  %-22s max %9s bytes  default=%-3s pii=%s"
               % (capability.get("key"), capability.get("max-size"),
                  capability.get("default-checked"), capability.get("pii")))
 
-    whole = fetch_status_report(url, session, ctx, keys)
-    print("everything (%d sections): %d bytes" % (len(keys), len(whole)))
+    # Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+    # section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+    whole = fetch_status_report(url, session, ctx, defaults)
+    print("default sections (%d of %d): %d bytes" % (len(defaults), len(keys), whole))
 
     # Pick a real, small section from the host's own catalogue rather than assuming a name: the
     # catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
     # list, and "xenserver-config" isn't one of the real keys any host actually publishes.
     subset_key = next((k for k in keys if k in ("firstboot", "network-status")), keys[0])
     subset = fetch_status_report(url, session, ctx, [subset_key])
-    print("%s only:   %d bytes" % (subset_key, len(subset)))
-    if len(subset) >= len(whole):
+    print("%s only:   %d bytes" % (subset_key, subset))
+    if subset >= whole:
         print("  ERROR: selecting fewer sections did not produce a smaller bundle")
 
     print("OK: server-status-report")
@@ -163,11 +189,17 @@ def server_status_report(url, username, password):
 
 
 def fetch_status_report(url, session, ctx, entries):
-    """Download the bundle for the given capability keys (a tar archive)."""
+    """Download the bundle for the given capability keys (a tar archive) to a file, streaming it -
+    a report can be large - and return its size. This example then deletes it; you'd keep it."""
     request = "%s/system-status?session_id=%s&output=tar&entries=%s" \
               % (url, session._session, ",".join(entries))
-    with urllib.request.urlopen(request, context=ctx) as response:
-        return response.read()
+    handle, path = tempfile.mkstemp(prefix="sdk-example-status-", suffix=".tar")
+    try:
+        with os.fdopen(handle, "wb") as out, urllib.request.urlopen(request, context=ctx) as response:
+            shutil.copyfileobj(response, out, 1024 * 1024)
+        return os.path.getsize(path)
+    finally:
+        os.remove(path)
 # Run it:
 #   server_status_report("https://xenserver", "root", password)
 ```
@@ -222,7 +254,7 @@ Status report for sdk-host1
   xapi                   max     16384 bytes  default=yes pii=yes
   xcp-rrdd-plugins       max  13107200 bytes  default=yes pii=maybe
   v6d                    max   1638400 bytes  default=yes pii=maybe
-everything (46 sections): 11264 bytes
+default sections (46 of 46): 11264 bytes
 firstboot only:   2048 bytes
 OK: server-status-report
 ```
@@ -249,19 +281,25 @@ private static void serverStatusReport(String url, String user, String password)
                 host.getSystemStatusCapabilities(conn))))
             .getElementsByTagName("capability");
         java.util.List<String> keys = new java.util.ArrayList<>();
+        java.util.List<String> defaults = new java.util.ArrayList<>();
         for (int i = 0; i < capabilities.getLength(); i++) {
             org.w3c.dom.Element capability = (org.w3c.dom.Element) capabilities.item(i);
-            keys.add(capability.getAttribute("key"));
+            String key = capability.getAttribute("key");
+            keys.add(key);
+            if ("yes".equals(capability.getAttribute("default-checked"))) defaults.add(key);
             System.out.printf("  %-22s max %9s bytes  default=%-3s pii=%s%n",
-                capability.getAttribute("key"), capability.getAttribute("max-size"),
+                key, capability.getAttribute("max-size"),
                 capability.getAttribute("default-checked"), capability.getAttribute("pii"));
         }
 
         // The download is an HTTP transfer alongside the API, so the session id travels in the
         // query string.
         String session = conn.getSessionReference();
-        int whole = fetchStatusReport(url, session, keys);
-        System.out.printf("everything (%d sections): %d bytes%n", keys.size(), whole);
+        // Take the sections the host marks default-checked, as XenCenter's dialog does: asking for
+        // every section can mean gigabytes (VM memory dumps, every log) and a long wait while the
+        // host builds it.
+        long whole = fetchStatusReport(url, session, defaults);
+        System.out.printf("default sections (%d of %d): %d bytes%n", defaults.size(), keys.size(), whole);
 
         // Pick a real, small section from the host's own catalogue rather than assuming a name: the
         // catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
@@ -270,7 +308,7 @@ private static void serverStatusReport(String url, String user, String password)
         for (String k : keys) {
             if (k.equals("firstboot") || k.equals("network-status")) { subsetKey = k; break; }
         }
-        int subset = fetchStatusReport(url, session, java.util.Arrays.asList(subsetKey));
+        long subset = fetchStatusReport(url, session, java.util.Arrays.asList(subsetKey));
         System.out.printf("%s only:   %d bytes%n", subsetKey, subset);
         if (subset >= whole)
             System.out.println("  ERROR: selecting fewer sections did not produce a smaller bundle");
@@ -281,13 +319,28 @@ private static void serverStatusReport(String url, String user, String password)
     }
 }
 
-/** Downloads the bundle for the given capability keys (a tar archive) and reports its size. */
-private static int fetchStatusReport(String url, String session,
-                                     java.util.List<String> entries) throws Exception {
-    HttpGet get = new HttpGet(url + "/system-status?session_id=" + session + "&output=tar"
-        + "&entries=" + String.join(",", entries));
-    try (CloseableHttpClient http = trustingHttpClient()) {
-        return http.execute(get, resp -> EntityUtils.toByteArray(resp.getEntity())).length;
+/**
+ * Downloads the bundle for the given capability keys (a tar archive) to a temp file, streaming it -
+ * a report can be large - and returns its size. This example then deletes it; you'd keep it.
+ */
+private static long fetchStatusReport(String url, String session,
+                                      java.util.List<String> entries) throws Exception {
+    java.io.File file = java.io.File.createTempFile("sdk-example-status-", ".tar");
+    try {
+        HttpGet get = new HttpGet(url + "/system-status?session_id=" + session + "&output=tar"
+            + "&entries=" + String.join(",", entries));
+        try (CloseableHttpClient http = trustingHttpClient()) {
+            http.execute(get, resp -> {
+                try (java.io.InputStream in = resp.getEntity().getContent()) {
+                    java.nio.file.Files.copy(in, file.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+                return null;
+            });
+        }
+        return file.length();
+    } finally {
+        file.delete();
     }
 }
 // Run it:
@@ -344,7 +397,7 @@ Status report for sdk-host1
   xapi                   max     16384 bytes  default=yes pii=yes
   xcp-rrdd-plugins       max  13107200 bytes  default=yes pii=maybe
   v6d                    max   1638400 bytes  default=yes pii=maybe
-everything (46 sections): 11264 bytes
+default sections (46 of 46): 11264 bytes
 firstboot only:   2048 bytes
 OK: server-status-report
 ```
@@ -382,9 +435,12 @@ func serverStatusReport(url, user, password string) {
 		} `xml:"capability"`
 	}
 	check(xml.Unmarshal([]byte(capabilitiesXML), &catalogue))
-	var keys []string
+	var keys, defaults []string
 	for _, capability := range catalogue.Capabilities {
 		keys = append(keys, capability.Key)
+		if capability.DefaultChecked == "yes" {
+			defaults = append(defaults, capability.Key)
+		}
 		fmt.Printf("  %-22s max %9s bytes  default=%-3s pii=%s\n",
 			capability.Key, capability.MaxSize, capability.DefaultChecked, capability.Pii)
 	}
@@ -392,8 +448,10 @@ func serverStatusReport(url, user, password string) {
 	// The download is an HTTP transfer alongside the API, so the session id travels in the query string.
 	// The Go binding keeps its own session private, so obtain one of our own.
 	sid := rawLogin(url, user, password)
-	whole := fetchStatusReport(url, sid, keys)
-	fmt.Printf("everything (%d sections): %d bytes\n", len(keys), whole)
+	// Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+	// section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+	whole := fetchStatusReport(url, sid, defaults)
+	fmt.Printf("default sections (%d of %d): %d bytes\n", len(defaults), len(keys), whole)
 
 	// Pick a real, small section from the host's own catalogue rather than assuming a name: the
 	// catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
@@ -414,15 +472,23 @@ func serverStatusReport(url, user, password string) {
 	fmt.Println("OK: server-status-report")
 }
 
-// fetchStatusReport downloads the bundle for the given capability keys (a tar archive) and sizes it.
+// fetchStatusReport downloads the bundle for the given capability keys (a tar archive) to a temp file,
+// streaming it - a report can be large - and returns its size. This example then deletes it; you'd keep it.
 func fetchStatusReport(url, sid string, entries []string) int {
 	resp, err := insecureClient().Get(fmt.Sprintf("%s/system-status?session_id=%s&output=tar&entries=%s",
 		url, sid, strings.Join(entries, ",")))
 	check(err)
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+
+	temp, err := os.CreateTemp("", "sdk-example-status-*.tar")
 	check(err)
-	return len(body)
+	path := temp.Name()
+	defer os.Remove(path)
+
+	written, err := io.Copy(temp, resp.Body)
+	check(err)
+	temp.Close()
+	return int(written)
 }
 
 // Run it:
@@ -479,7 +545,7 @@ Status report for sdk-host1
   xapi                   max     16384 bytes  default=yes pii=yes
   xcp-rrdd-plugins       max  13107200 bytes  default=yes pii=maybe
   v6d                    max   1638400 bytes  default=yes pii=maybe
-everything (46 sections): 11264 bytes
+default sections (46 of 46): 11264 bytes
 firstboot only:   2048 bytes
 OK: server-status-report
 ```
@@ -510,16 +576,20 @@ function Invoke-ServerStatusReport {
     # host's verbs, and this is not one of them.
     $catalogue = [xml](Get-XenHostProperty -XenHost $xenHost -XenProperty SystemStatusCapabilities)
     $keys = @()
+    $defaults = @()
     foreach ($capability in $catalogue.'system-status-capabilities'.capability) {
         $keys += $capability.key
+        if ($capability.'default-checked' -eq 'yes') { $defaults += $capability.key }
         Write-Host ("  {0,-22} max {1,9} bytes  default={2,-3} pii={3}" -f
             $capability.key, $capability.'max-size', $capability.'default-checked', $capability.pii)
     }
 
     # The download is an HTTP transfer alongside the API, so the session id travels in the query string.
     # Still pure PowerShell: Connect-Example has already trusted the server's certificate.
-    $whole = Get-StatusReportSize -Url $Url -Session $session -Entries $keys
-    Write-Host ("everything ({0} sections): {1} bytes" -f $keys.Count, $whole)
+    # Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+    # section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+    $whole = Get-StatusReportSize -Url $Url -Session $session -Entries $defaults
+    Write-Host ("default sections ({0} of {1}): {2} bytes" -f $defaults.Count, $keys.Count, $whole)
 
     # Pick a real, small section from the host's own catalogue rather than assuming a name: the
     # catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client list,
@@ -537,12 +607,19 @@ function Invoke-ServerStatusReport {
 }
 
 function Get-StatusReportSize {
-    # Downloads the bundle for the given capability keys (a tar archive) and reports its size.
+    # Downloads the bundle for the given capability keys (a tar archive) to a temp file, streaming it - a
+    # report can be large - and returns its size. This example then deletes it; you'd keep it.
     param([string]$Url, $Session, [string[]]$Entries)
-    $response = Invoke-WebRequest -UseBasicParsing `
-        -Uri ("$Url/system-status?session_id=$($Session.opaque_ref)&output=tar" +
-              "&entries=$($Entries -join ',')")
-    $response.Content.Length
+    $path = Join-Path ([IO.Path]::GetTempPath()) "sdk-example-status-$([guid]::NewGuid().Guid).tar"
+    try {
+        Invoke-WebRequest -UseBasicParsing -OutFile $path `
+            -Uri ("$Url/system-status?session_id=$($Session.opaque_ref)&output=tar" +
+                  "&entries=$($Entries -join ',')")
+        (Get-Item $path).Length
+    }
+    finally {
+        Remove-Item $path -ErrorAction SilentlyContinue
+    }
 }
 # Run it:
 #   Invoke-ServerStatusReport -Url https://xenserver -UserName root -Password $password
@@ -598,7 +675,7 @@ Status report for sdk-host1
   xapi                   max     16384 bytes  default=yes pii=yes
   xcp-rrdd-plugins       max  13107200 bytes  default=yes pii=maybe
   v6d                    max   1638400 bytes  default=yes pii=maybe
-everything (46 sections): 11264 bytes
+default sections (46 of 46): 11264 bytes
 firstboot only:   2048 bytes
 OK: server-status-report
 ```
@@ -619,6 +696,7 @@ w_server_status_report() {
     # whether it may contain personal data, so you can decide what to collect before collecting it.
     capabilities=$(xe host-get-system-status-capabilities uuid=$target)
     keys=""
+    defaults=""
     # Split the XML on '<' with bash's own field splitting rather than spawning a parser: each element
     # starts a field, and the ones we want begin `capability key="..."`.
     old_ifs=$IFS; IFS='<'
@@ -627,18 +705,22 @@ w_server_status_report() {
             capability\ *)
                 key=$(xml_attr "$element" key)
                 keys="${keys:+$keys,}$key"
+                default_checked=$(xml_attr "$element" default-checked)
+                [ "$default_checked" = "yes" ] && defaults="${defaults:+$defaults,}$key"
                 printf '  %-22s max %9s bytes  default=%-3s pii=%s\n' \
                     "$key" "$(xml_attr "$element" max-size)" \
-                    "$(xml_attr "$element" default-checked)" "$(xml_attr "$element" pii)"
+                    "$default_checked" "$(xml_attr "$element" pii)"
                 ;;
         esac
     done
     IFS=$old_ifs
 
     rm -f cli-status-all.tar cli-status-config.tar
-    xe host-get-system-status uuid=$target filename=cli-status-all.tar entries="$keys"
+    # Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+    # section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+    xe host-get-system-status uuid=$target filename=cli-status-all.tar entries="$defaults"
     whole=$(stat -c %s cli-status-all.tar)
-    echo "everything ($(count_csv "$keys") sections): $whole bytes"
+    echo "default sections ($(count_csv "$defaults") of $(count_csv "$keys")): $whole bytes"
 
     # Pick a real, small section from the host's own catalogue rather than assuming a name: the catalogue
     # is server-defined (xen-bugtool's own --capabilities output), not a fixed client list, and
@@ -713,7 +795,7 @@ Status report for sdk-host1
   xapi                   max     16384 bytes  default=yes pii=yes
   xcp-rrdd-plugins       max  13107200 bytes  default=yes pii=maybe
   v6d                    max   1638400 bytes  default=yes pii=maybe
-everything (46 sections): 11264 bytes
+default sections (46 of 46): 11264 bytes
 firstboot only:   2048 bytes
 OK: server-status-report
 ```

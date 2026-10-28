@@ -34,12 +34,13 @@ private static void RestartHost(string url, string user, string password)
     Console.WriteLine($"  evacuated:  guests={GuestCount(session, host)}");
 
     Host.reboot(session, host);
-    // A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long as
-    // XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the reboot
-    // to get underway, then explicitly re-enables - disabling does not clear itself, not even across
-    // a reboot, so nothing else re-enables the host for us.
-    System.Threading.Thread.Sleep(5000);
-    Host.enable(session, host);
+    // A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+    // host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+    // itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+    // never does - so enable it explicitly rather than depend on either.
+    WaitForHostLive(session, host, false, 600);
+    WaitForHostLive(session, host, true, 1200, 10);
+    EnableWhenBooted(session, host);
     Console.WriteLine($"  rebooted, re-enabled: enabled={Host.get_enabled(session, host)}");
 
     // The other ending: off, and back on out of band - but only demonstrated if that is actually
@@ -52,9 +53,9 @@ private static void RestartHost(string url, string user, string password)
         WaitForHostLive(session, host, false);
         Console.WriteLine($"  shut down:  live={HostLive(session, host)}");
         Host.power_on(session, host);
-        WaitForHostLive(session, host, true);
+        WaitForHostLive(session, host, true, 1200, 10);
         Console.WriteLine($"  powered on: live={HostLive(session, host)}");
-        Host.enable(session, host);
+        EnableWhenBooted(session, host);
         Console.WriteLine($"  re-enabled: enabled={Host.get_enabled(session, host)}");
     }
     else
@@ -98,8 +99,8 @@ def restart_host(url, username, password):
 
     Rebooting a host is never just the reboot: anything running on it has to go
     somewhere first, and the host has to stop accepting new VMs while that happens.
-    Disable, evacuate, reboot, re-enable -- disabling does not clear itself, not even across a
-    reboot, so an explicit enable is the only thing that brings the host back into service.
+    Disable, evacuate, reboot, re-enable. Disabling with the default auto_enable=true clears itself
+    once the host's toolstack is back up; an explicit enable doesn't depend on that, or on when.
     Powering it right off and back on again is a second, separate demonstration, and only a
     meaningful one if the host actually has an out-of-band power-on mode configured: a real
     host.power_on has no retry of its own and simply fails if none is set up, leaving the host off
@@ -125,12 +126,13 @@ def restart_host(url, username, password):
     print("  evacuated:  guests=%d" % guest_count(x, host))
 
     x.host.reboot(host)
-    # A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long
-    # as XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the
-    # reboot to get underway, then explicitly re-enables -- nothing does that for us, not even the
-    # reboot itself.
-    time.sleep(5)
-    x.host.enable(host)
+    # A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+    # host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+    # itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+    # never does - so enable it explicitly rather than depend on either.
+    _wait_for_host_live(x, host, False, timeout=600)
+    _wait_for_host_live(x, host, True, timeout=1200, interval=10)
+    _enable_when_booted(x, host)
     print("  rebooted, re-enabled: enabled=%s" % x.host.get_enabled(host))
 
     # The other ending: off, and back on out of band -- but only demonstrated if that is actually
@@ -141,9 +143,9 @@ def restart_host(url, username, password):
         _wait_for_host_live(x, host, False)
         print("  shut down:  live=%s" % host_live(x, host))
         x.host.power_on(host)
-        _wait_for_host_live(x, host, True)
+        _wait_for_host_live(x, host, True, timeout=1200, interval=10)
         print("  powered on: live=%s" % host_live(x, host))
-        x.host.enable(host)
+        _enable_when_booted(x, host)
         print("  re-enabled: enabled=%s" % x.host.get_enabled(host))
     else:
         print("  skipping shutdown/power-on: no out-of-band power-on mode is configured on this host")
@@ -206,12 +208,13 @@ private static void restartHost(String url, String user, String password) throws
         System.out.printf("  evacuated:  guests=%d%n", guestCount(conn, host));
 
         host.reboot(conn);
-        // A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as
-        // long as XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough
-        // for the reboot to get underway, then explicitly re-enables - nothing does that for us, not
-        // even the reboot itself: disabling does not clear itself, not even across a reboot.
-        Thread.sleep(5000);
-        host.enable(conn);
+        // A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+        // host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+        // itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+        // never does - so enable it explicitly rather than depend on either.
+        waitForHostLive(conn, host, false, 600_000, 2_000);
+        waitForHostLive(conn, host, true, 1_200_000, 10_000);
+        enableWhenBooted(conn, host);
         System.out.println("  rebooted, re-enabled: enabled=" + host.getEnabled(conn));
 
         // The other ending: off, and back on out of band - but only demonstrated if that is actually
@@ -224,9 +227,9 @@ private static void restartHost(String url, String user, String password) throws
             waitForHostLive(conn, host, false);
             System.out.println("  shut down:  live=" + host.getMetrics(conn).getLive(conn));
             host.powerOn(conn);
-            waitForHostLive(conn, host, true);
+            waitForHostLive(conn, host, true, 1_200_000, 10_000);
             System.out.println("  powered on: live=" + host.getMetrics(conn).getLive(conn));
-            host.enable(conn);
+            enableWhenBooted(conn, host);
             System.out.println("  re-enabled: enabled=" + host.getEnabled(conn));
         } else {
             System.out.println("  skipping shutdown/power-on: no out-of-band power-on mode is "
@@ -304,12 +307,13 @@ func restartHost(url, user, password string) {
 	fmt.Printf("  evacuated:  guests=%d\n", guestCount(session, host))
 
 	check(xenapi.Host.Reboot(session, host))
-	// A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long
-	// as XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the
-	// reboot to get underway, then explicitly re-enables - disabling does not clear itself, not even
-	// across a reboot, so nothing else brings the host back into service.
-	time.Sleep(5 * time.Second)
-	check(xenapi.Host.Enable(session, host))
+	// A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+	// host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+	// itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+	// never does - so enable it explicitly rather than depend on either.
+	waitForHostLiveTimeout(session, host, false, 600*time.Second, 2*time.Second)
+	waitForHostLiveTimeout(session, host, true, 1200*time.Second, 10*time.Second)
+	enableWhenBooted(session, host)
 	enabled, _ = xenapi.Host.GetEnabled(session, host)
 	fmt.Printf("  rebooted, re-enabled: enabled=%t\n", enabled)
 
@@ -323,9 +327,9 @@ func restartHost(url, user, password string) {
 		waitForHostLive(session, host, false)
 		fmt.Printf("  shut down:  live=%t\n", hostLive(session, host))
 		check(xenapi.Host.PowerOn(session, host))
-		waitForHostLive(session, host, true)
+		waitForHostLiveTimeout(session, host, true, 1200*time.Second, 10*time.Second)
 		fmt.Printf("  powered on: live=%t\n", hostLive(session, host))
-		check(xenapi.Host.Enable(session, host))
+		enableWhenBooted(session, host)
 		enabled, _ = xenapi.Host.GetEnabled(session, host)
 		fmt.Printf("  re-enabled: enabled=%t\n", enabled)
 	} else {
@@ -405,13 +409,13 @@ function Invoke-RestartHost {
     Write-Host "  evacuated:  guests=$(Measure-HostGuest $xenHost)"
 
     $xenHost | Invoke-XenHost -XenAction Reboot
-    # A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long as
-    # XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the reboot to
-    # get underway, then explicitly re-enables - nothing else does that for us, not even the reboot
-    # itself: disabling does not clear itself, not even across a reboot (host_auto_enable /
-    # host_disabled_until_reboot are cleared only by an explicit Enable call).
-    Start-Sleep -Seconds 5
-    $xenHost | Invoke-XenHost -XenAction Enable
+    # A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+    # host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+    # itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+    # never does - so enable it explicitly rather than depend on either.
+    Wait-HostLive -XenHost $xenHost -Want $false -TimeoutSeconds 600
+    Wait-HostLive -XenHost $xenHost -Want $true -TimeoutSeconds 1200 -IntervalSeconds 10
+    Enable-WhenBooted -XenHost $xenHost
     Write-Host "  rebooted, re-enabled: enabled=$((Get-XenHost -Ref $xenHost.opaque_ref).enabled)"
 
     # The other ending: off, and back on out of band - but only demonstrated if that is actually
@@ -424,9 +428,9 @@ function Invoke-RestartHost {
         Wait-HostLive -XenHost $xenHost -Want $false
         Write-Host "  shut down:  live=$(Get-HostLive $xenHost)"
         $xenHost | Invoke-XenHost -XenAction PowerOn
-        Wait-HostLive -XenHost $xenHost -Want $true
+        Wait-HostLive -XenHost $xenHost -Want $true -TimeoutSeconds 1200 -IntervalSeconds 10
         Write-Host "  powered on: live=$(Get-HostLive $xenHost)"
-        $xenHost | Invoke-XenHost -XenAction Enable
+        Enable-WhenBooted -XenHost $xenHost
         Write-Host "  re-enabled: enabled=$((Get-XenHost -Ref $xenHost.opaque_ref).enabled)"
     }
     else {
@@ -506,12 +510,13 @@ w_restart_host() {
     echo "  evacuated:  guests=$(count_host_guest $target)"
 
     xe host-reboot uuid=$target
-    # A real reboot takes minutes; a production tool would poll host-metrics-live/boot_time for as long as
-    # XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the reboot to
-    # get underway, then explicitly re-enables - nothing else re-enables a host that was explicitly
-    # disabled, not even the reboot itself.
-    sleep 5
-    xe host-enable uuid=$target
+    # A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+    # host-metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+    # itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+    # never does - so enable it explicitly rather than depend on either.
+    wait_for_host_live "$target" false 600
+    wait_for_host_live "$target" true 1200 10
+    enable_when_booted "$target"
     echo "  rebooted, re-enabled: enabled=$(xe host-param-get uuid=$target param-name=enabled)"
 
     # The other ending: off, and back on out of band - but only demonstrated if that is actually
@@ -523,9 +528,9 @@ w_restart_host() {
         wait_for_host_live "$target" false
         echo "  shut down:  live=$(host_live $target)"
         xe host-power-on uuid=$target
-        wait_for_host_live "$target" true
+        wait_for_host_live "$target" true 1200 10
         echo "  powered on: live=$(host_live $target)"
-        xe host-enable uuid=$target
+        enable_when_booted "$target"
         echo "  re-enabled: enabled=$(xe host-param-get uuid=$target param-name=enabled)"
     else
         echo "  skipping shutdown/power-on: no out-of-band power-on mode is configured on this host"
@@ -536,13 +541,13 @@ w_restart_host() {
 # Resident VMs excluding the control domain, which never moves.
 count_host_guest() {
     local n=0
-    for vm in $(each_csv "$(xe host-param-get uuid=$1 param-name=resident-VMs)"); do
+    for vm in $(each_csv "$(set_to_csv "$(xe host-param-get uuid=$1 param-name=resident-VMs)")"); do
         if [ "$(xe vm-param-get uuid=$vm param-name=is-control-domain)" != "true" ]; then n=$((n + 1)); fi
     done
     echo $n
 }
 
-host_live() { xe host-metrics-param-get uuid=$(xe host-param-get uuid=$1 param-name=metrics) param-name=live; }
+host_live() { xe host-param-get uuid=$1 param-name=host-metrics-live; }
 ```
 
 <details><summary>Sample output</summary>

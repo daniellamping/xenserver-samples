@@ -358,8 +358,9 @@ OK: manage-sr-lifecycle
 
 ```bash
 w_manage_sr_lifecycle() {
-    sr=$(xe sr-create name-label=cli-example-lifecycle type=nfs content-type=user shared=true \
-        device-config:server=192.0.2.10 device-config:serverpath=/export/spare device-config:nfsversion=3)
+    sr=$(xe sr-create name-label=xe-example-lifecycle type=nfs content-type=user shared=true \
+        device-config:server="$(param nfs_server 192.0.2.10)" \
+        device-config:serverpath="$(param nfs_path /export/spare)" device-config:nfsversion=3)
 
     # There is no sr-detach: a shared SR is joined to each host by one PBD, and detaching the SR means
     # unplugging every one of them. That is why an SR can be attached on some hosts and not others.
@@ -397,7 +398,7 @@ count_attached_pbd() {
 <details><summary>Sample output</summary>
 
 ```text
-cli-example-lifecycle: connected on 2 of 2 host(s)
+xe-example-lifecycle: connected on 2 of 2 host(s)
   detached:   connected on 0 host(s)
   reattached: connected on 2 host(s)
   rescanned:  0 disk(s)

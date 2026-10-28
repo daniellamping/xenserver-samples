@@ -255,7 +255,7 @@ w_manage_vm_groups() {
 
     # Membership is written from the VM side, and read back from the group side.
     xe vm-param-set uuid=$vm groups=$group
-    echo "Group members:  $(count_csv "$(xe vm-group-param-get uuid=$group param-name=vm-uuids)")"
+    echo "Group members:  $(count_csv "$(set_to_csv "$(xe vm-group-param-get uuid=$group param-name=vm-uuids)")")"
 
     # vm-group-destroy already clears the group from every member VM on its own - no need to remove
     # membership ourselves first.
@@ -267,7 +267,7 @@ w_manage_vm_groups() {
 <details><summary>Sample output</summary>
 
 ```text
-Created group:  00000001-0000-0000-280a-000000000000
+Created group:  00000001-0000-0000-100a-000000000000
 Group members:  0
 OK: manage-vm-groups
 ```

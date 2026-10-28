@@ -28,12 +28,17 @@ private static void ManageDriverVariants(string url, string user, string passwor
 
     // Select a variant explicitly. It becomes the selected one immediately; whether it is also
     // active depends on whether the hardware is present and the driver already loaded.
-    // Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
-    // and variant order isn't guaranteed to put the usable one first.
-    var (chosenRef, chosen) = drivers[0];
-    var variant = chosen.variants
-        .FirstOrDefault(v => Driver_variant.get_hardware_present(session, v.opaque_ref))
-        ?.opaque_ref ?? chosen.variants[0].opaque_ref;
+    // Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE) -
+    // and a host lists drivers for plenty of devices it doesn't have - so pick a driver for
+    // hardware this host actually has, and one of its variants that is usable.
+    var usable = drivers
+        .SelectMany(kv => kv.Value.variants.Select(v => (driverRef: kv.Key, variant: v)))
+        .Where(p => Driver_variant.get_hardware_present(session, p.variant.opaque_ref))
+        .ToList();
+    if (usable.Count == 0)
+        throw new Exception($"no driver on {Host.get_name_label(session, host)} has a variant for hardware it has");
+    var (chosenRef, chosenVariant) = usable[0];
+    var variant = chosenVariant.opaque_ref;
     Host_driver.select(session, chosenRef.opaque_ref, variant);
     var after = Host_driver.get_record(session, chosenRef.opaque_ref);
     Console.WriteLine($"  {after.name}: selected {VariantName(session, after.selected_variant.opaque_ref)}, " +
@@ -87,11 +92,14 @@ def manage_driver_variants(url, username, password):
 
     # Select a variant explicitly. It becomes the selected one immediately; whether it is also
     # active depends on whether the hardware is present and the driver already loaded.
-    # Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
-    # and variant order isn't guaranteed to put the usable one first.
-    ref, driver = sorted(drivers.items(), key=lambda kv: kv[1]["name"])[0]
-    variant = next((v for v in driver["variants"] if x.Driver_variant.get_hardware_present(v)),
-                   driver["variants"][0])
+    # Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE) -
+    # and a host lists drivers for plenty of devices it doesn't have - so pick a driver for hardware
+    # this host actually has, and one of its variants that is usable.
+    usable = [(ref, v) for ref, d in sorted(drivers.items(), key=lambda kv: kv[1]["name"])
+              for v in d["variants"] if x.Driver_variant.get_hardware_present(v)]
+    if not usable:
+        raise RuntimeError("no driver on %s has a variant for hardware it has" % x.host.get_name_label(host))
+    ref, variant = usable[0]
     x.Host_driver.select(ref, variant)
     after = x.Host_driver.get_record(ref)
     print("  %s: selected %s, active %s"
@@ -147,16 +155,26 @@ private static void manageDriverVariants(String url, String user, String passwor
 
         // Select a variant explicitly. It becomes the selected one immediately; whether it is also
         // active depends on whether the hardware is present and the driver already loaded.
-        // Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
-        // and variant order isn't guaranteed to put the usable one first.
-        Map.Entry<HostDriver, HostDriver.Record> first = drivers.get(0);
+        // Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE)
+        // - and a host lists drivers for plenty of devices it doesn't have - so pick a driver for
+        // hardware this host actually has, and one of its variants that is usable.
+        HostDriver driverRef = null;
         DriverVariant variant = null;
-        for (DriverVariant candidate : first.getValue().variants) {
-            if (candidate.getHardwarePresent(conn)) { variant = candidate; break; }
+        outer:
+        for (Map.Entry<HostDriver, HostDriver.Record> e : drivers) {
+            for (DriverVariant candidate : e.getValue().variants) {
+                if (candidate.getHardwarePresent(conn)) {
+                    driverRef = e.getKey();
+                    variant = candidate;
+                    break outer;
+                }
+            }
         }
-        if (variant == null) variant = first.getValue().variants.iterator().next();
-        first.getKey().select(conn, variant);
-        HostDriver.Record after = first.getKey().getRecord(conn);
+        if (driverRef == null)
+            throw new RuntimeException("no driver on " + host.getNameLabel(conn)
+                    + " has a variant for hardware it has");
+        driverRef.select(conn, variant);
+        HostDriver.Record after = driverRef.getRecord(conn);
         System.out.printf("  %s: selected %s, active %s%n",
             after.name, variantName(conn, after.selectedVariant), variantName(conn, after.activeVariant));
 
@@ -235,19 +253,28 @@ func manageDriverVariants(url, user, password string) {
 
 	// Select a variant explicitly. It becomes the selected one immediately; whether it is also active
 	// depends on whether the hardware is present and the driver already loaded.
-	// Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
-	// and variant order isn't guaranteed to put the usable one first - pick the first one that
-	// reports its hardware present, falling back to the first variant only if none do.
-	first := refs[0]
-	variant := drivers[first].Variants[0]
-	for _, v := range drivers[first].Variants {
-		if present, _ := xenapi.DriverVariant.GetHardwarePresent(session, v); present {
-			variant = v
+	// Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE) -
+	// and a host lists drivers for plenty of devices it doesn't have - so pick a driver for hardware
+	// this host actually has, and one of its variants that is usable.
+	var chosenDriver xenapi.HostDriverRef
+	var chosenVariant xenapi.DriverVariantRef
+	found := false
+	for _, ref := range refs {
+		for _, v := range drivers[ref].Variants {
+			if present, _ := xenapi.DriverVariant.GetHardwarePresent(session, v); present {
+				chosenDriver, chosenVariant, found = ref, v, true
+				break
+			}
+		}
+		if found {
 			break
 		}
 	}
-	check(xenapi.HostDriver.Select(session, first, variant))
-	after, err := xenapi.HostDriver.GetRecord(session, first)
+	if !found {
+		panic(fmt.Sprintf("no driver on %s has a variant for hardware it has", hostName))
+	}
+	check(xenapi.HostDriver.Select(session, chosenDriver, chosenVariant))
+	after, err := xenapi.HostDriver.GetRecord(session, chosenDriver)
 	check(err)
 	fmt.Printf("  %s: selected %s, active %s\n",
 		after.Name, variantName(session, after.SelectedVariant), variantName(session, after.ActiveVariant))
@@ -307,13 +334,17 @@ function Invoke-ManageDriverVariants {
 
     # Select a variant explicitly. It becomes the selected one immediately; whether it is also active
     # depends on whether the hardware is present and the driver already loaded. Host_driver.select
-    # refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE), and variant order isn't
-    # guaranteed to put the usable one first - pick the first one that reports present, falling back to
-    # variants[0] only if none do.
-    $target = $drivers | Sort-Object name | Select-Object -First 1
-    $variant = $target.variants |
-        Where-Object { (Get-XenDriverVariant -Ref $_.opaque_ref).hardware_present } | Select-Object -First 1
-    if (-not $variant) { $variant = $target.variants[0] }
+    # refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE) - and a host lists
+    # drivers for plenty of devices it doesn't have - so pick a driver for hardware this host actually
+    # has, and one of its variants that is usable.
+    $usable = @($drivers | Sort-Object name | ForEach-Object {
+        $driver = $_
+        $driver.variants | Where-Object { (Get-XenDriverVariant -Ref $_.opaque_ref).hardware_present } |
+            ForEach-Object { [pscustomobject]@{ Driver = $driver; Variant = $_ } }
+    })
+    if (-not $usable) { throw "no driver on $($xenHost.name_label) has a variant for hardware it has" }
+    $target = $usable[0].Driver
+    $variant = $usable[0].Variant
     Invoke-XenHostDriver -Ref $target.opaque_ref -XenAction Select -Variant $variant
     $after = Get-XenHostDriver -Ref $target.opaque_ref
     Write-Host "  $($after.name): selected $(Get-DriverVariantName $after.selected_variant), active $(Get-DriverVariantName $after.active_variant)"
@@ -356,11 +387,17 @@ w_manage_driver_variants() {
     drivers=$(xe hostdriver-list host-uuid=$host_uuid --minimal)
     echo "$hname has $(count_csv "$drivers") driver(s)"
 
+    # Sort by name (one xe call per driver to read it, same as the pairs read below) so the printed
+    # order and the selection below agree.
+    sorted_drivers=$( (for d in $(each_csv "$drivers"); do
+        printf '%s\t%s\n' "$(xe hostdriver-param-get uuid=$d param-name=name)" "$d"
+    done) | sort | cut -f2)
+
     # hostdriver-param-get has no "variants-uuid" field (only "variants", a printable name/version
     # summary) - the actual Driver_variant records behind it are found the normal CLI way, with the
     # generic hostdriver-variant-list filtered on driver-uuid=.
     n=0
-    for d in $(each_csv "$drivers"); do
+    for d in $sorted_drivers; do
         n=$((n + 1)); [ "$n" -gt 3 ] && break
         dname=$(xe hostdriver-param-get uuid=$d param-name=name)
         dtype=$(xe hostdriver-param-get uuid=$d param-name=type)
@@ -369,21 +406,25 @@ w_manage_driver_variants() {
         printf '  %-14s %-10s %d variant(s), active=%s\n' "$dname" "$dtype" "$nvariants" "${active:-(none)}"
     done
 
-    # Select a variant explicitly. It becomes the selected one immediately; whether it is also
-    # active depends on whether the hardware is present and the driver already loaded.
-    driver=$(first_csv "$drivers")
-    dname=$(xe hostdriver-param-get uuid=$driver param-name=name)
-    # Don't blindly pick the first variant: hostdriver-select on a no-hardware variant raises
-    # HOST_DRIVER_NO_HARDWARE, so pick the first one whose hardware is actually present (field "hw-present",
-    # not "hardware-present"), falling back to the first variant only if none report present.
-    variants=$(xe hostdriver-variant-list driver-uuid=$driver --minimal)
-    variant=""
-    for v in $(each_csv "$variants"); do
-        if [ "$(xe hostdriver-variant-param-get uuid=$v param-name=hw-present)" = "true" ]; then
-            variant=$v; break
-        fi
+    # Select a variant explicitly. It becomes the selected one immediately; whether it is also active
+    # depends on whether the hardware is present and the driver already loaded. hostdriver-select on a
+    # no-hardware variant raises HOST_DRIVER_NO_HARDWARE - and a host lists drivers for plenty of devices
+    # it doesn't have - so pick a driver for hardware this host actually has, and one of its variants
+    # that is usable (field "hw-present", not "hardware-present"): the first (driver, variant) pair,
+    # across all drivers sorted by name, whose variant reports present.
+    driver="" variant=""
+    for d in $sorted_drivers; do
+        for v in $(each_csv "$(xe hostdriver-variant-list driver-uuid=$d --minimal)"); do
+            if [ "$(xe hostdriver-variant-param-get uuid=$v param-name=hw-present)" = "true" ]; then
+                driver=$d; variant=$v; break 2
+            fi
+        done
     done
-    [ -n "$variant" ] || variant=$(first_csv "$variants")
+    if [ -z "$driver" ]; then
+        echo "no driver on $hname has a variant for hardware it has" >&2
+        return 1
+    fi
+    dname=$(xe hostdriver-param-get uuid=$driver param-name=name)
     variant_name=$(xe hostdriver-variant-param-get uuid=$variant param-name=name)
     xe hostdriver-select uuid=$driver variant-name="$variant_name"
     selected=$(xe hostdriver-param-get uuid=$driver param-name=selected-variant)
@@ -397,10 +438,10 @@ w_manage_driver_variants() {
 
 ```text
 sdk-host1 has 5 driver(s)
+  ahci           storage    1 variant(s), active=00000001-0000-0000-4900-000000000000
   bnxt_en        network    1 variant(s), active=00000001-0000-0000-4300-000000000000
   i40e           network    1 variant(s), active=(none)
-  megaraid_sas   storage    1 variant(s), active=00000001-0000-0000-4700-000000000000
-  bnxt_en: selected 00000001-0000-0000-4300-000000000000, active 00000001-0000-0000-4300-000000000000
+  ahci: selected 00000001-0000-0000-4900-000000000000, active 00000001-0000-0000-4900-000000000000
 OK: manage-driver-variants
 ```
 

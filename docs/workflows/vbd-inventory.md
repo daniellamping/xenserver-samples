@@ -194,7 +194,7 @@ OK: vbd-inventory
 w_vbd_inventory() {
     vm=$(vm_uuid db-01)
     echo "Disks of db-01:"
-    vbds=$(xe vm-param-get uuid=$vm param-name=VBDs --minimal)
+    vbds=$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=VBDs)")
     for vbd in ${vbds//,/ }; do
         if [ "$(xe vbd-param-get uuid=$vbd param-name=type)" = "Disk" ]; then
             vdi=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid)

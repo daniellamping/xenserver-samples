@@ -9,18 +9,17 @@ Workflow `apply-update`. [All workflows](README.md) · [Connecting](connecting.m
 ## C# (.NET)
 
 ```csharp
-private static void ApplyUpdate(string url, string user, string password)
+private static void ApplyUpdate(string url, string user, string password, string repoUrl, string sourceUrl)
 {
     var session = Connect(url, user, password);
     // pool.sync_updates needs at least one repository with update=true enabled
     // (NO_REPOSITORY_ENABLED otherwise) - introduce and attach a throwaway one, and forget it again
     // afterwards.
     var pool = Pool.get_all(session)[0].opaque_ref;
-    var repo = Repository.introduce(session, "sdk-cdn", "SDK example repository",
-        "https://cdn.example/base", "https://cdn.example/source", true, "").opaque_ref;
+    var repos = IntroduceUpdateRepositories(session, repoUrl, sourceUrl);
     // Remember the pool's own repositories, to put them back afterwards.
     var previous = Pool.get_repositories(session, pool);
-    Pool.set_repositories(session, pool, new List<XenRef<Repository>> { new(repo) });
+    Pool.set_repositories(session, pool, repos);
     try
     {
         // Sync the pool's update metadata; the returned hash identifies the synced set.
@@ -50,22 +49,34 @@ private static void ApplyUpdate(string url, string user, string password)
                               $"[{string.Join(", ", guidance)}]");
             // Modern xapi (>=23.18.0) doesn't reboot a host for you: it only records pending_guidances,
             // so only reboot (or restart the toolstack) when the applied batch actually asks for it.
-            if (guidance.Contains(update_guidances.reboot_host))
-                Host.reboot(session, hostRef.opaque_ref);
-            else if (guidance.Contains(update_guidances.restart_toolstack))
-                Host.restart_agent(session, hostRef.opaque_ref);
+            if (guidance.Contains(update_guidances.reboot_host) ||
+                guidance.Contains(update_guidances.restart_toolstack))
+            {
+                // As in rolling-pool-update: either restart returns before it has happened, and the
+                // coordinator's takes this session with it - so wait for it, reconnecting.
+                var rebooting = guidance.Contains(update_guidances.reboot_host);
+                var key = rebooting ? "boot_time" : "agent_start_time";
+                Host.get_other_config(session, hostRef.opaque_ref).TryGetValue(key, out var before);
+                if (rebooting) Host.reboot(session, hostRef.opaque_ref);
+                else Host.restart_agent(session, hostRef.opaque_ref);
+                session = WaitForRestart(url, user, password, host.uuid, key, before);
+            }
+            // apply_updates disables the host while it works (auto_enable: a restart puts it back) -
+            // with no restart to do, nothing re-enables it. Return it to service either way.
+            EnableWhenBooted(session, hostRef.opaque_ref);
         }
     }
     finally
     {
         Pool.set_repositories(session, pool, previous);
-        Repository.forget(session, repo);
+        foreach (var repo in repos) Repository.forget(session, repo.opaque_ref);
     }
     Console.WriteLine("OK: apply-update");
     session.logout();
 }
 // Run it:
-//   ApplyUpdate("https://xenserver", "root", password);
+//   ApplyUpdate("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+//       "https://repo-src.ops.xenserver.com/xs9");
 ```
 
 <details><summary>Sample output</summary>
@@ -82,7 +93,7 @@ OK: apply-update
 ## Python
 
 ```python
-def apply_update(url, username, password):
+def apply_update(url, username, password, repo_url, source_url):
     """Sync the pool's update metadata from the CDN, then apply the synced updates to each host.
 
     pool.sync_updates needs at least one repository with update=True enabled
@@ -94,12 +105,10 @@ def apply_update(url, username, password):
     HOST_PENDING_MANDATORY_GUIDANCES_NOT_EMPTY)."""
     session = connect(url, username, password)
     pool = session.xenapi.pool.get_all()[0]
-    repo = session.xenapi.Repository.introduce(
-        "sdk-cdn", "SDK example repository",
-        "https://cdn.example/base", "https://cdn.example/source", True, "")
+    repos = introduce_update_repositories(session, repo_url, source_url)
     # Remember the pool's own repositories, to put them back afterwards.
     previous = session.xenapi.pool.get_repositories(pool)
-    session.xenapi.pool.set_repositories(pool, [repo])
+    session.xenapi.pool.set_repositories(pool, repos)
     try:
         # Sync the pool's update metadata; the returned hash identifies the synced set.
         hash_ = session.xenapi.pool.sync_updates(pool, False, "", "")
@@ -120,17 +129,28 @@ def apply_update(url, username, password):
                 session.xenapi.host.enable(host_ref)
             guidance = session.xenapi.host.get_pending_guidances(host_ref)
             print("  %s: applied; pending guidance = [%s]" % (host["name_label"], ", ".join(guidance)))
-            if "reboot_host" in guidance:
-                session.xenapi.host.reboot(host_ref)
-            elif "restart_toolstack" in guidance:
-                session.xenapi.host.restart_agent(host_ref)
+            if "reboot_host" in guidance or "restart_toolstack" in guidance:
+                # As in rolling-pool-update: either restart returns before it has happened, and the
+                # coordinator's takes this session with it - so wait for it, reconnecting.
+                key = "boot_time" if "reboot_host" in guidance else "agent_start_time"
+                before = session.xenapi.host.get_other_config(host_ref).get(key)
+                if key == "boot_time":
+                    session.xenapi.host.reboot(host_ref)
+                else:
+                    session.xenapi.host.restart_agent(host_ref)
+                session = _wait_for_restart(url, username, password, host["uuid"], key, before)
+            # apply_updates disables the host while it works (auto_enable: a restart puts it back) - with
+            # no restart to do, nothing re-enables it. Return it to service either way.
+            _enable_when_booted(session.xenapi, host_ref)
     finally:
         session.xenapi.pool.set_repositories(pool, previous)
-        session.xenapi.Repository.forget(repo)
+        for repo in repos:
+            session.xenapi.Repository.forget(repo)
     print("OK: apply-update")
     session.xenapi.session.logout()
 # Run it:
-#   apply_update("https://xenserver", "root", password)
+#   apply_update("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+#       "https://repo-src.ops.xenserver.com/xs9")
 ```
 
 <details><summary>Sample output</summary>
@@ -154,14 +174,14 @@ OK: apply-update
 // asks for one. Only call host.reboot/host.restart_agent when the RETURNED pending guidance actually
 // contains REBOOT_HOST/RESTART_TOOLSTACK (modern xapi, >=23.18.0, never auto-reboots - it only
 // records guidance) - not unconditionally after every apply.
-private static void applyUpdate(String url, String user, String password) throws Exception {
+private static void applyUpdate(String url, String user, String password, String repoUrl,
+        String sourceUrl) throws Exception {
     Connection conn = connect(url, user, password);
     Pool pool = Pool.getAll(conn).iterator().next();
-    Repository repo = Repository.introduce(conn, "sdk-cdn", "SDK example repository",
-            "https://cdn.example/base", "https://cdn.example/source", true, "");
+    Set<Repository> repos = introduceUpdateRepositories(conn, repoUrl, sourceUrl);
     // Remember the pool's own repositories, to put them back afterwards.
     Set<Repository> previous = pool.getRepositories(conn);
-    pool.setRepositories(conn, new LinkedHashSet<>(java.util.List.of(repo)));
+    pool.setRepositories(conn, repos);
     try {
         // Sync the pool's update metadata; the returned hash identifies the synced set.
         String hash = pool.syncUpdates(conn, false, "", "");
@@ -183,21 +203,30 @@ private static void applyUpdate(String url, String user, String password) throws
             }
             Set<Types.UpdateGuidances> guidance = host.getPendingGuidances(conn);
             System.out.println("  " + e.getValue().nameLabel + ": applied; pending guidance = " + guidance);
-            if (guidance.contains(Types.UpdateGuidances.REBOOT_HOST)) {
-                host.reboot(conn);
-            } else if (guidance.contains(Types.UpdateGuidances.RESTART_TOOLSTACK)) {
-                host.restartAgent(conn);
+            boolean rebooting = guidance.contains(Types.UpdateGuidances.REBOOT_HOST);
+            if (rebooting || guidance.contains(Types.UpdateGuidances.RESTART_TOOLSTACK)) {
+                // As in rolling-pool-update: either restart returns before it has happened, and the
+                // coordinator's takes this connection's session with it - so wait for it, reconnecting.
+                String key = rebooting ? "boot_time" : "agent_start_time";
+                String before = host.getOtherConfig(conn).get(key);
+                if (rebooting) host.reboot(conn);
+                else host.restartAgent(conn);
+                conn = waitForRestart(url, user, password, e.getValue().uuid, key, before);
             }
+            // apply_updates disables the host while it works (auto_enable: a restart puts it back) -
+            // with no restart to do, nothing re-enables it. Return it to service either way.
+            enableWhenBooted(conn, host);
         }
     } finally {
         pool.setRepositories(conn, previous);
-        repo.forget(conn);
+        for (Repository repo : repos) repo.forget(conn);
     }
     System.out.println("OK: apply-update");
     Session.logout(conn);
 }
 // Run it:
-//   applyUpdate("https://xenserver", "root", password);
+//   applyUpdate("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+//       "https://repo-src.ops.xenserver.com/xs9");
 ```
 
 <details><summary>Sample output</summary>
@@ -219,21 +248,24 @@ OK: apply-update
 // afterwards. Applying a batch whose mandatory guidance needs an evacuation fails with
 // HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are moved off first; handle that
 // rather than assuming an update batch never asks for one.
-func applyUpdate(url, user, password string) {
+func applyUpdate(url, user, password, repoURL, sourceURL string) {
 	session := connect(url, user, password)
+	// Deferred first, so it runs LAST: after the deferred repository restore below, which needs
+	// the session. A closure, so it logs out whichever session is current by then.
+	defer func() { session.Logout() }()
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
 	pool := pools[0]
-	repo, err := xenapi.Repository.Introduce(session, "sdk-cdn", "SDK example repository",
-		"https://cdn.example/base", "https://cdn.example/source", true, "")
-	check(err)
+	repos := introduceUpdateRepositories(session, repoURL, sourceURL)
 	// Remember the pool's own repositories, to put them back afterwards.
 	previous, perr := xenapi.Pool.GetRepositories(session, pool)
 	check(perr)
-	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{repo}))
+	check(xenapi.Pool.SetRepositories(session, pool, repos))
 	defer func() {
 		check(xenapi.Pool.SetRepositories(session, pool, previous))
-		check(xenapi.Repository.Forget(session, repo))
+		for _, repo := range repos {
+			check(xenapi.Repository.Forget(session, repo))
+		}
 	}()
 
 	// Sync the pool's update metadata; the returned hash identifies the synced set.
@@ -261,15 +293,29 @@ func applyUpdate(url, user, password string) {
 		fmt.Printf("  %s: applied; pending guidance = %v\n", host.NameLabel, guidance)
 		// Modern xapi (>=23.18.0) doesn't reboot a host for you: it only records pending_guidances,
 		// so only reboot (or restart the toolstack) when the applied batch actually asks for it.
-		switch {
-		case containsGuidance(guidance, xenapi.UpdateGuidancesRebootHost):
-			check(xenapi.Host.Reboot(session, hostRef))
-		case containsGuidance(guidance, xenapi.UpdateGuidancesRestartToolstack):
-			check(xenapi.Host.RestartAgent(session, hostRef))
+		rebootHost := containsGuidance(guidance, xenapi.UpdateGuidancesRebootHost)
+		if rebootHost || containsGuidance(guidance, xenapi.UpdateGuidancesRestartToolstack) {
+			// As in rolling-pool-update: either restart returns before it has happened, and the
+			// coordinator's takes this session with it - so wait for it, reconnecting.
+			key := "agent_start_time"
+			if rebootHost {
+				key = "boot_time"
+			}
+			otherConfig, err := xenapi.Host.GetOtherConfig(session, hostRef)
+			check(err)
+			before := otherConfig[key]
+			if rebootHost {
+				check(xenapi.Host.Reboot(session, hostRef))
+			} else {
+				check(xenapi.Host.RestartAgent(session, hostRef))
+			}
+			session = waitForRestart(url, user, password, host.UUID, key, before)
 		}
+		// apply_updates disables the host while it works (auto_enable: a restart puts it back) - with
+		// no restart to do, nothing re-enables it. Return it to service either way.
+		enableWhenBooted(session, hostRef)
 	}
 	fmt.Println("OK: apply-update")
-	session.Logout()
 }
 
 // containsGuidance reports whether a host's pending_guidances includes the named one.
@@ -283,7 +329,8 @@ func containsGuidance(guidance []xenapi.UpdateGuidances, want xenapi.UpdateGuida
 }
 
 // Run it:
-//   applyUpdate("https://xenserver", "root", password)
+//   applyUpdate("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+//       "https://repo-src.ops.xenserver.com/xs9")
 ```
 
 <details><summary>Sample output</summary>
@@ -304,7 +351,9 @@ function Invoke-ApplyUpdate {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$RepoUrl,
+        [Parameter(Mandatory = $true)][string]$SourceUrl
     )
     # pool.sync_updates needs at least one repository with Update enabled (NO_REPOSITORY_ENABLED
     # otherwise) - introduce and attach a throwaway one, and forget it again afterwards. Applying a
@@ -315,12 +364,10 @@ function Invoke-ApplyUpdate {
     # records guidance) - not unconditionally after every apply.
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $pool = Get-XenPool | Select-Object -First 1
-    $repo = Invoke-XenRepository -Ref 'OpaqueRef:NULL' -XenAction Introduce -NameLabel 'sdk-cdn' `
-        -NameDescription 'SDK example repository' -BinaryUrl 'https://cdn.example/base' `
-        -SourceUrl 'https://cdn.example/source' -Update $true -GpgkeyPath '' -PassThru
+    $repos = @(New-UpdateRepositories -Session $session -RepoUrl $RepoUrl -SourceUrl $SourceUrl)
     # Remember the pool's own repositories, to put them back afterwards.
     $previous = @((Get-XenPool -Ref $pool.opaque_ref).repositories | ForEach-Object { $_.opaque_ref })
-    $pool | Set-XenPool -Repositories @($repo.opaque_ref)
+    $pool | Set-XenPool -Repositories @($repos | ForEach-Object { $_.opaque_ref })
     try {
         # Sync the pool's update metadata; -PassThru returns the hash identifying the synced set.
         $hash = $pool | Invoke-XenPool -XenAction SyncUpdates -PassThru
@@ -346,23 +393,35 @@ function Invoke-ApplyUpdate {
             }
             $guidance = @((Get-XenHost -Ref $xenHost.opaque_ref).pending_guidances)
             Write-Host "  $($xenHost.name_label): applied; pending guidance = [$($guidance -join ', ')]"
-            if ($guidance -contains "reboot_host") {
-                $xenHost | Invoke-XenHost -XenAction Reboot
+            if ($guidance -contains "reboot_host" -or $guidance -contains "restart_toolstack") {
+                # As in rolling-pool-update: either restart returns before it has happened, and the
+                # coordinator's takes this session with it - so wait for it, reconnecting.
+                $key = if ($guidance -contains "reboot_host") { "boot_time" } else { "agent_start_time" }
+                $before = (Get-XenHost -Ref $xenHost.opaque_ref).other_config[$key]
+                if ($key -eq "boot_time") {
+                    $xenHost | Invoke-XenHost -XenAction Reboot
+                }
+                else {
+                    $xenHost | Invoke-XenHost -XenAction RestartAgent
+                }
+                $session = Wait-ForRestart -Url $Url -UserName $UserName -Password $Password `
+                    -HostUuid $xenHost.uuid -Key $key -Before $before
             }
-            elseif ($guidance -contains "restart_toolstack") {
-                $xenHost | Invoke-XenHost -XenAction RestartAgent
-            }
+            # apply_updates disables the host while it works (auto_enable: a restart puts it back) - with no
+            # restart to do, nothing re-enables it. Return it to service either way.
+            Enable-WhenBooted -XenHost $xenHost
         }
     }
     finally {
         $pool | Set-XenPool -Repositories $previous
-        $repo | Invoke-XenRepository -XenAction Forget
+        $repos | ForEach-Object { $_ | Invoke-XenRepository -XenAction Forget }
     }
     Write-Host "OK: apply-update"
     $session | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-ApplyUpdate -Url https://xenserver -UserName root -Password $password
+#   Invoke-ApplyUpdate -Url https://xenserver -UserName root -Password $password `
+#       -RepoUrl https://repo.ops.xenserver.com/xs9 -SourceUrl https://repo-src.ops.xenserver.com/xs9
 ```
 
 <details><summary>Sample output</summary>
@@ -380,22 +439,22 @@ OK: apply-update
 
 ```bash
 # pool-sync-updates needs at least one repository with update=true enabled (NO_REPOSITORY_ENABLED
-# otherwise) - introduce one and forget it again afterwards. Unlike the SDK languages, xe has no command
-# for pool.set_repositories (the "repositories" field is DynamicRO; there is no CLI setter at all) - and
-# none is needed: the real corpus (XenRT job 4762371) never attaches one either, it just introduces the
-# repository with update=true and calls pool-sync-updates straight away. Applying a batch whose mandatory
-# guidance needs an evacuation fails with HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are
-# moved off first; handle that rather than assuming an update batch never asks for one.
+# otherwise) - introduce the base and update repositories and attach both, remembering what was there to
+# put it back afterwards (the "repositories" field is DynamicRO at the API level, but xe's generic
+# pool-param-set still writes it - a set reads back "a; b" and is set as "a,b"), forgetting the throwaway
+# ones again afterwards. Applying a batch whose mandatory guidance needs an evacuation fails with
+# HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are moved off first; handle that rather than
+# assuming an update batch never asks for one.
 w_apply_update() {
-    local repo pool before hash err guidance
-    repo=$(xe repository-introduce name-label=xe-cdn binary-url=https://cdn.example/base \
-        source-url=https://cdn.example/source update=true)
-    # pool-sync-updates syncs the pool's ENABLED repositories, and repository-introduce doesn't enable
-    # anything (NO_REPOSITORY_ENABLED otherwise). xe has no add-one command: set the pool's whole list,
-    # remembering what was there to put it back afterwards. A set reads back "a; b" and is set as "a,b".
+    local repo_url source_url repos repo_list pool before hash err guidance
+    repo_url=$(param repo_url "https://repo.ops.xenserver.com/xs9")
+    source_url=$(param source_url "https://repo-src.ops.xenserver.com/xs9")
+    repos=$(introduce_update_repositories "$repo_url" "$source_url")
+    repo_list=""
+    for r in $repos; do repo_list="${repo_list:+$repo_list,}$r"; done
     pool=$(xe pool-list --minimal)
     before=$(xe pool-param-get uuid=$pool param-name=repositories)
-    xe pool-param-set uuid=$pool repositories=$repo
+    xe pool-param-set uuid=$pool repositories=$repo_list
 
     hash=$(xe pool-sync-updates)
     echo "Synced updates (hash length ${#hash})"
@@ -412,19 +471,28 @@ w_apply_update() {
                 *) echo "$err" >&2; exit 1 ;;
             esac
         fi
-        guidance=$(xe host-param-get uuid=$h param-name=pending-guidances)
+        guidance=$(set_to_csv "$(xe host-param-get uuid=$h param-name=pending-guidances)")
         echo "  $(xe host-param-get uuid=$h param-name=name-label): applied; pending guidance = [$guidance]"
         # Modern xapi (>=23.18.0) doesn't reboot a host for you: it only records guidance, so only act
         # when the applied batch actually asked for it. A reboot restarts the toolstack too, so
         # reboot_host (checked first) covers restart_toolstack as well; xe has no separate command to
         # restart just the toolstack, so note it rather than silently doing nothing in that rarer case.
         case ",$guidance," in
-            *,reboot_host,*) xe host-reboot uuid=$h ;;
+            *,reboot_host,*)
+                # As in rolling-pool-update: the reboot returns before it has happened, and the
+                # coordinator's takes the connection with it - so wait for a newer boot time.
+                before_key=$(xe host-param-get uuid=$h param-name=other-config param-key=boot_time 2>/dev/null) || true
+                xe host-reboot uuid=$h
+                wait_for_restart "$h" boot_time "$before_key"
+                ;;
             *,restart_toolstack,*) echo "    (restart_toolstack requested; xe has no command for that alone)" ;;
         esac
+        # apply-updates disables the host while it works (auto_enable: a restart puts it back) - with no
+        # restart to do, nothing re-enables it. Return it to service either way.
+        enable_when_booted "$h"
     done
     xe pool-param-set uuid=$pool repositories="${before//; /,}"
-    xe repository-forget uuid=$repo
+    for r in $repos; do xe repository-forget uuid=$r; done
     echo "OK: apply-update"
 }
 ```

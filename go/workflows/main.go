@@ -266,13 +266,18 @@ func selfSignedCertPEM() (certPEM, keyPEM string) {
 }
 
 // reconnectAfterMasterChange waits out a pool-wide xapi restart (pool.DesignateNewMaster) and
-// reconnects. Mirrors XenRT's own wait after this call: the connection does not survive a
-// pool-wide xapi restart, so retry rather than assuming the session is still good.
-func reconnectAfterMasterChange(url, user, password string) (session *xenapi.Session) {
+// reconnects.
+//
+// DesignateNewMaster returns BEFORE the change: for a while the old coordinator still answers, and
+// still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+// enough - keep reconnecting until the pool names the new coordinator (by uuid; connect follows
+// HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits minutes
+// before trusting the pool again.
+func reconnectAfterMasterChange(url, user, password, newMasterUUID string) (session *xenapi.Session) {
 	deadline := time.Now().Add(600 * time.Second)
 	var lastErr any
 	for time.Now().Before(deadline) {
-		reconnected := func() (ok bool) {
+		settled := func() (ok bool) {
 			defer func() {
 				if r := recover(); r != nil {
 					lastErr = r
@@ -280,10 +285,36 @@ func reconnectAfterMasterChange(url, user, password string) (session *xenapi.Ses
 				}
 			}()
 			session = connect(url, user, password)
+			pools, err := xenapi.Pool.GetAll(session)
+			check(err)
+			master, err := xenapi.Pool.GetMaster(session, pools[0])
+			check(err)
+			uuid, err := xenapi.Host.GetUUID(session, master)
+			check(err)
+			// The new coordinator answers before the pool has settled - calls made too soon fail
+			// (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+			// live and enabled.
+			if uuid != newMasterUUID {
+				lastErr = "the pool has not settled under the new coordinator"
+				return false
+			}
+			hosts, err := xenapi.Host.GetAllRecords(session)
+			check(err)
+			for _, h := range hosts {
+				live, err := xenapi.HostMetrics.GetLive(session, h.Metrics)
+				check(err)
+				if !h.Enabled || !live {
+					lastErr = "the pool has not settled under the new coordinator"
+					return false
+				}
+			}
 			return true
 		}()
-		if reconnected {
+		if settled {
 			return session
+		}
+		if session != nil {
+			session.Logout()
 		}
 		time.Sleep(5 * time.Second)
 	}
@@ -292,15 +323,67 @@ func reconnectAfterMasterChange(url, user, password string) (session *xenapi.Ses
 
 // waitForHostLive polls host_metrics.live until it matches, rather than issuing the next power
 // command immediately - real out-of-band power control has no retry of its own, so a tool that
-// doesn't wait can issue a second command while the first is still in flight. Short default
-// timeouts are fine for a demo; real tooling (XenRT's own waitForEnabled) waits up to 900s.
+// doesn't wait can issue a second command while the first is still in flight.
 func waitForHostLive(session *xenapi.Session, host xenapi.HostRef, want bool) {
-	deadline := time.Now().Add(60 * time.Second)
+	waitForHostLiveTimeout(session, host, want, 60*time.Second, 2*time.Second)
+}
+
+func waitForHostLiveTimeout(session *xenapi.Session, host xenapi.HostRef, want bool, timeout, interval time.Duration) {
+	deadline := time.Now().Add(timeout)
 	for hostLive(session, host) != want {
 		if time.Now().After(deadline) {
 			panic(fmt.Sprintf("host did not reach live=%t in time", want))
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(interval)
+	}
+}
+
+// enableWhenBooted re-enables a host that has just come back. It reports itself live before xapi
+// on it has finished starting, and until then Host.Enable fails HOST_STILL_BOOTING - so retry that.
+func enableWhenBooted(session *xenapi.Session, host xenapi.HostRef) {
+	deadline := time.Now().Add(600 * time.Second)
+	for {
+		err := xenapi.Host.Enable(session, host)
+		if err == nil {
+			return
+		}
+		if failureCode(err) != xenapi.ErrorHostStillBooting || time.Now().After(deadline) {
+			panic(err)
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+// waitForRestart waits for a host to come back from a reboot (key "boot_time") or toolstack
+// restart ("agent_start_time"): until that other_config entry differs from before and the host is
+// live. It reconnects every time round, because the host restarting may be the coordinator this
+// session talks to; returns the new session.
+func waitForRestart(url, user, password, hostUUID, key, before string) (session *xenapi.Session) {
+	deadline := time.Now().Add(1800 * time.Second)
+	for {
+		ready := func() (ok bool) {
+			defer func() {
+				if recover() != nil { // down, or xapi still starting
+					ok = false
+				}
+			}()
+			session = connect(url, user, password)
+			host, err := xenapi.Host.GetByUUID(session, hostUUID)
+			check(err)
+			otherConfig, err := xenapi.Host.GetOtherConfig(session, host)
+			check(err)
+			return otherConfig[key] != before && hostLive(session, host)
+		}()
+		if ready {
+			return session
+		}
+		if session != nil {
+			session.Logout()
+		}
+		if time.Now().After(deadline) {
+			panic(fmt.Sprintf("host %s did not come back in time", hostUUID))
+		}
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -468,13 +551,16 @@ func hasSuspendSR(session *xenapi.Session, vm xenapi.VMRef) bool {
 // throwaway VM of its own, matching XenCenter's own "deactivate" action, which only ever targets
 // additional disks. No shrink demonstration: real SR backends refuse one outright
 // (SR_BACKEND_FAILURE_79).
-func manageVMDisks(url, user, password, templateName, srName, newVMName string) {
+//
+// Plugging and unplugging a disk on a running VM needs the guest's PV drivers
+// (VM_MISSING_PV_DRIVERS otherwise), so the VM is a throwaway copy of sourceVM, a VM with a guest OS
+// and PV drivers.
+func manageVMDisks(url, user, password, sourceVM, srName, newVMName string) {
 	const GiB = 1024 * 1024 * 1024
 	session := connect(url, user, password)
-	vmRef, err := xenapi.VM.Clone(session, templateByName(session, templateName), newVMName)
-	check(err)
-	provision(session, vmRef)
+	vmRef := copyOfGuest(session, sourceVM, newVMName)
 	check(xenapi.VM.Start(session, vmRef, false, true))
+	waitForGuestAgent(session, vmRef)
 
 	srRef := srByName(session, srName, false)
 	vdiRef, err := xenapi.VDI.Create(session, xenapi.VDIRecord{
@@ -491,7 +577,8 @@ func manageVMDisks(url, user, password, templateName, srName, newVMName string) 
 	check(err)
 	vbdRef, err := xenapi.VBD.Create(session, xenapi.VBDRecord{
 		VM: vmRef, VDI: vdiRef, Userdevice: devices[0],
-		Mode: xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
+		Bootable: false,
+		Mode:     xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
 		// A Go record sends every field, so say so explicitly: a VBD created with unpluggable=false
 		// can't be hot-unplugged (VBD_NOT_UNPLUGGABLE). xapi's own default, when the field is left
 		// out, is true.
@@ -519,11 +606,28 @@ func manageVMDisks(url, user, password, templateName, srName, newVMName string) 
 	fmt.Printf("After plug:     %t\n", attached)
 
 	// Growing a disk that is attached and live is a DIFFERENT call, not a flag on the same one:
-	// ResizeOnline tells the storage layer the guest is using the disk while it grows.
-	grownOnline := grown + 1024*1024*1024
-	check(xenapi.VDI.ResizeOnline(session, vdiRef, grownOnline))
-	final, _ := xenapi.VDI.GetVirtualSize(session, vdiRef)
-	fmt.Printf("Grown online:   %d bytes\n", final)
+	// ResizeOnline tells the storage layer the guest is using the disk while it grows. Only some
+	// storage drivers can (none of a stock XenServer 9's do), and the rest refuse with
+	// SR_OPERATION_NOT_SUPPORTED - so ask the SR's driver (its SM record's features) first.
+	srType, err := xenapi.SR.GetType(session, srRef)
+	check(err)
+	sms, err := xenapi.SM.GetAllRecords(session)
+	check(err)
+	resizeOnline := false
+	for _, sm := range sms {
+		if sm.Type == srType {
+			_, resizeOnline = sm.Features["VDI_RESIZE_ONLINE"]
+			break
+		}
+	}
+	if resizeOnline {
+		grownOnline := grown + GiB
+		check(xenapi.VDI.ResizeOnline(session, vdiRef, grownOnline))
+		final, _ := xenapi.VDI.GetVirtualSize(session, vdiRef)
+		fmt.Printf("Grown online:   %d bytes\n", final)
+	} else {
+		fmt.Printf("Grown online:   not supported by %s storage; unplug, resize, plug as above\n", srType)
+	}
 
 	check(xenapi.VM.HardShutdown(session, vmRef))
 	destroyVMAndDisks(session, vmRef)
@@ -625,6 +729,14 @@ func changeRootPassword(url, user, password string) {
 	// authenticated.
 	check(session.ChangePassword(password, temporary))
 	fmt.Println("Password changed.")
+	// Whatever happens next, put the password back: a failure part-way would otherwise leave root on
+	// the temporary one.
+	restored := false
+	defer func() {
+		if !restored {
+			session.ChangePassword(temporary, password)
+		}
+	}()
 
 	// The existing session stays valid afterwards - only NEW connections need the new password.
 	pools, err := xenapi.Pool.GetAll(session)
@@ -635,13 +747,15 @@ func changeRootPassword(url, user, password string) {
 	// xapi_session.ml) - any string would also be accepted, so there is no "wrong old password is
 	// rejected" failure to demonstrate here. The real gate is upstream of that: only a session
 	// authenticated as the local superuser may call this at all. The Go binding keeps its session
-	// id private, so check that the same way the RRD/export examples obtain one of their own.
-	sid := rawLogin(url, user, password)
+	// id private, so check that the same way the RRD/export examples obtain one of their own - with
+	// the NEW password, which is the one any new connection needs now.
+	sid := rawLogin(url, user, temporary)
 	isSuperuser := rawRPC(url, "session.get_is_local_superuser", sid, sid)
 	fmt.Printf("Allowed because session.is_local_superuser = %s\n", isSuperuser)
 	rawRPC(url, "session.logout", sid)
 
 	check(session.ChangePassword(temporary, password))
+	restored = true
 	fmt.Println("Password restored.")
 	fmt.Println("OK: change-root-password")
 	session.Logout()
@@ -893,6 +1007,9 @@ func createNetwork(url, user, password, networkName string) {
 		NameDescription: "Internal network created by the SDK example",
 		MTU:             1500,
 		OtherConfig:     map[string]string{},
+		// Managed by xapi (bridge and PIFs created for it). Say so: the binding sends every field, and
+		// the zero value is false - an unmanaged network, which a bond refuses.
+		Managed: true,
 	})
 	check(err)
 	uuid, _ := xenapi.Network.GetUUID(session, netRef)
@@ -1394,16 +1511,32 @@ func tagsAndFolders(url, user, password, vmName string) {
 //   tagsAndFolders("https://xenserver", "root", password, "web-01")
 
 // --- 16. Configure updates (CDN) ------------------------------------------------------
-func configureUpdates(url, user, password string) {
+// introduceUpdateRepositories introduces the pool's update repositories the way XenCenter does: the
+// release's base packages (update=false) and its update stream (update=true, which
+// Pool.SyncUpdates needs - otherwise NO_REPOSITORY_ENABLED). A real host checks the URLs
+// (INVALID_BASE_URL for an unknown domain), so these are the XenServer CDN's, e.g.
+// https://repo.ops.xenserver.com/xs9/{base,normal}.
+func introduceUpdateRepositories(session *xenapi.Session, repoURL, sourceURL string) []xenapi.RepositoryRef {
+	var repos []xenapi.RepositoryRef
+	for _, stage := range []string{"base", "normal"} {
+		repo, err := xenapi.Repository.Introduce(session, "sdk-example-"+stage,
+			"SDK example "+stage+" repository",
+			repoURL+"/"+stage, sourceURL+"/"+stage, stage != "base", "")
+		check(err)
+		repos = append(repos, repo)
+	}
+	return repos
+}
+
+func configureUpdates(url, user, password, repoURL, sourceURL string) {
 	session := connect(url, user, password)
-	// update=true: without it this introduces only a base package mirror, not an actual UPDATE
-	// repository - pool.sync_updates needs one with update=true enabled (NO_REPOSITORY_ENABLED
-	// otherwise), which is exactly what apply-update and rolling-pool-update rely on.
-	repo, err := xenapi.Repository.Introduce(session, "sdk-cdn", "SDK example repository",
-		"https://cdn.example/base", "https://cdn.example/source", true, "")
-	check(err)
-	name, _ := xenapi.Repository.GetNameLabel(session, repo)
-	fmt.Printf("Introduced repository: %s\n", name)
+	repos := introduceUpdateRepositories(session, repoURL, sourceURL)
+	var names []string
+	for _, repo := range repos {
+		name, _ := xenapi.Repository.GetNameLabel(session, repo)
+		names = append(names, name)
+	}
+	fmt.Printf("Introduced repositories: %s\n", strings.Join(names, ", "))
 
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
@@ -1411,22 +1544,25 @@ func configureUpdates(url, user, password string) {
 	// Remember the pool's own repositories, to put them back afterwards.
 	previous, perr := xenapi.Pool.GetRepositories(session, pool)
 	check(perr)
-	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{repo}))
+	check(xenapi.Pool.SetRepositories(session, pool, repos))
 	check(xenapi.Pool.SetUpdateSyncEnabled(session, pool, true))
-	repos, _ := xenapi.Pool.GetRepositories(session, pool)
+	nowRepos, _ := xenapi.Pool.GetRepositories(session, pool)
 	enabled, _ := xenapi.Pool.GetUpdateSyncEnabled(session, pool)
-	fmt.Printf("Pool repositories: %d; auto-sync enabled: %v\n", len(repos), enabled)
+	fmt.Printf("Pool repositories: %d; auto-sync enabled: %v\n", len(nowRepos), enabled)
 
 	// Tidy up so the example is repeatable.
 	check(xenapi.Pool.SetUpdateSyncEnabled(session, pool, false))
 	check(xenapi.Pool.SetRepositories(session, pool, previous))
-	check(xenapi.Repository.Forget(session, repo))
+	for _, repo := range repos {
+		check(xenapi.Repository.Forget(session, repo))
+	}
 	fmt.Println("OK: configure-updates")
 	session.Logout()
 }
 
 // Run it:
-//   configureUpdates("https://xenserver", "root", password)
+//   configureUpdates("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+//       "https://repo-src.ops.xenserver.com/xs9")
 
 // diskVdis returns the VDIs backing a VM's disk VBDs (used to clean up a VM's owned disks).
 func diskVdis(session *xenapi.Session, vmRef xenapi.VMRef) []xenapi.VDIRef {
@@ -1595,21 +1731,24 @@ func storageMigrate(url, user, password, sourceVM, newVMName string) {
 // afterwards. Applying a batch whose mandatory guidance needs an evacuation fails with
 // HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are moved off first; handle that
 // rather than assuming an update batch never asks for one.
-func applyUpdate(url, user, password string) {
+func applyUpdate(url, user, password, repoURL, sourceURL string) {
 	session := connect(url, user, password)
+	// Deferred first, so it runs LAST: after the deferred repository restore below, which needs
+	// the session. A closure, so it logs out whichever session is current by then.
+	defer func() { session.Logout() }()
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
 	pool := pools[0]
-	repo, err := xenapi.Repository.Introduce(session, "sdk-cdn", "SDK example repository",
-		"https://cdn.example/base", "https://cdn.example/source", true, "")
-	check(err)
+	repos := introduceUpdateRepositories(session, repoURL, sourceURL)
 	// Remember the pool's own repositories, to put them back afterwards.
 	previous, perr := xenapi.Pool.GetRepositories(session, pool)
 	check(perr)
-	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{repo}))
+	check(xenapi.Pool.SetRepositories(session, pool, repos))
 	defer func() {
 		check(xenapi.Pool.SetRepositories(session, pool, previous))
-		check(xenapi.Repository.Forget(session, repo))
+		for _, repo := range repos {
+			check(xenapi.Repository.Forget(session, repo))
+		}
 	}()
 
 	// Sync the pool's update metadata; the returned hash identifies the synced set.
@@ -1637,15 +1776,29 @@ func applyUpdate(url, user, password string) {
 		fmt.Printf("  %s: applied; pending guidance = %v\n", host.NameLabel, guidance)
 		// Modern xapi (>=23.18.0) doesn't reboot a host for you: it only records pending_guidances,
 		// so only reboot (or restart the toolstack) when the applied batch actually asks for it.
-		switch {
-		case containsGuidance(guidance, xenapi.UpdateGuidancesRebootHost):
-			check(xenapi.Host.Reboot(session, hostRef))
-		case containsGuidance(guidance, xenapi.UpdateGuidancesRestartToolstack):
-			check(xenapi.Host.RestartAgent(session, hostRef))
+		rebootHost := containsGuidance(guidance, xenapi.UpdateGuidancesRebootHost)
+		if rebootHost || containsGuidance(guidance, xenapi.UpdateGuidancesRestartToolstack) {
+			// As in rolling-pool-update: either restart returns before it has happened, and the
+			// coordinator's takes this session with it - so wait for it, reconnecting.
+			key := "agent_start_time"
+			if rebootHost {
+				key = "boot_time"
+			}
+			otherConfig, err := xenapi.Host.GetOtherConfig(session, hostRef)
+			check(err)
+			before := otherConfig[key]
+			if rebootHost {
+				check(xenapi.Host.Reboot(session, hostRef))
+			} else {
+				check(xenapi.Host.RestartAgent(session, hostRef))
+			}
+			session = waitForRestart(url, user, password, host.UUID, key, before)
 		}
+		// apply_updates disables the host while it works (auto_enable: a restart puts it back) - with
+		// no restart to do, nothing re-enables it. Return it to service either way.
+		enableWhenBooted(session, hostRef)
 	}
 	fmt.Println("OK: apply-update")
-	session.Logout()
 }
 
 // containsGuidance reports whether a host's pending_guidances includes the named one.
@@ -1659,7 +1812,8 @@ func containsGuidance(guidance []xenapi.UpdateGuidances, want xenapi.UpdateGuida
 }
 
 // Run it:
-//   applyUpdate("https://xenserver", "root", password)
+//   applyUpdate("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+//       "https://repo-src.ops.xenserver.com/xs9")
 
 // --- 21. Checkpoint & revert ------------------------------------------------------------
 // checkpointVM checkpoints a throwaway copy of a VM with a guest OS, then reverts it back to that
@@ -1727,7 +1881,8 @@ func attachDisk(url, user, password, templateName, srName, newVMName string) {
 	device := devices[0]
 	_, err = xenapi.VBD.Create(session, xenapi.VBDRecord{
 		VM: vm, VDI: vdi, Userdevice: device,
-		Mode: xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
+		Bootable: false,
+		Mode:     xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
 		OtherConfig: map[string]string{}, QosAlgorithmParams: map[string]string{},
 	})
 	check(err)
@@ -2256,21 +2411,24 @@ func findByUUID(url, user, password, vmName string) {
 // and attach a throwaway one, forget it again afterwards. Modern xapi (>=23.18.0) doesn't reboot a
 // host for you: it only records pending_guidances, so only reboot (or restart the toolstack) when
 // the applied batch actually asks for it.
-func rollingPoolUpdate(url, user, password string) {
+func rollingPoolUpdate(url, user, password, repoURL, sourceURL string) {
 	session := connect(url, user, password)
+	// Deferred first, so it runs LAST: after the deferred repository restore below, which needs
+	// the session. A closure, so it logs out whichever session is current by then.
+	defer func() { session.Logout() }()
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
 	pool := pools[0]
-	repo, err := xenapi.Repository.Introduce(session, "sdk-cdn", "SDK example repository",
-		"https://cdn.example/base", "https://cdn.example/source", true, "")
-	check(err)
+	repos := introduceUpdateRepositories(session, repoURL, sourceURL)
 	// Remember the pool's own repositories, to put them back afterwards.
 	previous, perr := xenapi.Pool.GetRepositories(session, pool)
 	check(perr)
-	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{repo}))
+	check(xenapi.Pool.SetRepositories(session, pool, repos))
 	defer func() {
 		check(xenapi.Pool.SetRepositories(session, pool, previous))
-		check(xenapi.Repository.Forget(session, repo))
+		for _, repo := range repos {
+			check(xenapi.Repository.Forget(session, repo))
+		}
 	}()
 
 	hash, err := xenapi.Pool.SyncUpdates5(session, pool, false, "", "")
@@ -2289,31 +2447,59 @@ func rollingPoolUpdate(url, user, password string) {
 		check(err) // apply the synced updates
 		guidance, _ := xenapi.Host.GetPendingGuidances(session, hostRef)
 		fmt.Printf("  applied; pending guidance = %v\n", guidance)
-		switch {
-		case containsGuidance(guidance, xenapi.UpdateGuidancesRebootHost):
-			check(xenapi.Host.Reboot(session, hostRef)) // reboot into the updated software
-		case containsGuidance(guidance, xenapi.UpdateGuidancesRestartToolstack):
-			check(xenapi.Host.RestartAgent(session, hostRef))
+		rebootHost := containsGuidance(guidance, xenapi.UpdateGuidancesRebootHost)
+		restartToolstack := containsGuidance(guidance, xenapi.UpdateGuidancesRestartToolstack)
+		if rebootHost || restartToolstack {
+			// Either restart returns before it has happened, and if this host is the coordinator it
+			// takes this session with it - so note when the host last started, restart it, and
+			// reconnect until it reports a newer start and is live again.
+			key := "agent_start_time"
+			if rebootHost {
+				key = "boot_time"
+			}
+			otherConfig, err := xenapi.Host.GetOtherConfig(session, hostRef)
+			check(err)
+			before := otherConfig[key]
+			if rebootHost {
+				check(xenapi.Host.Reboot(session, hostRef)) // reboot into the updated software
+			} else {
+				check(xenapi.Host.RestartAgent(session, hostRef))
+			}
+			session = waitForRestart(url, user, password, host.UUID, key, before)
 		}
-		check(xenapi.Host.Enable(session, hostRef)) // return the host to service
+		enableWhenBooted(session, hostRef) // return the host to service
 	}
 	fmt.Println("OK: rolling-pool-update")
-	session.Logout()
 }
 
 // --- 42. Cross-pool copy a VM --------------------------------------------------------
 // Copy a VM from one pool to another (Storage XenMotion copy): get a receiver token from the
 // destination with host.migrate_receive, then VM.migrate_send with copy=true on the source.
-func crossPoolCopyVM(url, user, password, destURL, vmName string) {
+func crossPoolCopyVM(url, user, password, destURL, vmName, destUser, destPassword string) {
 	source := connect(url, user, password)
-	dest := connect(destURL, user, password)
-	// Destination: choose a host, network and SR, then ask for a receiver token.
-	destHosts, err := xenapi.Host.GetAll(dest)
+	if destUser == "" {
+		destUser, destPassword = user, password
+	}
+	dest := connect(destURL, destUser, destPassword)
+	// Destination: choose a host, network and SR, then ask for a receiver token. The disks go to
+	// the destination pool's default SR and the data travels over the host's management network -
+	// one both pools can certainly reach (the first network listed may well not be).
+	destPools, err := xenapi.Pool.GetAll(dest)
 	check(err)
-	destNets, err := xenapi.Network.GetAll(dest)
+	destHost, err := xenapi.Pool.GetMaster(dest, destPools[0])
 	check(err)
-	destSr := srByName(dest, "Shared NFS", true)
-	receiver, err := xenapi.Host.MigrateReceive(dest, destHosts[0], destNets[0], map[string]string{})
+	destSr, err := xenapi.Pool.GetDefaultSR(dest, destPools[0])
+	check(err)
+	pifs, err := xenapi.Host.GetPIFs(dest, destHost)
+	check(err)
+	var destNetwork xenapi.NetworkRef
+	for _, pif := range pifs {
+		if management, _ := xenapi.PIF.GetManagement(dest, pif); management {
+			destNetwork, err = xenapi.PIF.GetNetwork(dest, pif)
+			check(err)
+		}
+	}
+	receiver, err := xenapi.Host.MigrateReceive(dest, destHost, destNetwork, map[string]string{})
 	check(err)
 
 	// Source: map every disk to the destination SR and every NIC to the destination network,
@@ -2331,23 +2517,29 @@ func crossPoolCopyVM(url, user, password, destURL, vmName string) {
 	vifs, _ := xenapi.VM.GetVIFs(source, vm)
 	vifMap := map[xenapi.VIFRef]xenapi.NetworkRef{}
 	for _, vif := range vifs {
-		vifMap[vif] = destNets[0]
+		vifMap[vif] = destNetwork
 	}
 
 	// MigrateSend8 is the 8-argument form every pool version accepts; MigrateSend itself takes newer
 	// arguments that older hosts reject.
-	_, err = xenapi.VM.MigrateSend8(source, vm, receiver, false, vdiMap, vifMap,
+	copied, err := xenapi.VM.MigrateSend8(source, vm, receiver, false, vdiMap, vifMap,
 		map[string]string{"copy": "true"}, map[xenapi.VGPURef]xenapi.GPUGroupRef{})
 	check(err)
 	fmt.Printf("Sent '%s' to the destination pool (copy); source still present: %v\n",
 		vmName, vmByName(source, vmName) == vm)
+	// The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
+	copyName, err := xenapi.VM.GetNameLabel(dest, copied)
+	check(err)
+	copyUUID, err := xenapi.VM.GetUUID(dest, copied)
+	check(err)
+	fmt.Printf("  the copy on the destination: %s (%s)\n", copyName, copyUUID)
 	fmt.Println("OK: cross-pool-copy-vm")
 	dest.Logout()
 	source.Logout()
 }
 
 // Run it:
-//   findByUUID("https://xenserver", "root", password, "web-01")
+//   crossPoolCopyVM("https://poolA", "root", password, "https://poolB", "db-01", "", "")
 
 // Maps the <workflow> argument to the matching self-contained function above, supplying the concrete
 // objects each one operates on. In your own code you would call these functions directly (see the
@@ -2567,22 +2759,37 @@ func vmIpAddress(url, user, password, timeoutStr, intervalStr string) {
 // manageAdUsers joins AD, adds a user as a subject with an RBAC role, reads it back, then tidies
 // up. Needs a real, reachable AD domain controller - EnableExternalAuth fails at the very first
 // call (DNS/LDAP/Kerberos) without one, so domain/adminUser/adminPassword have to identify a real
-// domain to join. newUser is the account to grant a role to; its subject identity is looked up
-// against the directory just joined, so it has to be a real account there too. The simulator
-// models a single-user, domain-less fake directory (hence the empty domain default) - override
-// every one of these on a real pool.
-func manageAdUsers(url, user, password, domain, adminUser, adminPassword, newUser string) {
+// domain to join. Before joining, every host must resolve the domain (point its DNS at a domain
+// controller) and keep its clock close to the DC's (Kerberos). Current Windows DCs want LDAPS
+// (ldaps="true"), which also needs the pool to trust the DC's CA certificate
+// (xenapi.Pool.InstallTrustedCertificate with purpose "ldaps"). newUser is the account to grant a
+// role to; its subject identity is looked up against the directory, so it has to be a real account
+// there too. A pool already joined to this domain is used as it is - and left joined. The
+// simulator models a single-user, domain-less fake directory (hence the empty domain default) -
+// override every one of these on a real pool.
+func manageAdUsers(url, user, password, domain, adminUser, adminPassword, newUser, ldaps string) {
 	session := connect(url, user, password)
 
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
 	pool := pools[0]
-	check(xenapi.Pool.EnableExternalAuth(session, pool,
-		map[string]string{"user": adminUser, "pass": adminPassword, "ldaps": "false"}, domain, "AD"))
-	if domain != "" {
-		fmt.Printf("Joined domain: %s\n", domain)
+	coordinator, err := xenapi.Pool.GetMaster(session, pool)
+	check(err)
+	authType, err := xenapi.Host.GetExternalAuthType(session, coordinator)
+	check(err)
+	authDomain, err := xenapi.Host.GetExternalAuthServiceName(session, coordinator)
+	check(err)
+	alreadyJoined := domain != "" && authType == "AD" && strings.EqualFold(authDomain, domain)
+	if alreadyJoined {
+		fmt.Printf("Already joined to domain: %s\n", domain)
 	} else {
-		fmt.Println("Joined domain: (none - simulator's fake directory)")
+		check(xenapi.Pool.EnableExternalAuth(session, pool,
+			map[string]string{"user": adminUser, "pass": adminPassword, "ldaps": ldaps}, domain, "AD"))
+		if domain != "" {
+			fmt.Printf("Joined domain: %s\n", domain)
+		} else {
+			fmt.Println("Joined domain: (none - simulator's fake directory)")
+		}
 	}
 
 	subjectName := newUser
@@ -2622,7 +2829,12 @@ func manageAdUsers(url, user, password, domain, adminUser, adminPassword, newUse
 
 	check(xenapi.Subject.RemoveFromRoles(session, subject, admin))
 	check(xenapi.Subject.Destroy(session, subject))
-	check(xenapi.Pool.DisableExternalAuth(session, pool, map[string]string{}))
+	if !alreadyJoined {
+		// Leave the way it was found. Passing the admin credentials also removes the pool's computer
+		// accounts from the directory; with {} they stay behind in AD.
+		check(xenapi.Pool.DisableExternalAuth(session, pool,
+			map[string]string{"user": adminUser, "pass": adminPassword}))
+	}
 	fmt.Println("OK: manage-ad-users")
 	session.Logout()
 }
@@ -2631,6 +2843,12 @@ func manageAdUsers(url, user, password, domain, adminUser, adminPassword, newUse
 // element name and nesting both vary by host/backend - the probe helpers below must not assume
 // either), and returns a map of its immediate child elements' tag name to text content.
 func firstXMLElement(xmlText, tag string) map[string]string {
+	return findXMLElement(xmlText, tag, "", "")
+}
+
+// findXMLElement is firstXMLElement for the first <tag> whose child <key> has the given text (any
+// <tag>, when value is "").
+func findXMLElement(xmlText, tag, key, value string) map[string]string {
 	decoder := xml.NewDecoder(strings.NewReader(xmlText))
 	for {
 		tok, err := decoder.Token()
@@ -2652,7 +2870,9 @@ func firstXMLElement(xmlText, tag string) map[string]string {
 		for _, f := range raw.Fields {
 			fields[f.XMLName.Local] = f.Value
 		}
-		return fields
+		if value == "" || fields[key] == value {
+			return fields
+		}
 	}
 }
 
@@ -2754,8 +2974,9 @@ func createSmbSr(url, user, password, server, share, smbUsername, smbPassword, s
 	check(err)
 	secretUUID, err := xenapi.Secret.GetUUID(session, secret)
 	check(err)
+	// server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
 	dc := map[string]string{
-		"server": server, "serverpath": share, "username": smbUsername,
+		"server": "//" + server + share, "username": smbUsername,
 		"password_secret": secretUUID,
 	}
 	sr, err := xenapi.SR.Create(session, host, dc, 0, srName,
@@ -2777,14 +2998,16 @@ func createSmbSr(url, user, password, server, share, smbUsername, smbPassword, s
 // BlockDevice wherever it occurs.
 //
 // SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
-func createHbaSr(url, user, password, srName string) {
+func createHbaSr(url, user, password, scsiID, srName string) {
 	const GiB = 1024 * 1024 * 1024
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
 	host := hosts[0]
 
-	device := firstXMLElement(probeForFailure(session, host, map[string]string{}, "lvmohba"), "BlockDevice")
+	// SR.create formats the LUN: on shared FC storage name yours (scsiID); with none, the first is taken.
+	device := findXMLElement(probeForFailure(session, host, map[string]string{}, "lvmohba"), "BlockDevice",
+		"SCSIid", scsiID)
 	fmt.Printf("Discovered LUN: SCSIid %s on %s\n", device["SCSIid"], device["path"])
 
 	// SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
@@ -2802,12 +3025,14 @@ func createHbaSr(url, user, password, srName string) {
 }
 
 // --- 51. Create an ISO library SR -----------------------------------------------------
-func createIsoSr(url, user, password string) {
+// Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+// "server:/path").
+func createIsoSr(url, user, password, location string) {
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
-	dc := map[string]string{"location": "192.0.2.10:/isos", "type": "nfs_iso"}
-	sr, err := xenapi.SR.Create(session, hosts[0], dc, 0, "sdk-iso-sr",
+	dc := map[string]string{"location": location, "type": "nfs_iso"}
+	sr, err := xenapi.SR.Create(session, hosts[0], dc, 0, "sdk-example-iso",
 		"ISO library created by the SDK example", "iso", "iso", true, map[string]string{})
 	check(err)
 	uuid, _ := xenapi.SR.GetUUID(session, sr)
@@ -2915,7 +3140,9 @@ func manageVapp(url, user, password, vmName string) {
 	state, _ := xenapi.VM.GetPowerState(session, vm)
 	fmt.Printf("Started:        %s\n", state)
 
-	check(xenapi.VMAppliance.CleanShutdown(session, vapp))
+	// Shutdown tries each VM's clean shutdown and falls back to a hard one. CleanShutdown alone fails
+	// OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+	check(xenapi.VMAppliance.Shutdown(session, vapp))
 	state, _ = xenapi.VM.GetPowerState(session, vm)
 	fmt.Printf("Shut down:      %s\n", state)
 
@@ -2969,12 +3196,38 @@ func attachUsbDevice(url, user, password, vmName string) {
 // HTTP call to it and raises WLB_CONNECTION_REFUSED/WLB_CONNECTION_RESET if it can't connect -
 // there is no way to fake this with a placeholder. wlbHostPort is host:port, with no URL scheme -
 // that is the real wire format (xe pool-initialize-wlb wlb_url="10.x.x.x:30601" ...), not a URL.
-func wlbRecommendations(url, user, password, vmName, wlbHostPort, wlbUsername, wlbPassword string) {
+//
+// The pool checks the appliance's TLS certificate (pool.wlb_verify_cert), and only against the
+// certificates installed with Pool.CertificateInstall - not install_trusted_certificate's. A fresh
+// appliance has a self-signed one, so pass it as wlbCertificate (a PEM file): without it
+// InitializeWlb fails with INTERNAL_ERROR "Connection failed: configuration failed." and no hint
+// that the certificate is the reason.
+func wlbRecommendations(url, user, password, vmName, wlbHostPort, wlbUsername, wlbPassword, wlbCertificate string) {
 	session := connect(url, user, password)
-	check(xenapi.Pool.InitializeWlb(session, wlbHostPort, wlbUsername, wlbPassword, user, password))
+	// Deferred first, so it runs LAST: after the deferred WLB tidy-up below, which needs the session.
+	defer session.Logout()
 
+	certName := ""
+	if wlbCertificate != "" {
+		certName = "sdk-example-wlb.pem"
+		cert, err := os.ReadFile(wlbCertificate)
+		check(err)
+		check(xenapi.Pool.CertificateInstall(session, certName, string(cert))) // pool-wide: no pool argument
+	}
+	check(xenapi.Pool.InitializeWlb(session, wlbHostPort, wlbUsername, wlbPassword, user, password))
+	defer func() {
+		// Disconnect from the appliance however the above went, or the pool stays attached to it.
+		check(xenapi.Pool.DeconfigureWlb(session))
+		if certName != "" {
+			check(xenapi.Pool.CertificateUninstall(session, certName))
+		}
+	}()
+
+	// Initializing connects the pool to the appliance but leaves balancing off: every WLB call after
+	// this would fail WLB_DISABLED until it's switched on.
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
+	check(xenapi.Pool.SetWlbEnabled(session, pools[0], true))
 	wlbURL, _ := xenapi.Pool.GetWlbURL(session, pools[0])
 	fmt.Printf("WLB: %s\n", wlbURL)
 
@@ -2988,11 +3241,23 @@ func wlbRecommendations(url, user, password, vmName, wlbHostPort, wlbUsername, w
 		fmt.Printf("  move %s -> host %s (%s)\n", name, fields[1], fields[4])
 	}
 
-	// A VM's own are keyed by host and star-rate each destination: [0] "wlb", [1] the rating.
+	// A VM's own are keyed by host and star-rate each destination: [0] "wlb", [1] the rating - higher
+	// is better (a real appliance rated hosts 6.1 here, so not capped at XenCenter's five stars).
+	// Right after connecting, the appliance is still discovering the pool and answers
+	// WLB_INTERNAL_ERROR 4024 ("Pool discovery has not been started"), 4025 ("... has not been
+	// completed"), then 4016 ("WLB does not have current metrics") - keep asking for a while.
 	vms, err := xenapi.VM.GetByNameLabel(session, vmName)
 	check(err)
-	vmRecs, err := xenapi.VM.RetrieveWlbRecommendations(session, vms[0])
-	check(err)
+	deadline := time.Now().Add(10 * time.Minute)
+	var vmRecs map[xenapi.HostRef][]string
+	for {
+		vmRecs, err = xenapi.VM.RetrieveWlbRecommendations(session, vms[0])
+		if err == nil || !isWlbStillDiscovering(err) || time.Now().After(deadline) {
+			check(err)
+			break
+		}
+		time.Sleep(15 * time.Second)
+	}
 	for hostRef, fields := range vmRecs {
 		name, _ := xenapi.Host.GetNameLabel(session, hostRef)
 		fmt.Printf("  %s rated %s\n", name, fields[1])
@@ -3014,9 +3279,24 @@ func wlbRecommendations(url, user, password, vmName, wlbHostPort, wlbUsername, w
 	}
 	fmt.Printf("  appliance configuration: %s\n", strings.Join(pairs, ", "))
 
-	check(xenapi.Pool.DeconfigureWlb(session))
 	fmt.Println("OK: wlb-recommendations")
-	session.Logout()
+}
+
+// isWlbStillDiscovering reports whether err is a WLB_INTERNAL_ERROR whose WLB code is 4024, 4025 or
+// 4016 - the appliance is still discovering the pool, or has no metrics for it yet. See
+// coordinatorFromSlaveError for why the data slice has to be parsed out of the formatted error string.
+func isWlbStillDiscovering(err error) bool {
+	msg := err.Error()
+	if !strings.Contains(msg, xenapi.ErrorWlbInternalError) {
+		return false
+	}
+	m := regexp.MustCompile(`data \[(.+)\]`).FindStringSubmatch(msg)
+	if m == nil {
+		return false
+	}
+	fields := strings.Fields(m[1])
+	// The binding prints the code in the message and only its parameters in data: [4024 Pool ...].
+	return len(fields) > 0 && (fields[0] == "4024" || fields[0] == "4025" || fields[0] == "4016")
 }
 
 // --- Configure clustering (GFS2) ---------------------------------------------------------
@@ -3093,13 +3373,15 @@ func managePoolMembership(url, user, password string) {
 		fmt.Printf("  member: %s%s\n", hn, suffix)
 	}
 	otherName, _ := xenapi.Host.GetNameLabel(session, other)
+	otherUUID, _ := xenapi.Host.GetUUID(session, other)
+	originalUUID, _ := xenapi.Host.GetUUID(session, original)
 
 	// Promote another member. The pool database moves with the role and clients are redirected, so this
 	// briefly interrupts management traffic — it does not move any VM.
 	check(xenapi.Pool.DesignateNewMaster(session, other))
 	fmt.Printf("Promoting:   %s (xapi restarts pool-wide; reconnecting)\n", otherName)
 
-	session = reconnectAfterMasterChange(url, user, password)
+	session = reconnectAfterMasterChange(url, user, password, otherUUID)
 	pools, err = xenapi.Pool.GetAll(session)
 	check(err)
 	master, _ := xenapi.Pool.GetMaster(session, pools[0])
@@ -3111,7 +3393,7 @@ func managePoolMembership(url, user, password string) {
 	check(xenapi.Pool.DesignateNewMaster(session, original))
 	fmt.Printf("Restoring:   %s (reconnecting again)\n", name)
 
-	session = reconnectAfterMasterChange(url, user, password)
+	session = reconnectAfterMasterChange(url, user, password, originalUUID)
 	pools, err = xenapi.Pool.GetAll(session)
 	check(err)
 	master, _ = xenapi.Pool.GetMaster(session, pools[0])
@@ -3144,12 +3426,18 @@ func createBond(url, user, password string) {
 			devices = append(devices, pif.Device)
 		}
 	}
+	if len(spares) < 2 {
+		name, _ := xenapi.Host.GetNameLabel(session, hosts[0])
+		panic(fmt.Sprintf("%s has %d spare NIC(s); a bond needs two that aren't the management interface",
+			name, len(spares)))
+	}
 	fmt.Printf("Bonding:      %s\n", strings.Join(devices, ", "))
 
 	// The bond needs a network to sit on.
 	network, err := xenapi.Network.Create(session, xenapi.NetworkRecord{
 		NameLabel:       "sdk-example-bond",
 		NameDescription: "Created by the SDK example",
+		Managed:         true, // as in createNetwork: the zero value would be NETWORK_UNMANAGED
 	})
 	check(err)
 
@@ -3172,11 +3460,32 @@ func createBond(url, user, password string) {
 }
 
 // --- Configure PVS Accelerator ---
-func configurePvsAccelerator(url, user, password string) {
+func configurePvsAccelerator(url, user, password, vmName string) {
 	session := connect(url, user, password)
 	defer session.Logout()
 
-	site, err := xenapi.PVSSite.Introduce(session, "sdk-pvs-farm", "Created by the SDK examples", "")
+	// Check the VM first, before creating anything: it needs a NIC for the proxy to sit on. It need
+	// not be running - a proxy on a halted VM just reports "stopped" until it starts.
+	vm := vmByName(session, vmName)
+	vifs, err := xenapi.VM.GetVIFs(session, vm)
+	check(err)
+	if len(vifs) == 0 {
+		panic(fmt.Sprintf("%s has no network interface to accelerate", vmName))
+	}
+	// A proxy may only sit on the VM's LOWEST-numbered NIC, so sort by device rather than taking
+	// VIFs[0] — the list comes back in creation order, which is the same thing only by luck.
+	sort.Slice(vifs, func(i, j int) bool { return vifDevice(session, vifs[i]) < vifDevice(session, vifs[j]) })
+	// ... and one that no site accelerates yet (a VIF takes one proxy: PVS_PROXY_ALREADY_PRESENT).
+	proxies, err := xenapi.PVSProxy.GetAllRecords(session)
+	check(err)
+	for _, proxy := range proxies {
+		if proxy.VIF == vifs[0] {
+			siteName, _ := xenapi.PVSSite.GetNameLabel(session, proxy.Site)
+			panic(fmt.Sprintf("%s is already accelerated by site '%s'", vmName, siteName))
+		}
+	}
+
+	site, err := xenapi.PVSSite.Introduce(session, "sdk-example-pvs", "Created by the SDK examples", "")
 	check(err)
 	_, err = xenapi.PVSServer.Introduce(session, []string{"10.62.0.90"}, 6910, 6930, site)
 	check(err)
@@ -3196,11 +3505,8 @@ func configurePvsAccelerator(url, user, password string) {
 		check(err)
 	}
 
-	// A proxy may only sit on the VM's LOWEST-numbered NIC, so sort by device rather than taking
-	// VIFs[0] — the list comes back in creation order, which is the same thing only by luck.
-	vm := firstUnacceleratedGuest(session)
-	vifs := append([]xenapi.VIFRef(nil), vm.VIFs...)
-	sort.Slice(vifs, func(i, j int) bool { return vifDevice(session, vifs[i]) < vifDevice(session, vifs[j]) })
+	// A proxy may only sit on the VM's LOWEST-numbered NIC, hence sorting by device above rather than
+	// taking VIFs[0] — the list comes back in creation order, which is the same thing only by luck.
 	proxy, err := xenapi.PVSProxy.Create(session, site, vifs[0])
 	check(err)
 
@@ -3212,7 +3518,8 @@ func configurePvsAccelerator(url, user, password string) {
 	// and a proxy on a VM whose NIC is unplugged reports "stopped".
 	status, err := xenapi.PVSProxy.GetStatus(session, proxy)
 	check(err)
-	fmt.Printf("  %s: %s\n", vm.NameLabel, status)
+	vmLabel, _ := xenapi.VM.GetNameLabel(session, vm)
+	fmt.Printf("  %s: %s\n", vmLabel, status)
 
 	// Forgetting the site only cascades its cache storage - a running proxy or a server it still
 	// has makes forget refuse with PVS_SITE_CONTAINS_RUNNING_PROXIES/_SERVERS, so tear those down
@@ -3249,32 +3556,6 @@ func vifDevice(session *xenapi.Session, vif xenapi.VIFRef) int {
 	check(err)
 	n, _ := strconv.Atoi(device)
 	return n
-}
-
-// firstUnacceleratedGuest returns a running guest with a NIC that no proxy already covers. A VIF can
-// carry only one proxy, so a VM the pool already accelerates fails with PVS_PROXY_ALREADY_PRESENT.
-func firstUnacceleratedGuest(session *xenapi.Session) xenapi.VMRecord {
-	taken := map[xenapi.VMRef]bool{}
-	proxies, err := xenapi.PVSProxy.GetAll(session)
-	check(err)
-	for _, proxy := range proxies {
-		vif, err := xenapi.PVSProxy.GetVIF(session, proxy)
-		check(err)
-		vm, err := xenapi.VIF.GetVM(session, vif)
-		check(err)
-		taken[vm] = true
-	}
-	vms, err := xenapi.VM.GetAllRecords(session)
-	check(err)
-	for ref, v := range vms {
-		if v.IsATemplate || v.IsControlDomain || v.IsASnapshot || taken[ref] {
-			continue
-		}
-		if v.PowerState == xenapi.VMPowerStateRunning && len(v.VIFs) > 0 {
-			return v
-		}
-	}
-	panic("no unaccelerated running guest with a NIC")
 }
 
 // --- Manage SSH access ---
@@ -3490,23 +3771,20 @@ func firstDisk(session *xenapi.Session, vm xenapi.VMRef) xenapi.VDIRef {
 }
 
 // --- Export and import a VM ---
-func exportImportVm(url, user, password string) {
+func exportImportVm(url, user, password, vmName string) {
 	session := connect(url, user, password)
 	defer session.Logout()
 
-	// Only a halted VM can be exported: its disks must not be changing underneath the copy.
-	vms, err := xenapi.VM.GetAllRecords(session)
+	// Name the VM: an export carries every block of its disks, so which VM matters (a large one takes a
+	// long time, and fills the disk). Only a halted VM can be exported: its disks must not be changing
+	// underneath the copy.
+	vm := vmByName(session, vmName)
+	powerState, err := xenapi.VM.GetPowerState(session, vm)
 	check(err)
-	var vm xenapi.VMRef
-	var record xenapi.VMRecord
-	for ref, v := range vms {
-		if !v.IsATemplate && !v.IsControlDomain && !v.IsASnapshot &&
-			v.PowerState == xenapi.VMPowerStateHalted {
-			vm, record = ref, v
-			break
-		}
+	if powerState != xenapi.VMPowerStateHalted {
+		panic(fmt.Sprintf("%s must be halted to be exported", vmName))
 	}
-	fmt.Printf("Exporting %s\n", record.NameLabel)
+	fmt.Printf("Exporting %s\n", vmName)
 
 	// Export and import are HTTP transfers alongside the API, not API calls, so the session id travels
 	// in the query string. The Go binding keeps its own session private, so obtain one the same way the
@@ -3518,6 +3796,10 @@ func exportImportVm(url, user, password string) {
 	check(err)
 	path := temp.Name()
 	temp.Close()
+	// Always clean up the file, on failure too: a real export is gigabytes, not worth leaving behind.
+	defer os.Remove(path)
+
+	// Stream both directions: a real VM's export is gigabytes, too large to hold in memory.
 	uuid, err := xenapi.VM.GetUUID(session, vm)
 	check(err)
 	resp, err := insecureClient().Get(fmt.Sprintf("%s/export?session_id=%s&uuid=%s", url, sid, uuid))
@@ -3545,7 +3827,7 @@ func exportImportVm(url, user, password string) {
 	// simulator's convenience echoes it there) - the only place it appears is the task named in the
 	// task_id query parameter, so create one, pass it, and read task.get_result() once the upload
 	// finishes (the same <value>...</value> string-strip wait-for-task already uses).
-	task, err := xenapi.Task.Create(session, "vm_import", "importing "+record.NameLabel+" back")
+	task, err := xenapi.Task.Create(session, "vm_import", "importing "+vmName+" back")
 	check(err)
 	defer xenapi.Task.Destroy(session, task)
 
@@ -3577,16 +3859,20 @@ func exportImportVm(url, user, password string) {
 	}
 	result, err := xenapi.Task.GetResult(session, task)
 	check(err)
-	imported := xenapi.VMRef(strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(result, "<value>", ""), "</value>", "")))
+	// The result lists the imported VMs (<value><array><data>OpaqueRef:...</data></array></value>
+	// on a real host), so take the first reference in it.
+	imported := xenapi.VMRef(regexp.MustCompile(`OpaqueRef:[^<]+`).FindString(result))
 	name, err := xenapi.VM.GetNameLabel(session, imported)
 	check(err)
 	fmt.Printf("  imported as %s\n", name)
 
 	// The import brought its own disks along; destroy those too, not just the VM record.
 	destroyVMAndDisks(session, imported)
-	check(os.Remove(path))
 	fmt.Println("OK: export-import-vm")
 }
+
+// Run it:
+//   exportImportVm("https://xenserver", "root", password, "db-01")
 
 // tarNames lists the entries of a tar archive.
 func tarNames(path string) []string {
@@ -3750,8 +4036,15 @@ func manageVmMedia(url, user, password string) {
 // to THAT host's own address, not to the pool's (coordinator) url - a restore sent to the wrong
 // host's connection silently restores the WRONG host, not the one named by ref=. ref= is kept in
 // the query string purely for log-readability (a real host ignores it).
+//
+// Both halves are hundreds of MB on a real host, so they stream to/from a temp file rather than
+// holding the backup in memory. A transfer takes long enough on a slow link for the network to drop
+// an API connection left idle meanwhile, and the next call would then hang on it until the socket
+// timed out - so this session sends "Connection: close", giving every API call its own connection.
 func backupHostConfig(url, user, password string) {
-	session := connect(url, user, password)
+	session := xenapi.NewSession(&xenapi.ClientOpts{URL: url, Headers: map[string]string{"Connection": "close"}})
+	_, err := session.LoginWithPassword(user, password, "1.0", "sdk-examples")
+	check(err)
 	defer session.Logout()
 
 	hosts, err := xenapi.Host.GetAll(session)
@@ -3770,18 +4063,20 @@ func backupHostConfig(url, user, password string) {
 	temp, err := os.CreateTemp("", "sdk-example-host-*.backup")
 	check(err)
 	path := temp.Name()
-	temp.Close()
 
 	resp, err := insecureClient().Get(
 		fmt.Sprintf("%s/host_backup?session_id=%s&ref=%s", hostAddr, sid, host))
 	check(err)
-	backup, err := io.ReadAll(resp.Body)
+	// Hundreds of MB on a real host: stream it to disk, don't hold it in memory.
+	_, err = io.Copy(temp, resp.Body)
 	check(err)
 	resp.Body.Close()
-	check(os.WriteFile(path, backup, 0o600))
-	fmt.Printf("  wrote %d bytes to %s\n", len(backup), filepath.Base(path))
+	check(temp.Close())
+	info, err := os.Stat(path)
+	check(err)
+	fmt.Printf("  wrote %d bytes to %s\n", info.Size(), filepath.Base(path))
 
-	fmt.Printf("  restoring it to %s: %s\n", name, restoreHostConfig(session, hostAddr, sid, host, backup))
+	fmt.Printf("  restoring it to %s: %s\n", name, restoreHostConfig(session, hostAddr, sid, host, path))
 	if len(hosts) > 1 {
 		other := hosts[1]
 		otherName, err := xenapi.Host.GetNameLabel(session, other)
@@ -3796,7 +4091,7 @@ func backupHostConfig(url, user, password string) {
 		// matters in topologies (like this simulator fixture) where a second host's address isn't
 		// actually routable from the caller.
 		fmt.Printf("  restoring it to %s: %s\n", otherName,
-			safeRestoreHostConfig(session, otherURL, sid, other, backup))
+			safeRestoreHostConfig(session, otherURL, sid, other, path))
 	}
 
 	check(os.Remove(path))
@@ -3805,13 +4100,13 @@ func backupHostConfig(url, user, password string) {
 
 // safeRestoreHostConfig calls restoreHostConfig but turns any transport error into a friendly
 // message instead of letting the whole example fail.
-func safeRestoreHostConfig(session *xenapi.Session, hostURL, sid string, host xenapi.HostRef, backup []byte) (result string) {
+func safeRestoreHostConfig(session *xenapi.Session, hostURL, sid string, host xenapi.HostRef, path string) (result string) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = fmt.Sprintf("could not connect to %s directly (%v)", hostURL, r)
 		}
 	}()
-	return restoreHostConfig(session, hostURL, sid, host, backup)
+	return restoreHostConfig(session, hostURL, sid, host, path)
 }
 
 // restoreHostConfig uploads a backup to a host - over a connection opened to THAT host's own
@@ -3820,16 +4115,26 @@ func safeRestoreHostConfig(session *xenapi.Session, hostURL, sid string, host xe
 // An upload answers 200 as soon as it has read the request headers, because the client waits for that
 // before it starts sending the file. The outcome therefore cannot be in the status line: it arrives on a
 // task you create first, name in the URL, and poll once the upload has finished.
-func restoreHostConfig(session *xenapi.Session, url, sid string, host xenapi.HostRef, backup []byte) string {
+func restoreHostConfig(session *xenapi.Session, url, sid string, host xenapi.HostRef, path string) string {
 	task, err := xenapi.Task.Create(session, "host_restore", "restoring a configuration backup")
 	check(err)
 	defer xenapi.Task.Destroy(session, task)
 
+	file, err := os.Open(path)
+	check(err)
+	defer file.Close()
+	info, err := os.Stat(path)
+	check(err)
+
+	// Stream the file as the request body rather than reading it into memory first: a real host's
+	// backup is hundreds of MB. http.NewRequest can't infer the length of an arbitrary io.Reader, so
+	// set ContentLength explicitly - without it Go would send chunked Transfer-Encoding, which isn't
+	// what a real host's /host_restore handler expects.
 	request, err := http.NewRequest(http.MethodPut,
 		fmt.Sprintf("%s/host_restore?session_id=%s&ref=%s&task_id=%s", url, sid, host, task),
-		bytes.NewReader(backup))
+		file)
 	check(err)
-	request.ContentLength = int64(len(backup))
+	request.ContentLength = info.Size()
 	resp, err := insecureClient().Do(request)
 	check(err)
 	io.Copy(io.Discard, resp.Body)
@@ -4016,9 +4321,12 @@ func serverStatusReport(url, user, password string) {
 		} `xml:"capability"`
 	}
 	check(xml.Unmarshal([]byte(capabilitiesXML), &catalogue))
-	var keys []string
+	var keys, defaults []string
 	for _, capability := range catalogue.Capabilities {
 		keys = append(keys, capability.Key)
+		if capability.DefaultChecked == "yes" {
+			defaults = append(defaults, capability.Key)
+		}
 		fmt.Printf("  %-22s max %9s bytes  default=%-3s pii=%s\n",
 			capability.Key, capability.MaxSize, capability.DefaultChecked, capability.Pii)
 	}
@@ -4026,8 +4334,10 @@ func serverStatusReport(url, user, password string) {
 	// The download is an HTTP transfer alongside the API, so the session id travels in the query string.
 	// The Go binding keeps its own session private, so obtain one of our own.
 	sid := rawLogin(url, user, password)
-	whole := fetchStatusReport(url, sid, keys)
-	fmt.Printf("everything (%d sections): %d bytes\n", len(keys), whole)
+	// Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+	// section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+	whole := fetchStatusReport(url, sid, defaults)
+	fmt.Printf("default sections (%d of %d): %d bytes\n", len(defaults), len(keys), whole)
 
 	// Pick a real, small section from the host's own catalogue rather than assuming a name: the
 	// catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
@@ -4048,15 +4358,23 @@ func serverStatusReport(url, user, password string) {
 	fmt.Println("OK: server-status-report")
 }
 
-// fetchStatusReport downloads the bundle for the given capability keys (a tar archive) and sizes it.
+// fetchStatusReport downloads the bundle for the given capability keys (a tar archive) to a temp file,
+// streaming it - a report can be large - and returns its size. This example then deletes it; you'd keep it.
 func fetchStatusReport(url, sid string, entries []string) int {
 	resp, err := insecureClient().Get(fmt.Sprintf("%s/system-status?session_id=%s&output=tar&entries=%s",
 		url, sid, strings.Join(entries, ",")))
 	check(err)
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+
+	temp, err := os.CreateTemp("", "sdk-example-status-*.tar")
 	check(err)
-	return len(body)
+	path := temp.Name()
+	defer os.Remove(path)
+
+	written, err := io.Copy(temp, resp.Body)
+	check(err)
+	temp.Close()
+	return int(written)
 }
 
 // Run it:
@@ -4295,12 +4613,13 @@ func restartHost(url, user, password string) {
 	fmt.Printf("  evacuated:  guests=%d\n", guestCount(session, host))
 
 	check(xenapi.Host.Reboot(session, host))
-	// A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long
-	// as XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the
-	// reboot to get underway, then explicitly re-enables - disabling does not clear itself, not even
-	// across a reboot, so nothing else brings the host back into service.
-	time.Sleep(5 * time.Second)
-	check(xenapi.Host.Enable(session, host))
+	// A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+	// host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+	// itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+	// never does - so enable it explicitly rather than depend on either.
+	waitForHostLiveTimeout(session, host, false, 600*time.Second, 2*time.Second)
+	waitForHostLiveTimeout(session, host, true, 1200*time.Second, 10*time.Second)
+	enableWhenBooted(session, host)
 	enabled, _ = xenapi.Host.GetEnabled(session, host)
 	fmt.Printf("  rebooted, re-enabled: enabled=%t\n", enabled)
 
@@ -4314,9 +4633,9 @@ func restartHost(url, user, password string) {
 		waitForHostLive(session, host, false)
 		fmt.Printf("  shut down:  live=%t\n", hostLive(session, host))
 		check(xenapi.Host.PowerOn(session, host))
-		waitForHostLive(session, host, true)
+		waitForHostLiveTimeout(session, host, true, 1200*time.Second, 10*time.Second)
 		fmt.Printf("  powered on: live=%t\n", hostLive(session, host))
-		check(xenapi.Host.Enable(session, host))
+		enableWhenBooted(session, host)
 		enabled, _ = xenapi.Host.GetEnabled(session, host)
 		fmt.Printf("  re-enabled: enabled=%t\n", enabled)
 	} else {
@@ -4454,7 +4773,8 @@ func attachVdi(session *xenapi.Session, vm xenapi.VMRef, vdi xenapi.VDIRef) xena
 	check(err)
 	vbd, err := xenapi.VBD.Create(session, xenapi.VBDRecord{
 		VM: vm, VDI: vdi, Userdevice: devices[0],
-		Mode: xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
+		Bootable: false,
+		Mode:     xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
 		OtherConfig: map[string]string{}, QosAlgorithmParams: map[string]string{},
 	})
 	check(err)
@@ -4749,19 +5069,28 @@ func manageDriverVariants(url, user, password string) {
 
 	// Select a variant explicitly. It becomes the selected one immediately; whether it is also active
 	// depends on whether the hardware is present and the driver already loaded.
-	// Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
-	// and variant order isn't guaranteed to put the usable one first - pick the first one that
-	// reports its hardware present, falling back to the first variant only if none do.
-	first := refs[0]
-	variant := drivers[first].Variants[0]
-	for _, v := range drivers[first].Variants {
-		if present, _ := xenapi.DriverVariant.GetHardwarePresent(session, v); present {
-			variant = v
+	// Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE) -
+	// and a host lists drivers for plenty of devices it doesn't have - so pick a driver for hardware
+	// this host actually has, and one of its variants that is usable.
+	var chosenDriver xenapi.HostDriverRef
+	var chosenVariant xenapi.DriverVariantRef
+	found := false
+	for _, ref := range refs {
+		for _, v := range drivers[ref].Variants {
+			if present, _ := xenapi.DriverVariant.GetHardwarePresent(session, v); present {
+				chosenDriver, chosenVariant, found = ref, v, true
+				break
+			}
+		}
+		if found {
 			break
 		}
 	}
-	check(xenapi.HostDriver.Select(session, first, variant))
-	after, err := xenapi.HostDriver.GetRecord(session, first)
+	if !found {
+		panic(fmt.Sprintf("no driver on %s has a variant for hardware it has", hostName))
+	}
+	check(xenapi.HostDriver.Select(session, chosenDriver, chosenVariant))
+	after, err := xenapi.HostDriver.GetRecord(session, chosenDriver)
 	check(err)
 	fmt.Printf("  %s: selected %s, active %s\n",
 		after.Name, variantName(session, after.SelectedVariant), variantName(session, after.ActiveVariant))
@@ -4833,9 +5162,9 @@ var workflows = map[string]workflow{
 	"vm-lifecycle": wf(map[string]string{"source_vm": "web-01", "new_vm_name": "sdk-example-lifecycle"},
 		func(u, n, p string, m map[string]string) { vmLifecycle(u, n, p, m["source_vm"], m["new_vm_name"]) }),
 	"manage-vm-disks": wf(map[string]string{
-		"template_name": "Rocky Linux 8", "sr_name": "Shared NFS", "new_vm_name": "sdk-example-vm-disks",
+		"source_vm": "web-01", "sr_name": "Shared NFS", "new_vm_name": "sdk-example-vm-disks",
 	}, func(u, n, p string, m map[string]string) {
-		manageVMDisks(u, n, p, m["template_name"], m["sr_name"], m["new_vm_name"])
+		manageVMDisks(u, n, p, m["source_vm"], m["sr_name"], m["new_vm_name"])
 	}),
 	"dismiss-alerts":       wf(nil, func(u, n, p string, m map[string]string) { dismissAlerts(u, n, p) }),
 	"host-power-on":        wf(nil, func(u, n, p string, m map[string]string) { hostPowerOn(u, n, p) }),
@@ -4881,7 +5210,9 @@ var workflows = map[string]workflow{
 		}),
 	"tags-and-folders": wf(map[string]string{"vm_name": "web-01"},
 		func(u, n, p string, m map[string]string) { tagsAndFolders(u, n, p, m["vm_name"]) }),
-	"configure-updates": wf(nil, func(u, n, p string, m map[string]string) { configureUpdates(u, n, p) }),
+	"configure-updates": wf(map[string]string{
+		"repo_url": "https://repo.ops.xenserver.com/xs9", "source_url": "https://repo-src.ops.xenserver.com/xs9",
+	}, func(u, n, p string, m map[string]string) { configureUpdates(u, n, p, m["repo_url"], m["source_url"]) }),
 	"clone-vm": wf(map[string]string{"vm_name": "db-01", "clone_name": "sdk-example-clone"},
 		func(u, n, p string, m map[string]string) { cloneVM(u, n, p, m["vm_name"], m["clone_name"]) }),
 	"delete-vm": wf(map[string]string{"template_name": "Rocky Linux 8", "new_vm_name": "sdk-example-delete"},
@@ -4890,7 +5221,9 @@ var workflows = map[string]workflow{
 		func(u, n, p string, m map[string]string) {
 			storageMigrate(u, n, p, m["source_vm"], m["new_vm_name"])
 		}),
-	"apply-update": wf(nil, func(u, n, p string, m map[string]string) { applyUpdate(u, n, p) }),
+	"apply-update": wf(map[string]string{
+		"repo_url": "https://repo.ops.xenserver.com/xs9", "source_url": "https://repo-src.ops.xenserver.com/xs9",
+	}, func(u, n, p string, m map[string]string) { applyUpdate(u, n, p, m["repo_url"], m["source_url"]) }),
 	"checkpoint-vm": wf(map[string]string{"source_vm": "web-01", "new_vm_name": "sdk-example-checkpoint"},
 		func(u, n, p string, m map[string]string) { checkpointVM(u, n, p, m["source_vm"], m["new_vm_name"]) }),
 	"attach-disk": wf(map[string]string{
@@ -4926,15 +5259,19 @@ var workflows = map[string]workflow{
 		}),
 	"find-by-uuid": wf(map[string]string{"vm_name": "web-01"},
 		func(u, n, p string, m map[string]string) { findByUUID(u, n, p, m["vm_name"]) }),
-	"rolling-pool-update":       wf(nil, func(u, n, p string, m map[string]string) { rollingPoolUpdate(u, n, p) }),
-	"pvs-accelerator":           wf(nil, func(u, n, p string, m map[string]string) { pvsAccelerator(u, n, p) }),
-	"configure-pvs-accelerator": wf(nil, func(u, n, p string, m map[string]string) { configurePvsAccelerator(u, n, p) }),
-	"manage-ssh-access":         wf(nil, func(u, n, p string, m map[string]string) { manageSSHAccess(u, n, p) }),
-	"manage-vtpm":               wf(nil, func(u, n, p string, m map[string]string) { manageVtpm(u, n, p) }),
-	"export-import-vm":          wf(nil, func(u, n, p string, m map[string]string) { exportImportVm(u, n, p) }),
-	"configure-dynamic-memory":  wf(nil, func(u, n, p string, m map[string]string) { configureDynamicMemory(u, n, p) }),
-	"manage-vm-media":           wf(nil, func(u, n, p string, m map[string]string) { manageVmMedia(u, n, p) }),
-	"backup-host-config":        wf(nil, func(u, n, p string, m map[string]string) { backupHostConfig(u, n, p) }),
+	"rolling-pool-update": wf(map[string]string{
+		"repo_url": "https://repo.ops.xenserver.com/xs9", "source_url": "https://repo-src.ops.xenserver.com/xs9",
+	}, func(u, n, p string, m map[string]string) { rollingPoolUpdate(u, n, p, m["repo_url"], m["source_url"]) }),
+	"pvs-accelerator": wf(nil, func(u, n, p string, m map[string]string) { pvsAccelerator(u, n, p) }),
+	"configure-pvs-accelerator": wf(map[string]string{"vm_name": "db-01"},
+		func(u, n, p string, m map[string]string) { configurePvsAccelerator(u, n, p, m["vm_name"]) }),
+	"manage-ssh-access": wf(nil, func(u, n, p string, m map[string]string) { manageSSHAccess(u, n, p) }),
+	"manage-vtpm":       wf(nil, func(u, n, p string, m map[string]string) { manageVtpm(u, n, p) }),
+	"export-import-vm": wf(map[string]string{"vm_name": "db-01"},
+		func(u, n, p string, m map[string]string) { exportImportVm(u, n, p, m["vm_name"]) }),
+	"configure-dynamic-memory": wf(nil, func(u, n, p string, m map[string]string) { configureDynamicMemory(u, n, p) }),
+	"manage-vm-media":          wf(nil, func(u, n, p string, m map[string]string) { manageVmMedia(u, n, p) }),
+	"backup-host-config":       wf(nil, func(u, n, p string, m map[string]string) { backupHostConfig(u, n, p) }),
 	"manage-sr-lifecycle": wf(map[string]string{"nfs_server": "192.0.2.10", "nfs_path": "/export/spare"},
 		func(u, n, p string, m map[string]string) { manageSrLifecycle(u, n, p, m["nfs_server"], m["nfs_path"]) }),
 	"set-default-sr": wf(map[string]string{"nfs_server": "192.0.2.10", "nfs_path": "/export/spare"},
@@ -4958,8 +5295,9 @@ var workflows = map[string]workflow{
 		func(u, n, p string, m map[string]string) { vmIpAddress(u, n, p, m["timeout"], m["interval"]) }),
 	"manage-ad-users": wf(map[string]string{
 		"domain": "", "admin_user": "alice", "admin_password": "Password1", "new_user": "alice",
+		"ldaps": "false",
 	}, func(u, n, p string, m map[string]string) {
-		manageAdUsers(u, n, p, m["domain"], m["admin_user"], m["admin_password"], m["new_user"])
+		manageAdUsers(u, n, p, m["domain"], m["admin_user"], m["admin_password"], m["new_user"], m["ldaps"])
 	}),
 	"create-iscsi-sr": wf(map[string]string{
 		"target": "192.0.2.30", "port": "", "chap_user": "", "chap_password": "", "target_iqn": "",
@@ -4974,9 +5312,10 @@ var workflows = map[string]workflow{
 	}, func(u, n, p string, m map[string]string) {
 		createSmbSr(u, n, p, m["server"], m["share"], m["smb_username"], m["smb_password"], m["sr_name"])
 	}),
-	"create-hba-sr": wf(map[string]string{"sr_name": "sdk-example-hba"},
-		func(u, n, p string, m map[string]string) { createHbaSr(u, n, p, m["sr_name"]) }),
-	"create-iso-sr":  wf(nil, func(u, n, p string, m map[string]string) { createIsoSr(u, n, p) }),
+	"create-hba-sr": wf(map[string]string{"scsi_id": "", "sr_name": "sdk-example-hba"},
+		func(u, n, p string, m map[string]string) { createHbaSr(u, n, p, m["scsi_id"], m["sr_name"]) }),
+	"create-iso-sr": wf(map[string]string{"location": "192.0.2.10:/isos"},
+		func(u, n, p string, m map[string]string) { createIsoSr(u, n, p, m["location"]) }),
 	"configure-nrpe": wf(nil, func(u, n, p string, m map[string]string) { configureNrpe(u, n, p) }),
 	"configure-snmp": wf(map[string]string{"trap_destination": "192.0.2.50"},
 		func(u, n, p string, m map[string]string) { configureSnmp(u, n, p, m["trap_destination"]) }),
@@ -4989,8 +5328,10 @@ var workflows = map[string]workflow{
 		func(u, n, p string, m map[string]string) { attachUsbDevice(u, n, p, m["vm_name"]) }),
 	"wlb-recommendations": wf(map[string]string{
 		"vm_name": "web-01", "wlb_host_port": "wlb.example:8012", "wlb_username": "wlbuser", "wlb_password": "wlbpass",
+		"wlb_certificate": "",
 	}, func(u, n, p string, m map[string]string) {
-		wlbRecommendations(u, n, p, m["vm_name"], m["wlb_host_port"], m["wlb_username"], m["wlb_password"])
+		wlbRecommendations(u, n, p, m["vm_name"], m["wlb_host_port"], m["wlb_username"], m["wlb_password"],
+			m["wlb_certificate"])
 	}),
 	"configure-pool-options":   wf(nil, func(u, n, p string, m map[string]string) { configurePoolOptions(u, n, p) }),
 	"configure-console-access": wf(nil, func(u, n, p string, m map[string]string) { configureConsoleAccess(u, n, p) }),
@@ -5001,14 +5342,24 @@ var workflows = map[string]workflow{
 }
 
 func main() {
-	// cross-pool-copy-vm spans two pools, so it keeps its existing fixed 4-arg form (plus the
-	// destination URL), unchanged - no key=value overrides.
+	// cross-pool-copy-vm spans two pools, so it keeps its own positional form - the destination URL,
+	// then optionally that pool's credentials (if they differ from the source's) and the VM to copy -
+	// with no key=value overrides.
 	if len(os.Args) >= 2 && os.Args[1] == "cross-pool-copy-vm" {
-		if len(os.Args) != 6 {
-			fmt.Fprintln(os.Stderr, "usage: go run . cross-pool-copy-vm <sourceUrl> <user> <password> <destUrl>")
+		n := len(os.Args)
+		if n != 6 && n != 8 && n != 9 {
+			fmt.Fprintln(os.Stderr, "usage: go run . cross-pool-copy-vm <sourceUrl> <user> <password> <destUrl>"+
+				" [<destUser> <destPassword> [<vmName>]]")
 			os.Exit(2)
 		}
-		crossPoolCopyVM(os.Args[2], os.Args[3], os.Args[4], os.Args[5], "db-01")
+		vmName, destUser, destPassword := "db-01", "", ""
+		if n >= 8 {
+			destUser, destPassword = os.Args[6], os.Args[7]
+		}
+		if n == 9 {
+			vmName = os.Args[8]
+		}
+		crossPoolCopyVM(os.Args[2], os.Args[3], os.Args[4], os.Args[5], vmName, destUser, destPassword)
 		return
 	}
 	if len(os.Args) < 5 {

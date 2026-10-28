@@ -288,7 +288,7 @@ w_manage_vtpm() {
     vtpm=$(xe vtpm-create vm-uuid=$vm is-unique=false)
     echo "  unique to this VM:   $(xe vtpm-param-get uuid=$vtpm param-name=is_unique)"
     echo "  protected:           $(xe vtpm-param-get uuid=$vtpm param-name=is_protected)"
-    echo "  VM now has $(count_csv "$(xe vm-param-get uuid=$vm param-name=vtpms --minimal)") vTPM(s)"
+    echo "  VM now has $(count_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=vtpms)")") vTPM(s)"
 
     # The VM advertises whether another can be added; once it has one, it cannot.
     case "$(xe vm-param-get uuid=$vm param-name=allowed-operations)" in
@@ -296,8 +296,8 @@ w_manage_vtpm() {
         *)             echo "  can add another:     false" ;;
     esac
 
-    xe vtpm-destroy uuid=$vtpm
-    echo "  after removal:       $(count_csv "$(xe vm-param-get uuid=$vm param-name=vtpms --minimal)") vTPM(s)"
+    xe vtpm-destroy uuid=$vtpm --force       # xe insists: the vTPM's secrets are destroyed with it
+    echo "  after removal:       $(count_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=vtpms)")") vTPM(s)"
     echo "OK: manage-vtpm"
 }
 ```

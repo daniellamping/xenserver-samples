@@ -229,7 +229,7 @@ w_reclaim_space() {
     # via the trim plugin - XenCenter's "Reclaim freed space".
     sr=$(first_csv "$(xe sr-list type=lvm --minimal)")
     # A host with a live (plugged) connection to the SR runs the plugin.
-    pbd=$(first_csv "$(xe sr-param-get uuid=$sr param-name=PBDs)")
+    pbd=$(first_csv "$(set_to_csv "$(xe sr-param-get uuid=$sr param-name=PBDs)")")
     h=$(xe pbd-param-get uuid=$pbd param-name=host)
     result=$(xe host-call-plugin host-uuid=$h plugin=trim fn=do_trim args:sr_uuid=$sr)
     echo "  reclaimed freed space on $sr: $result"

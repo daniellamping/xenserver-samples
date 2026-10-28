@@ -136,23 +136,39 @@ private static (string CertPem, string KeyPem) SelfSignedCertPem()
 }
 
 /// <summary>
-/// Wait out a pool-wide xapi restart (Pool.designate_new_master) and reconnect. XenRT's own helper
-/// for this call treats the connection dropping as the expected, successful outcome and then waits
-/// several minutes before trusting the pool again, rather than retrying immediately - do the same.
+/// Wait out a pool-wide xapi restart (Pool.designate_new_master) and reconnect.
+///
+/// designate_new_master returns BEFORE the change: for a while the old coordinator still answers,
+/// and still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+/// enough - keep reconnecting until the pool names the new coordinator (by uuid; Connect follows
+/// HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits minutes
+/// before trusting the pool again.
 /// </summary>
 private static Session ReconnectAfterMasterChange(string url, string user, string password,
-    int timeoutSeconds = 600, int intervalSeconds = 5)
+    string newMasterUuid, int timeoutSeconds = 600, int intervalSeconds = 5)
 {
     var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
-    Exception lastError = null;
+    object lastError = null;
     while (DateTime.UtcNow < deadline)
     {
-        try { return Connect(url, user, password); }
+        try
+        {
+            var session = Connect(url, user, password);
+            var master = Pool.get_master(session, Pool.get_all(session)[0].opaque_ref).opaque_ref;
+            // The new coordinator answers before the pool has settled - calls made too soon fail
+            // (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+            // live and enabled.
+            if (Host.get_uuid(session, master) == newMasterUuid && Host.get_all_records(session).Values.All(
+                    r => r.enabled && Host_metrics.get_live(session, r.metrics.opaque_ref)))
+                return session;
+            session.logout();
+            lastError = "the pool has not settled under the new coordinator";
+        }
         catch (Exception e)
         {
             lastError = e;
-            System.Threading.Thread.Sleep(intervalSeconds * 1000);
         }
+        System.Threading.Thread.Sleep(intervalSeconds * 1000);
     }
     throw new Exception($"the pool did not come back after the master change: {lastError}");
 }
@@ -170,6 +186,60 @@ private static void WaitForHostLive(Session session, string host, bool want,
     {
         if (DateTime.UtcNow > deadline) throw new Exception($"host did not reach live={want} in time");
         System.Threading.Thread.Sleep(intervalSeconds * 1000);
+    }
+}
+
+/// <summary>
+/// Wait for a host to come back from a reboot (key "boot_time") or toolstack restart
+/// ("agent_start_time"): until that other_config entry differs from <paramref name="before"/> and the
+/// host is live. Reconnects every time round, because the host restarting may be the coordinator this
+/// session talks to; returns the new session.
+/// </summary>
+private static Session WaitForRestart(string url, string user, string password, string hostUuid,
+    string key, string before, int timeoutSeconds = 1800, int intervalSeconds = 10)
+{
+    var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+    while (true)
+    {
+        try
+        {
+            var session = Connect(url, user, password);
+            var host = Host.get_by_uuid(session, hostUuid).opaque_ref;
+            var otherConfig = Host.get_other_config(session, host);
+            var value = otherConfig.TryGetValue(key, out var v) ? v : null;
+            if (value != before && HostLive(session, host))
+                return session;
+            session.logout();
+        }
+        catch (Exception)
+        {
+            // down, or xapi still starting
+        }
+        if (DateTime.UtcNow > deadline) throw new Exception($"host {hostUuid} did not come back in time");
+        System.Threading.Thread.Sleep(intervalSeconds * 1000);
+    }
+}
+
+/// <summary>
+/// Re-enable a host that has just come back. It reports itself live before xapi on it has finished
+/// starting, and until then Host.enable fails HOST_STILL_BOOTING - so retry that.
+/// </summary>
+private static void EnableWhenBooted(Session session, string host, int timeoutSeconds = 600,
+    int intervalSeconds = 10)
+{
+    var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+    while (true)
+    {
+        try
+        {
+            Host.enable(session, host);
+            return;
+        }
+        catch (Failure e)
+        {
+            if (e.ErrorDescription[0] != "HOST_STILL_BOOTING" || DateTime.UtcNow > deadline) throw;
+            System.Threading.Thread.Sleep(intervalSeconds * 1000);
+        }
     }
 }
 
@@ -460,20 +530,33 @@ def _self_signed_cert_pem():
             os.remove(certpath)
 
 
-def _reconnect_after_master_change(url, username, password, timeout=600, interval=5):
+def _reconnect_after_master_change(url, username, password, new_master_uuid, timeout=600, interval=5):
     """Wait out a pool-wide xapi restart (pool.designate_new_master) and reconnect.
 
-    XenRT's own helper for this call treats the connection dropping as the expected, successful
-    outcome and then waits several minutes before trusting the pool again, rather than retrying
-    immediately - do the same here."""
+    designate_new_master returns BEFORE the change: for a while the old coordinator still answers,
+    and still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+    enough - keep reconnecting until the pool names the new coordinator (by uuid; connect() follows
+    HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits minutes
+    before trusting the pool again."""
     deadline = time.time() + timeout
     last_error = None
     while time.time() < deadline:
         try:
-            return connect(url, username, password)
+            session = connect(url, username, password)
+            x = session.xenapi
+            master = x.pool.get_master(x.pool.get_all()[0])
+            # The new coordinator answers before the pool has settled - calls made too soon fail
+            # (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+            # live and enabled.
+            if x.host.get_uuid(master) == new_master_uuid and all(
+                    r["enabled"] and x.host_metrics.get_live(r["metrics"])
+                    for r in x.host.get_all_records().values()):
+                return session
+            x.session.logout()
+            last_error = "the pool has not settled under the new coordinator"
         except Exception as e:
             last_error = e
-            time.sleep(interval)
+        time.sleep(interval)
     raise RuntimeError("the pool did not come back after the master change: %s" % last_error)
 
 
@@ -486,6 +569,41 @@ def _wait_for_host_live(x, host, want, timeout=60, interval=2):
         if time.time() > deadline:
             raise RuntimeError("host did not reach live=%s in time" % want)
         time.sleep(interval)
+
+
+def _wait_for_restart(url, username, password, host_uuid, key, before, timeout=1800, interval=10):
+    """Wait for a host to come back from a reboot (key "boot_time") or toolstack restart
+    ("agent_start_time"): until that other_config entry differs from `before` and the host is live.
+    Reconnects every time round, because the host restarting may be the coordinator this session
+    talks to; returns the new session."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            session = connect(url, username, password)
+            x = session.xenapi
+            host = x.host.get_by_uuid(host_uuid)
+            if x.host.get_other_config(host).get(key) != before and host_live(x, host):
+                return session
+            x.session.logout()
+        except (OSError, xmlrpc.client.ProtocolError, XenAPI.Failure):
+            pass                     # down, or xapi still starting
+        if time.time() > deadline:
+            raise RuntimeError("host %s did not come back in time" % host_uuid)
+        time.sleep(interval)
+
+
+def _enable_when_booted(x, host, timeout=600, interval=10):
+    """Re-enable a host that has just come back. It reports itself live before xapi on it has
+    finished starting, and until then host.enable fails HOST_STILL_BOOTING - so retry that."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            x.host.enable(host)
+            return
+        except XenAPI.Failure as e:
+            if e.details[0] != "HOST_STILL_BOOTING" or time.time() > deadline:
+                raise
+            time.sleep(interval)
 
 
 def _host_url(url, address):
@@ -692,33 +810,96 @@ private static String[] selfSignedCertPem() throws Exception {
     }
 }
 
-// Wait out a pool-wide xapi restart (pool.designateNewMaster) and reconnect. XenRT's own helper for
-// this call treats the connection dropping as the expected, successful outcome and then waits several
-// minutes before trusting the pool again, rather than retrying immediately - do the same here.
-private static Connection reconnectAfterMasterChange(String url, String user, String password) throws Exception {
+// Wait out a pool-wide xapi restart (pool.designateNewMaster) and reconnect.
+//
+// designateNewMaster returns BEFORE the change: for a while the old coordinator still answers, and
+// still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+// enough - keep reconnecting until the pool names the new coordinator (by uuid; connect() follows
+// HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits minutes before
+// trusting the pool again.
+private static Connection reconnectAfterMasterChange(String url, String user, String password,
+        String newMasterUuid) throws Exception {
     long deadline = System.currentTimeMillis() + 600_000;
-    Exception lastError = null;
+    Object lastError = null;
     while (System.currentTimeMillis() < deadline) {
         try {
-            return connect(url, user, password);
+            Connection conn = connect(url, user, password);
+            Host master = Pool.getAll(conn).iterator().next().getMaster(conn);
+            // The new coordinator answers before the pool has settled - calls made too soon fail
+            // (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+            // live and enabled.
+            boolean settled = master.getUuid(conn).equals(newMasterUuid);
+            if (settled) {
+                for (Map.Entry<Host, Host.Record> e : Host.getAllRecords(conn).entrySet()) {
+                    if (!e.getValue().enabled || !e.getValue().metrics.getLive(conn)) {
+                        settled = false;
+                        break;
+                    }
+                }
+            }
+            if (settled) return conn;
+            Session.logout(conn);
+            lastError = "the pool has not settled under the new coordinator";
         } catch (Exception e) {
             lastError = e;
-            Thread.sleep(5000);
         }
+        Thread.sleep(5000);
     }
     throw new RuntimeException("the pool did not come back after the master change: " + lastError);
 }
 
 // Poll host_metrics.live until it matches, rather than issuing the next power command immediately -
 // real out-of-band power control has no retry of its own, so a tool that doesn't wait can issue a
-// second command while the first is still in flight. Short default timeout is intentional for a
-// demo; real tooling (XenRT's waitForEnabled) waits up to 900s.
+// second command while the first is still in flight.
 private static void waitForHostLive(Connection conn, Host host, boolean want) throws Exception {
-    long deadline = System.currentTimeMillis() + 60_000;
+    waitForHostLive(conn, host, want, 60_000, 2000);
+}
+
+private static void waitForHostLive(Connection conn, Host host, boolean want, long timeoutMillis,
+        long intervalMillis) throws Exception {
+    long deadline = System.currentTimeMillis() + timeoutMillis;
     while (host.getMetrics(conn).getLive(conn) != want) {
         if (System.currentTimeMillis() > deadline)
             throw new RuntimeException("host did not reach live=" + want + " in time");
-        Thread.sleep(2000);
+        Thread.sleep(intervalMillis);
+    }
+}
+
+// Re-enable a host that has just come back. It reports itself live before xapi on it has finished
+// starting, and until then host.enable fails HOST_STILL_BOOTING - so retry that.
+private static void enableWhenBooted(Connection conn, Host host) throws Exception {
+    long deadline = System.currentTimeMillis() + 600_000;
+    while (true) {
+        try {
+            host.enable(conn);
+            return;
+        } catch (Types.HostStillBooting e) {
+            if (System.currentTimeMillis() > deadline) throw e;
+            Thread.sleep(10_000);
+        }
+    }
+}
+
+// Wait for a host to come back from a reboot (key "boot_time") or toolstack restart
+// ("agent_start_time"): until that other_config entry differs from `before` and the host is live.
+// Reconnects every time round, because the host restarting may be the coordinator this connection
+// talks to; returns the new Connection.
+private static Connection waitForRestart(String url, String user, String password, String hostUuid,
+        String key, String before) throws Exception {
+    long deadline = System.currentTimeMillis() + 1_800_000;
+    while (true) {
+        try {
+            Connection conn = connect(url, user, password);
+            Host host = Host.getByUuid(conn, hostUuid);
+            String now = host.getOtherConfig(conn).get(key);
+            if (!java.util.Objects.equals(now, before) && host.getMetrics(conn).getLive(conn)) return conn;
+            Session.logout(conn);
+        } catch (Exception e) {
+            // down, or xapi still starting
+        }
+        if (System.currentTimeMillis() > deadline)
+            throw new RuntimeException("host " + hostUuid + " did not come back in time");
+        Thread.sleep(10_000);
     }
 }
 
@@ -1011,13 +1192,18 @@ func selfSignedCertPEM() (certPEM, keyPEM string) {
 }
 
 // reconnectAfterMasterChange waits out a pool-wide xapi restart (pool.DesignateNewMaster) and
-// reconnects. Mirrors XenRT's own wait after this call: the connection does not survive a
-// pool-wide xapi restart, so retry rather than assuming the session is still good.
-func reconnectAfterMasterChange(url, user, password string) (session *xenapi.Session) {
+// reconnects.
+//
+// DesignateNewMaster returns BEFORE the change: for a while the old coordinator still answers, and
+// still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+// enough - keep reconnecting until the pool names the new coordinator (by uuid; connect follows
+// HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits minutes
+// before trusting the pool again.
+func reconnectAfterMasterChange(url, user, password, newMasterUUID string) (session *xenapi.Session) {
 	deadline := time.Now().Add(600 * time.Second)
 	var lastErr any
 	for time.Now().Before(deadline) {
-		reconnected := func() (ok bool) {
+		settled := func() (ok bool) {
 			defer func() {
 				if r := recover(); r != nil {
 					lastErr = r
@@ -1025,10 +1211,36 @@ func reconnectAfterMasterChange(url, user, password string) (session *xenapi.Ses
 				}
 			}()
 			session = connect(url, user, password)
+			pools, err := xenapi.Pool.GetAll(session)
+			check(err)
+			master, err := xenapi.Pool.GetMaster(session, pools[0])
+			check(err)
+			uuid, err := xenapi.Host.GetUUID(session, master)
+			check(err)
+			// The new coordinator answers before the pool has settled - calls made too soon fail
+			// (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+			// live and enabled.
+			if uuid != newMasterUUID {
+				lastErr = "the pool has not settled under the new coordinator"
+				return false
+			}
+			hosts, err := xenapi.Host.GetAllRecords(session)
+			check(err)
+			for _, h := range hosts {
+				live, err := xenapi.HostMetrics.GetLive(session, h.Metrics)
+				check(err)
+				if !h.Enabled || !live {
+					lastErr = "the pool has not settled under the new coordinator"
+					return false
+				}
+			}
 			return true
 		}()
-		if reconnected {
+		if settled {
 			return session
+		}
+		if session != nil {
+			session.Logout()
 		}
 		time.Sleep(5 * time.Second)
 	}
@@ -1037,15 +1249,67 @@ func reconnectAfterMasterChange(url, user, password string) (session *xenapi.Ses
 
 // waitForHostLive polls host_metrics.live until it matches, rather than issuing the next power
 // command immediately - real out-of-band power control has no retry of its own, so a tool that
-// doesn't wait can issue a second command while the first is still in flight. Short default
-// timeouts are fine for a demo; real tooling (XenRT's own waitForEnabled) waits up to 900s.
+// doesn't wait can issue a second command while the first is still in flight.
 func waitForHostLive(session *xenapi.Session, host xenapi.HostRef, want bool) {
-	deadline := time.Now().Add(60 * time.Second)
+	waitForHostLiveTimeout(session, host, want, 60*time.Second, 2*time.Second)
+}
+
+func waitForHostLiveTimeout(session *xenapi.Session, host xenapi.HostRef, want bool, timeout, interval time.Duration) {
+	deadline := time.Now().Add(timeout)
 	for hostLive(session, host) != want {
 		if time.Now().After(deadline) {
 			panic(fmt.Sprintf("host did not reach live=%t in time", want))
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(interval)
+	}
+}
+
+// enableWhenBooted re-enables a host that has just come back. It reports itself live before xapi
+// on it has finished starting, and until then Host.Enable fails HOST_STILL_BOOTING - so retry that.
+func enableWhenBooted(session *xenapi.Session, host xenapi.HostRef) {
+	deadline := time.Now().Add(600 * time.Second)
+	for {
+		err := xenapi.Host.Enable(session, host)
+		if err == nil {
+			return
+		}
+		if failureCode(err) != xenapi.ErrorHostStillBooting || time.Now().After(deadline) {
+			panic(err)
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+// waitForRestart waits for a host to come back from a reboot (key "boot_time") or toolstack
+// restart ("agent_start_time"): until that other_config entry differs from before and the host is
+// live. It reconnects every time round, because the host restarting may be the coordinator this
+// session talks to; returns the new session.
+func waitForRestart(url, user, password, hostUUID, key, before string) (session *xenapi.Session) {
+	deadline := time.Now().Add(1800 * time.Second)
+	for {
+		ready := func() (ok bool) {
+			defer func() {
+				if recover() != nil { // down, or xapi still starting
+					ok = false
+				}
+			}()
+			session = connect(url, user, password)
+			host, err := xenapi.Host.GetByUUID(session, hostUUID)
+			check(err)
+			otherConfig, err := xenapi.Host.GetOtherConfig(session, host)
+			check(err)
+			return otherConfig[key] != before && hostLive(session, host)
+		}()
+		if ready {
+			return session
+		}
+		if session != nil {
+			session.Logout()
+		}
+		if time.Now().After(deadline) {
+			panic(fmt.Sprintf("host %s did not come back in time", hostUUID))
+		}
+		time.Sleep(10 * time.Second)
 	}
 }
 
@@ -1308,23 +1572,92 @@ function Get-SelfSignedCertPem {
 }
 
 function Reconnect-AfterMasterChange {
-    # Wait out a pool-wide xapi restart (pool.designate_new_master) and reconnect. XenRT's own helper
-    # for this call treats the connection dropping as the expected, successful outcome and then waits
-    # several minutes before trusting the pool again, rather than retrying immediately - do the same.
+    # Wait out a pool-wide xapi restart (pool.designate_new_master) and reconnect.
+    #
+    # designate_new_master returns BEFORE the change: for a while the old coordinator still answers,
+    # and still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+    # enough - keep reconnecting until the pool names the new coordinator (by uuid; Connect-Example
+    # follows HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits
+    # minutes before trusting the pool again.
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
         [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$NewMasterUuid,
         [int]$TimeoutSeconds = 600,
         [int]$IntervalSeconds = 5
     )
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $lastError = $null
     while ((Get-Date) -lt $deadline) {
-        try { return Connect-Example -Url $Url -UserName $UserName -Password $Password }
-        catch { $lastError = $_; Start-Sleep -Seconds $IntervalSeconds }
+        try {
+            $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
+            $master = (Get-XenPool | Select-Object -First 1).master
+            # The new coordinator answers before the pool has settled - calls made too soon fail
+            # (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+            # live and enabled.
+            $settled = (Get-XenHost -Ref $master.opaque_ref).uuid -eq $NewMasterUuid -and
+                -not (Get-XenHost | Where-Object {
+                    -not $_.enabled -or -not (Get-XenHostMetrics -Ref $_.metrics.opaque_ref).live
+                })
+            if ($settled) { return $session }
+            $session | Disconnect-XenServer
+            $lastError = "the pool has not settled under the new coordinator"
+        }
+        catch { $lastError = $_ }
+        Start-Sleep -Seconds $IntervalSeconds
     }
     throw "the pool did not come back after the master change: $lastError"
+}
+
+function Enable-WhenBooted {
+    # Re-enable a host that has just come back. It reports itself live before xapi on it has finished
+    # starting, and until then Enable fails HOST_STILL_BOOTING - so retry that.
+    param($XenHost, [int]$TimeoutSeconds = 600, [int]$IntervalSeconds = 10)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try { $XenHost | Invoke-XenHost -XenAction Enable; return }
+        catch {
+            $ex = $_.Exception
+            while ($ex -and -not $ex.ErrorDescription) { $ex = $ex.InnerException }
+            if (-not ($ex -and $ex.ErrorDescription -and $ex.ErrorDescription[0] -eq "HOST_STILL_BOOTING") `
+                    -or (Get-Date) -gt $deadline) {
+                throw
+            }
+            Start-Sleep -Seconds $IntervalSeconds
+        }
+    }
+}
+
+function Wait-ForRestart {
+    # Wait for a host to come back from a reboot (Key "boot_time") or toolstack restart
+    # ("agent_start_time"): until that other_config entry differs from -Before and the host is live.
+    # Reconnects every time round, because the host restarting may be the coordinator this session
+    # talks to; returns the new session.
+    param(
+        [Parameter(Mandatory = $true)][string]$Url,
+        [Parameter(Mandatory = $true)][string]$UserName,
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$HostUuid,
+        [Parameter(Mandatory = $true)][string]$Key,
+        $Before,
+        [int]$TimeoutSeconds = 1800,
+        [int]$IntervalSeconds = 10
+    )
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try {
+            $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
+            $xenHost = Get-XenHost -Uuid $HostUuid
+            if ($xenHost.other_config[$Key] -ne $Before -and (Get-HostLive $xenHost)) { return $session }
+            $session | Disconnect-XenServer
+        }
+        catch {
+            # down, or xapi still starting: a connection error or any XenAPI failure, keep retrying.
+        }
+        if ((Get-Date) -gt $deadline) { throw "host $HostUuid did not come back in time" }
+        Start-Sleep -Seconds $IntervalSeconds
+    }
 }
 ```
 
@@ -1351,6 +1684,10 @@ first_csv()  { echo "${1%%,*}"; }                       # first element of a com
 count_csv()  { local IFS=,; set -- $1; echo $#; }       # number of elements (0 for empty)
 each_csv()   { local IFS=,; set -- $1; printf '%s\n' "$@"; }   # one element per line, for `for`
 nth_csv()    { local n=$2 IFS=,; set -- $1; shift $((n - 1)); echo "$1"; }  # Nth element, 1-based
+# A set-valued FIELD (vm-param-get param-name=VBDs, allowed-VBD-devices, ...) is printed "a; b; c" - with
+# or without --minimal, which only turns a LIST of objects into a comma-separated line. Convert it, so the
+# helpers above work on both.
+set_to_csv() { echo "${1//; /,}"; }
 
 shared_sr() { first_csv "$(xe sr-list name-label="Shared NFS" --minimal)"; }
 first_host() { first_csv "$(xe host-list --minimal)"; }
@@ -1437,14 +1774,21 @@ self_signed_cert() {
 }
 
 # Wait out a pool-wide xapi restart (pool-designate-new-master) and find the new coordinator's address,
-# updating $host - xe does not follow HOST_IS_SLAVE itself (see the probe at the top of this script), and
-# the old coordinator's own xapi is briefly down while it restarts, so this is the same bounded wait/retry
-# XenRT's own helper for this call does, rather than retrying immediately.
+# updating $host - xe does not follow HOST_IS_SLAVE itself (see the probe at the top of this script).
+#
+# pool-designate-new-master returns BEFORE the change: for a while the old coordinator still answers, and
+# still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not enough -
+# keep reconnecting until the pool names the new coordinator (by uuid) AND every host is back, enabled and
+# live. XenRT's own helper likewise waits minutes before trusting the pool again.
 reconnect_after_master_change() {
-    local timeout=600 interval=5 probe
+    local new_master_uuid=$1 timeout=600 interval=5 probe
     local deadline=$((SECONDS + timeout))
     while [ $SECONDS -lt $deadline ]; do
-        if probe=$(xe pool-list --minimal 2>&1); then return 0; fi
+        # Called as an if-condition, so set -e does not end the script when one of its xe calls fails -
+        # and while xapi restarts across the pool, any of them can.
+        if probe=$(xe pool-list --minimal 2>&1) && pool_settled_under "$new_master_uuid" "$probe"; then
+            return 0
+        fi
         if [[ $probe =~ (Master|Coordinator)\ IP\ address:\ ([0-9A-Fa-f.:]+) ]]; then
             host=${BASH_REMATCH[2]}
         fi
@@ -1454,17 +1798,72 @@ reconnect_after_master_change() {
     return 1
 }
 
+# True once the pool (uuid $2) names $1 as its coordinator AND every host is back, enabled and live. The
+# new coordinator answers before the pool has settled - calls made too soon fail (HANDLE_INVALID on the
+# operation's own task) - hence the second half.
+pool_settled_under() {
+    local master h
+    master=$(xe pool-param-get uuid="$(first_csv "$2")" param-name=master) || return 1
+    [ "$master" = "$1" ] || return 1
+    for h in $(each_csv "$(xe host-list --minimal)"); do
+        [ "$(xe host-param-get uuid=$h param-name=enabled)" = "true" ] || return 1
+        [ "$(host_live "$h")" = "true" ] || return 1
+    done
+}
+
 # Poll host_metrics.live until it matches, rather than issuing the next power command immediately - real
 # out-of-band power control has no retry of its own, so a script that doesn't wait can issue a second
 # command while the first is still in flight.
 wait_for_host_live() {
-    local h=$1 want=$2 timeout=60 interval=2
+    local h=$1 want=$2 timeout=${3:-60} interval=${4:-2}
     local deadline=$((SECONDS + timeout))
     while [ "$(host_live "$h")" != "$want" ]; do
         if [ $SECONDS -gt $deadline ]; then
             echo "host did not reach live=$want in time" >&2
             return 1
         fi
+        sleep "$interval"
+    done
+}
+
+# Wait for a host to come back from a reboot (key "boot_time") or toolstack restart
+# ("agent_start_time"): until that other-config entry differs from $before and the host is live. Follows
+# HOST_IS_SLAVE-style coordinator redirection (updating the global $host, the same way the top-of-script
+# probe and reconnect_after_master_change do) in case the host restarting is the coordinator xe is
+# currently talking to.
+wait_for_restart() {
+    local host_uuid=$1 key=$2 before=$3 timeout=${4:-1800} interval=${5:-10} probe
+    local deadline=$((SECONDS + timeout))
+    while true; do
+        if probe=$(xe host-param-get uuid=$host_uuid param-name=other-config param-key=$key 2>&1); then
+            if [ "$probe" != "$before" ] && [ "$(host_live "$host_uuid")" = "true" ]; then
+                return 0
+            fi
+        elif [[ $probe =~ (Master|Coordinator)\ IP\ address:\ ([0-9A-Fa-f.:]+) ]]; then
+            host=${BASH_REMATCH[2]}
+        fi
+        if [ $SECONDS -gt $deadline ]; then
+            echo "host $host_uuid did not come back in time" >&2
+            return 1
+        fi
+        sleep "$interval"
+    done
+}
+
+# Re-enable a host that has just come back. It reports itself live before xapi on it has finished
+# starting, and until then host-enable fails HOST_STILL_BOOTING - so retry that.
+enable_when_booted() {
+    local h=$1 timeout=600 interval=10 err
+    local deadline=$((SECONDS + timeout))
+    while true; do
+        if err=$(xe host-enable uuid=$h 2>&1); then return 0; fi
+        # xe prints the error's message, not its code: HOST_STILL_BOOTING reads "The host toolstack is
+        # still initialising".
+        case "$err" in
+            *STILL_BOOTING*|*"still initialising"*) ;;
+            *) echo "$err" >&2; return 1 ;;
+        esac
+        if [ $SECONDS -gt $deadline ]; then echo "$err" >&2; return 1; fi
         sleep "$interval"
     done
 }
@@ -1511,7 +1910,7 @@ wait_for_guest_agent() {
 # storage-migrate already demonstrates.
 move_disks_to_sr() {
     local vm=$1 sr_ref=$2 vbd vdi
-    for vbd in $(each_csv "$(xe vm-param-get uuid=$vm param-name=VBDs --minimal)"); do
+    for vbd in $(each_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=VBDs)")"); do
         [ "$(xe vbd-param-get uuid=$vbd param-name=type)" = "Disk" ] || continue
         vdi=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid)
         if [ "$(xe vdi-param-get uuid=$vdi param-name=sr-uuid)" != "$sr_ref" ]; then

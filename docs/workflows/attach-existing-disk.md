@@ -60,6 +60,7 @@ private static string AttachVdi(Session session, string vm, string vdi) => VBD.c
     VM = new XenRef<VM>(vm),
     VDI = new XenRef<VDI>(vdi),
     userdevice = VM.get_allowed_VBD_devices(session, vm).First(),
+    bootable = false,
     mode = vbd_mode.RW,
     type = vbd_type.Disk,
     empty = false,
@@ -75,9 +76,9 @@ private static string AttachVdi(Session session, string vm, string vdi) => VBD.c
 
 ```text
 Disk sdk-example-portable-disk created on Shared NFS
-  attached to db-01
+  attached to web-01
   detached:   the disk still exists (4294967296 bytes)
-  attached to secure-01
+  attached to db-01
   the disk is on 1 VM(s)
 OK: attach-existing-disk
 ```
@@ -133,6 +134,7 @@ def attach_vdi(x, vm, vdi):
     """Join an existing disk to a VM on its next free device slot."""
     return x.VBD.create({
         "VM": vm, "VDI": vdi, "userdevice": x.VM.get_allowed_VBD_devices(vm)[0],
+        "bootable": False,
         "mode": "RW", "type": "Disk", "empty": False, "other_config": {},
         "qos_algorithm_type": "", "qos_algorithm_params": {},
     })
@@ -216,6 +218,7 @@ private static VBD attachVdi(Connection conn, VM vm, VDI vdi) throws Exception {
     record.VM = vm;
     record.VDI = vdi;
     record.userdevice = vm.getAllowedVBDDevices(conn).iterator().next();
+    record.bootable = false;
     record.mode = Types.VbdMode.RW;
     record.type = Types.VbdType.DISK;
     record.empty = false;
@@ -309,7 +312,8 @@ func attachVdi(session *xenapi.Session, vm xenapi.VMRef, vdi xenapi.VDIRef) xena
 	check(err)
 	vbd, err := xenapi.VBD.Create(session, xenapi.VBDRecord{
 		VM: vm, VDI: vdi, Userdevice: devices[0],
-		Mode: xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
+		Bootable: false,
+		Mode:     xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
 		OtherConfig: map[string]string{}, QosAlgorithmParams: map[string]string{},
 	})
 	check(err)
@@ -413,16 +417,18 @@ w_attach_existing_disk() {
     vdi=$(xe vdi-create sr-uuid=$sr name-label=xe-example-portable-disk virtual-size=4294967296 type=user)
     echo "Disk $(xe vdi-param-get uuid=$vdi param-name=name-label) created on $(xe sr-param-get uuid=$sr param-name=name-label)"
 
-    vbd=$(xe vbd-create vm-uuid=$first vdi-uuid=$vdi device=3 type=Disk mode=RW)
+    device=$(first_csv "$(set_to_csv "$(xe vm-param-get uuid=$first param-name=allowed-VBD-devices)")")
+    vbd=$(xe vbd-create vm-uuid=$first vdi-uuid=$vdi device=$device type=Disk mode=RW)
     echo "  attached to $(xe vm-param-get uuid=$first param-name=name-label)"
 
     # Destroying the VBD detaches the disk; the disk itself is untouched and keeps its data.
     xe vbd-destroy uuid=$vbd
     echo "  detached:   the disk still exists ($(xe vdi-param-get uuid=$vdi param-name=virtual-size) bytes)"
 
-    vbd2=$(xe vbd-create vm-uuid=$second vdi-uuid=$vdi device=3 type=Disk mode=RW)
+    device=$(first_csv "$(set_to_csv "$(xe vm-param-get uuid=$second param-name=allowed-VBD-devices)")")
+    vbd2=$(xe vbd-create vm-uuid=$second vdi-uuid=$vdi device=$device type=Disk mode=RW)
     echo "  attached to $(xe vm-param-get uuid=$second param-name=name-label)"
-    echo "  the disk is on $(count_csv "$(xe vdi-param-get uuid=$vdi param-name=vbds)") VM(s)"
+    echo "  the disk is on $(count_csv "$(set_to_csv "$(xe vdi-param-get uuid=$vdi param-name=vbds)")") VM(s)"
 
     xe vbd-destroy uuid=$vbd2
     xe vdi-destroy uuid=$vdi
@@ -434,9 +440,9 @@ w_attach_existing_disk() {
 
 ```text
 Disk xe-example-portable-disk created on Shared NFS
-  attached to db-01
+  attached to web-01
   detached:   the disk still exists (4294967296 bytes)
-  attached to secure-01
+  attached to db-01
   the disk is on 0 VM(s)
 OK: attach-existing-disk
 ```

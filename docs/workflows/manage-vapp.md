@@ -30,7 +30,9 @@ private static void ManageVapp(string url, string user, string password, string 
     VM_appliance.start(session, vapp.opaque_ref, false);
     Console.WriteLine($"Started:        {VM.get_power_state(session, vm.opaque_ref)}");
 
-    VM_appliance.clean_shutdown(session, vapp.opaque_ref);
+    // shutdown tries each VM's clean shutdown and falls back to a hard one. clean_shutdown alone fails
+    // OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+    VM_appliance.shutdown(session, vapp.opaque_ref);
     Console.WriteLine($"Shut down:      {VM.get_power_state(session, vm.opaque_ref)}");
 
     VM.set_appliance(session, vm.opaque_ref, null);
@@ -75,7 +77,9 @@ def manage_vapp(url, username, password, vm_name):
     x.VM_appliance.start(vapp, False)
     print(f"Started:        {x.VM.get_power_state(vm)}")
 
-    x.VM_appliance.clean_shutdown(vapp)
+    # shutdown tries each VM's clean shutdown and falls back to a hard one. clean_shutdown alone fails
+    # OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+    x.VM_appliance.shutdown(vapp)
     print(f"Shut down:      {x.VM.get_power_state(vm)}")
 
     x.VM.set_appliance(vm, "OpaqueRef:NULL")
@@ -121,10 +125,14 @@ private static void manageVapp(String url, String user, String password, String 
         vapp.start(conn, false);
         System.out.println("Started:        " + vm.getPowerState(conn));
 
-        vapp.cleanShutdown(conn);
+        // shutdown tries each VM's clean shutdown and falls back to a hard one. cleanShutdown alone
+        // fails OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+        vapp.shutdown(conn);
         System.out.println("Shut down:      " + vm.getPowerState(conn));
 
-        vm.setAppliance(conn, null);
+        // Detach with the null REFERENCE, not Java's null: the binding doesn't turn null into
+        // OpaqueRef:NULL, and a real host refuses what it sends with INTERNAL_ERROR.
+        vm.setAppliance(conn, new VMAppliance("OpaqueRef:NULL"));
         vapp.destroy(conn);
         System.out.println("OK: manage-vapp");
     } finally {
@@ -170,7 +178,9 @@ func manageVapp(url, user, password, vmName string) {
 	state, _ := xenapi.VM.GetPowerState(session, vm)
 	fmt.Printf("Started:        %s\n", state)
 
-	check(xenapi.VMAppliance.CleanShutdown(session, vapp))
+	// Shutdown tries each VM's clean shutdown and falls back to a hard one. CleanShutdown alone fails
+	// OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+	check(xenapi.VMAppliance.Shutdown(session, vapp))
 	state, _ = xenapi.VM.GetPowerState(session, vm)
 	fmt.Printf("Shut down:      %s\n", state)
 
@@ -215,7 +225,9 @@ function Invoke-ManageVapp {
     Invoke-XenVMAppliance -VMAppliance $vapp -XenAction Start -Paused $false
     Write-Host "Started:        $((Get-XenVM -Name $VmName).power_state)"
 
-    Invoke-XenVMAppliance -VMAppliance $vapp -XenAction CleanShutdown
+    # Shutdown tries each VM's clean shutdown and falls back to a hard one. CleanShutdown alone fails
+    # OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+    Invoke-XenVMAppliance -VMAppliance $vapp -XenAction Shutdown
     Write-Host "Shut down:      $((Get-XenVM -Name $VmName).power_state)"
 
     Set-XenVM -VM (Get-XenVM -Name $VmName) -Appliance "OpaqueRef:NULL"
@@ -251,7 +263,9 @@ w_manage_vapp() {
     xe appliance-start uuid="$vapp_uuid"
     echo "Started:        $(xe vm-list uuid="$vm_uuid" params=power-state --minimal)"
 
-    xe appliance-shutdown uuid="$vapp_uuid"
+    # A plain appliance-shutdown is clean only, and fails OPERATION_PARTIALLY_FAILED if any member can't
+    # shut down cleanly (no guest OS or PV drivers); force=true shuts the members down hard.
+    xe appliance-shutdown uuid="$vapp_uuid" force=true
     echo "Shut down:      $(xe vm-list uuid="$vm_uuid" params=power-state --minimal)"
 
     xe vm-param-set uuid="$vm_uuid" appliance=
@@ -263,7 +277,7 @@ w_manage_vapp() {
 <details><summary>Sample output</summary>
 
 ```text
-Started:        running
+Started:        halted
 Shut down:      halted
 OK: manage-vapp
 ```

@@ -32,7 +32,7 @@ private static void ManagePoolMembership(string url, string user, string passwor
     // Reconnect (with a bounded wait, the same way XenRT's own helper for this call does) before
     // touching the pool again, and re-resolve every ref from the fresh session rather than assuming
     // the old ones are still good.
-    session = ReconnectAfterMasterChange(url, user, password);
+    session = ReconnectAfterMasterChange(url, user, password, hosts[new XenRef<Host>(other)].uuid);
     poolRef = Pool.get_all(session)[0].opaque_ref;
     Console.WriteLine($"Promoted:    {Host.get_name_label(session, Pool.get_master(session, poolRef).opaque_ref)}");
 
@@ -42,7 +42,7 @@ private static void ManagePoolMembership(string url, string user, string passwor
     Pool.designate_new_master(session, original);
     Console.WriteLine($"Restoring:   {hosts[new XenRef<Host>(original)].name_label} (reconnecting again)");
 
-    session = ReconnectAfterMasterChange(url, user, password);
+    session = ReconnectAfterMasterChange(url, user, password, hosts[new XenRef<Host>(original)].uuid);
     poolRef = Pool.get_all(session)[0].opaque_ref;
     Console.WriteLine($"Restored:    {Host.get_name_label(session, Pool.get_master(session, poolRef).opaque_ref)}");
 
@@ -96,7 +96,7 @@ def manage_pool_membership(url, username, password):
     x.pool.designate_new_master(other)
     print(f"Promoting:   {hosts[other]['name_label']} (xapi restarts pool-wide; reconnecting)")
 
-    session = _reconnect_after_master_change(url, username, password)
+    session = _reconnect_after_master_change(url, username, password, hosts[other]["uuid"])
     x = session.xenapi
     pool = x.pool.get_all()[0]
     print(f"Promoted:    {x.host.get_name_label(x.pool.get_master(pool))}")
@@ -106,7 +106,7 @@ def manage_pool_membership(url, username, password):
     x.pool.designate_new_master(original)
     print(f"Restoring:   {hosts[original]['name_label']} (reconnecting again)")
 
-    session = _reconnect_after_master_change(url, username, password)
+    session = _reconnect_after_master_change(url, username, password, hosts[original]["uuid"])
     x = session.xenapi
     pool = x.pool.get_all()[0]
     print(f"Restored:    {x.host.get_name_label(x.pool.get_master(pool))}")
@@ -148,6 +148,7 @@ private static void managePoolMembership(String url, String user, String passwor
     Pool pool = Pool.getAll(conn).iterator().next();
     Host original = pool.getMaster(conn);
     String originalName = original.getNameLabel(conn);
+    String originalUuid = original.getUuid(conn);
     System.out.println("Coordinator: " + originalName);
 
     String otherName = null;
@@ -157,13 +158,14 @@ private static void managePoolMembership(String url, String user, String passwor
         if (!h.equals(original)) otherName = h.getNameLabel(conn);
     }
     Host other = hostByName(conn, otherName);
+    String otherUuid = other.getUuid(conn);
 
     // Promote another member. The pool database moves with the role and clients are redirected, so
     // this briefly interrupts management traffic - it does not move any VM.
     Pool.designateNewMaster(conn, other);
     System.out.println("Promoting:   " + otherName + " (xapi restarts pool-wide; reconnecting)");
 
-    conn = reconnectAfterMasterChange(url, user, password);
+    conn = reconnectAfterMasterChange(url, user, password, otherUuid);
     pool = Pool.getAll(conn).iterator().next();
     System.out.println("Promoted:    " + pool.getMaster(conn).getNameLabel(conn));
 
@@ -174,7 +176,7 @@ private static void managePoolMembership(String url, String user, String passwor
     Pool.designateNewMaster(conn, originalAgain);
     System.out.println("Restoring:   " + originalName + " (reconnecting again)");
 
-    conn = reconnectAfterMasterChange(url, user, password);
+    conn = reconnectAfterMasterChange(url, user, password, originalUuid);
     pool = Pool.getAll(conn).iterator().next();
     System.out.println("Restored:    " + pool.getMaster(conn).getNameLabel(conn));
 
@@ -240,13 +242,15 @@ func managePoolMembership(url, user, password string) {
 		fmt.Printf("  member: %s%s\n", hn, suffix)
 	}
 	otherName, _ := xenapi.Host.GetNameLabel(session, other)
+	otherUUID, _ := xenapi.Host.GetUUID(session, other)
+	originalUUID, _ := xenapi.Host.GetUUID(session, original)
 
 	// Promote another member. The pool database moves with the role and clients are redirected, so this
 	// briefly interrupts management traffic — it does not move any VM.
 	check(xenapi.Pool.DesignateNewMaster(session, other))
 	fmt.Printf("Promoting:   %s (xapi restarts pool-wide; reconnecting)\n", otherName)
 
-	session = reconnectAfterMasterChange(url, user, password)
+	session = reconnectAfterMasterChange(url, user, password, otherUUID)
 	pools, err = xenapi.Pool.GetAll(session)
 	check(err)
 	master, _ := xenapi.Pool.GetMaster(session, pools[0])
@@ -258,7 +262,7 @@ func managePoolMembership(url, user, password string) {
 	check(xenapi.Pool.DesignateNewMaster(session, original))
 	fmt.Printf("Restoring:   %s (reconnecting again)\n", name)
 
-	session = reconnectAfterMasterChange(url, user, password)
+	session = reconnectAfterMasterChange(url, user, password, originalUUID)
 	pools, err = xenapi.Pool.GetAll(session)
 	check(err)
 	master, _ = xenapi.Pool.GetMaster(session, pools[0])
@@ -312,7 +316,8 @@ function Invoke-ManagePoolMembership {
     Invoke-XenPool -Ref $pool.opaque_ref -XenAction DesignateNewMaster -XenHost $other.opaque_ref
     Write-Host "Promoting:   $($other.name_label) (xapi restarts pool-wide; reconnecting)"
 
-    $session = Reconnect-AfterMasterChange -Url $Url -UserName $UserName -Password $Password
+    $session = Reconnect-AfterMasterChange -Url $Url -UserName $UserName -Password $Password `
+        -NewMasterUuid $other.uuid
     $pool = Get-XenPool | Select-Object -First 1
     Write-Host "Promoted:    $((Get-XenHost -Ref $pool.master.opaque_ref).name_label)"
 
@@ -321,7 +326,8 @@ function Invoke-ManagePoolMembership {
     Invoke-XenPool -Ref $pool.opaque_ref -XenAction DesignateNewMaster -XenHost $originalRef
     Write-Host "Restoring:   $($original.name_label) (reconnecting again)"
 
-    $session = Reconnect-AfterMasterChange -Url $Url -UserName $UserName -Password $Password
+    $session = Reconnect-AfterMasterChange -Url $Url -UserName $UserName -Password $Password `
+        -NewMasterUuid $original.uuid
     $pool = Get-XenPool | Select-Object -First 1
     Write-Host "Restored:    $((Get-XenHost -Ref $pool.master.opaque_ref).name_label)"
 
@@ -366,17 +372,21 @@ w_manage_pool_membership() {
     # xapi pool-wide, so the connection this script is using does not survive it: reconnect (a bounded
     # wait/retry, the same way XenRT's own helper for this call does) before touching the pool again,
     # rather than assuming the next xe call will just work.
+    # Names first: once the switch starts, the address this script talks to may already be a supporter.
+    local other_name original_name
+    other_name=$(xe host-list uuid="$other" params=name-label --minimal)
+    original_name=$(xe host-list uuid="$original" params=name-label --minimal)
     xe pool-designate-new-master host-uuid="$other"
-    echo "Promoting:   $(xe host-list uuid="$other" params=name-label --minimal) (xapi restarts pool-wide; reconnecting)"
-    reconnect_after_master_change
-    echo "Promoted:    $(xe host-list uuid="$other" params=name-label --minimal)"
+    echo "Promoting:   $other_name (xapi restarts pool-wide; reconnecting)"
+    reconnect_after_master_change "$other"
+    echo "Promoted:    $other_name"
 
     # Put it back. Ejecting a member (pool-eject) is the other half of this surface and is deliberately
     # not shown: it cannot be undone from the pool, because rejoining is initiated by the ejected host.
     xe pool-designate-new-master host-uuid="$original"
-    echo "Restoring:   $(xe host-list uuid="$original" params=name-label --minimal) (reconnecting again)"
-    reconnect_after_master_change
-    echo "Restored:    $(xe host-list uuid="$original" params=name-label --minimal)"
+    echo "Restoring:   $original_name (reconnecting again)"
+    reconnect_after_master_change "$original"
+    echo "Restored:    $original_name"
     echo "OK: manage-pool-membership"
 }
 ```

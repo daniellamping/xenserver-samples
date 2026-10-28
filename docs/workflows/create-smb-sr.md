@@ -26,8 +26,8 @@ private static void CreateSmbSr(string url, string user, string password, string
     }).opaque_ref;
     var dc = new Dictionary<string, string>
     {
-        ["server"] = server,
-        ["serverpath"] = share,
+        // server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
+        ["server"] = $"//{server}{share}",
         ["username"] = smbUsername,
         ["password_secret"] = Secret.get_uuid(session, secret),
     };
@@ -46,7 +46,7 @@ private static void CreateSmbSr(string url, string user, string password, string
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-cf0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-d30a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -66,7 +66,8 @@ def create_smb_sr(url, username, password, server, share, smb_username, smb_pass
     host = session.xenapi.host.get_all()[0]
 
     secret = session.xenapi.secret.create({"value": smb_password, "other_config": {}})
-    dc = {"server": server, "serverpath": share, "username": smb_username,
+    # server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
+    dc = {"server": "//%s%s" % (server, share), "username": smb_username,
           "password_secret": session.xenapi.secret.get_uuid(secret)}
     sr = session.xenapi.SR.create(host, dc, "0", sr_name,
                                   "SMB SR created by the SDK example", "smb", "user", True, {})
@@ -81,7 +82,7 @@ def create_smb_sr(url, username, password, server, share, smb_username, smb_pass
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-560b-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-9e0a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -105,8 +106,8 @@ private static void createSmbSr(String url, String user, String password, String
         Secret secret = Secret.create(conn, secretRec);
 
         Map<String, String> dc = new java.util.HashMap<>();
-        dc.put("server", server);
-        dc.put("serverpath", share);
+        // server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
+        dc.put("server", "//" + server + share);
         dc.put("username", smbUsername);
         dc.put("password_secret", secret.getUuid(conn));
         SR sr = SR.create(conn, host, dc, 0L, srName, "SMB SR created by the SDK example",
@@ -127,7 +128,7 @@ private static void createSmbSr(String url, String user, String password, String
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-db0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-a20a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -152,8 +153,9 @@ func createSmbSr(url, user, password, server, share, smbUsername, smbPassword, s
 	check(err)
 	secretUUID, err := xenapi.Secret.GetUUID(session, secret)
 	check(err)
+	// server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
 	dc := map[string]string{
-		"server": server, "serverpath": share, "username": smbUsername,
+		"server": "//" + server + share, "username": smbUsername,
 		"password_secret": secretUUID,
 	}
 	sr, err := xenapi.SR.Create(session, host, dc, 0, srName,
@@ -172,7 +174,7 @@ func createSmbSr(url, user, password, server, share, smbUsername, smbPassword, s
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-d30a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-d70a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -201,8 +203,8 @@ function Invoke-CreateSmbSr {
 
     $secret = New-XenSecret -Value $SmbPassword -OtherConfig @{} -PassThru
     $deviceConfig = @{
-        server          = $Server
-        serverpath      = $Share
+        # server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
+        server          = "//$Server$Share"
         username        = $SmbUsername
         password_secret = $secret.uuid
     }
@@ -222,7 +224,7 @@ function Invoke-CreateSmbSr {
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-230b-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-dc0a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -243,7 +245,7 @@ w_create_smb_sr() {
     # (0/3 real captured sr-create calls for this type use plaintext).
     secret=$(xe secret-create value="$smb_password")
     sr=$(xe sr-create host-uuid=$(first_host) type=smb name-label="$sr_name" shared=true \
-        device-config:server="$server" device-config:serverpath="$share" \
+        device-config:server="//$server$share" \
         device-config:username="$smb_username" device-config:password_secret=$secret)
     echo "Created SMB SR: $sr ($(( $(xe sr-param-get uuid=$sr param-name=physical-size) / 1024 / 1024 / 1024 )) GiB)"
     detach_and_forget_sr $sr
@@ -255,7 +257,7 @@ w_create_smb_sr() {
 <details><summary>Sample output</summary>
 
 ```text
-Created SMB SR: 00000001-0000-0000-5a0b-000000000000 (512 GiB)
+Created SMB SR: 00000001-0000-0000-db0a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 

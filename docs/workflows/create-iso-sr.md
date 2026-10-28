@@ -9,13 +9,14 @@ Workflow `create-iso-sr`. [All workflows](README.md) · [Connecting](connecting.
 ## C# (.NET)
 
 ```csharp
-private static void CreateIsoSr(string url, string user, string password)
+// Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+// "server:/path").
+private static void CreateIsoSr(string url, string user, string password, string location)
 {
     var session = Connect(url, user, password);
     var host = Host.get_all(session)[0].opaque_ref;
-    // Connect an ISO-library SR to a file share of ISO images (here an NFS export).
-    var dc = new Dictionary<string, string> { ["location"] = "192.0.2.10:/isos", ["type"] = "nfs_iso" };
-    var sr = SR.create(session, host, dc, 0, "sdk-iso-sr", "ISO library created by the SDK example",
+    var dc = new Dictionary<string, string> { ["location"] = location, ["type"] = "nfs_iso" };
+    var sr = SR.create(session, host, dc, 0, "sdk-example-iso", "ISO library created by the SDK example",
         "iso", "iso", true, new Dictionary<string, string>());
     Console.WriteLine($"Created ISO SR: {SR.get_uuid(session, sr)}");
     DetachAndForgetSr(session, sr);
@@ -23,13 +24,13 @@ private static void CreateIsoSr(string url, string user, string password)
     session.logout();
 }
 // Run it:
-//   CreateIsoSr("https://xenserver", "root", password);
+//   CreateIsoSr("https://xenserver", "root", password, "192.0.2.10:/isos");
 ```
 
 <details><summary>Sample output</summary>
 
 ```text
-Created ISO SR: 00000001-0000-0000-df0a-000000000000
+Created ISO SR: 00000001-0000-0000-d40a-000000000000
 OK: create-iso-sr
 ```
 
@@ -38,12 +39,13 @@ OK: create-iso-sr
 ## Python
 
 ```python
-def create_iso_sr(url, username, password):
-    """Connect an ISO-library SR to a file share of ISO images (here an NFS export)."""
+def create_iso_sr(url, username, password, location):
+    """Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+    "server:/path")."""
     session = connect(url, username, password)
     host = session.xenapi.host.get_all()[0]
-    dc = {"location": "192.0.2.10:/isos", "type": "nfs_iso"}
-    sr = session.xenapi.SR.create(host, dc, "0", "sdk-iso-sr",
+    dc = {"location": location, "type": "nfs_iso"}
+    sr = session.xenapi.SR.create(host, dc, "0", "sdk-example-iso",
                                   "ISO library created by the SDK example", "iso", "iso", True, {})
     print("Created ISO SR: %s" % session.xenapi.SR.get_uuid(sr))
     detach_and_forget_sr(session, sr)
@@ -54,7 +56,7 @@ def create_iso_sr(url, username, password):
 <details><summary>Sample output</summary>
 
 ```text
-Created ISO SR: 00000001-0000-0000-d90a-000000000000
+Created ISO SR: 00000001-0000-0000-b20a-000000000000
 OK: create-iso-sr
 ```
 
@@ -63,14 +65,16 @@ OK: create-iso-sr
 ## Java
 
 ```java
-private static void createIsoSr(String url, String user, String password) throws Exception {
+// Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+// "server:/path").
+private static void createIsoSr(String url, String user, String password, String location) throws Exception {
     Connection conn = connect(url, user, password);
     try {
         Host host = Host.getAllRecords(conn).keySet().iterator().next();
         Map<String, String> dc = new java.util.HashMap<>();
-        dc.put("location", "192.0.2.10:/isos");
+        dc.put("location", location);
         dc.put("type", "nfs_iso");
-        SR sr = SR.create(conn, host, dc, 0L, "sdk-iso-sr", "ISO library created by the SDK example",
+        SR sr = SR.create(conn, host, dc, 0L, "sdk-example-iso", "ISO library created by the SDK example",
             "iso", "iso", true, new java.util.HashMap<>());
         System.out.println("Created ISO SR: " + sr.getUuid(conn));
         detachAndForgetSr(conn, sr);
@@ -80,13 +84,13 @@ private static void createIsoSr(String url, String user, String password) throws
     }
 }
 // Run it:
-//   createIsoSr("https://xenserver", "root", password);
+//   createIsoSr("https://xenserver", "root", password, "192.0.2.10:/isos");
 ```
 
 <details><summary>Sample output</summary>
 
 ```text
-Created ISO SR: 00000001-0000-0000-dc0a-000000000000
+Created ISO SR: 00000001-0000-0000-d70a-000000000000
 OK: create-iso-sr
 ```
 
@@ -95,12 +99,14 @@ OK: create-iso-sr
 ## Go
 
 ```go
-func createIsoSr(url, user, password string) {
+// Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+// "server:/path").
+func createIsoSr(url, user, password, location string) {
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
-	dc := map[string]string{"location": "192.0.2.10:/isos", "type": "nfs_iso"}
-	sr, err := xenapi.SR.Create(session, hosts[0], dc, 0, "sdk-iso-sr",
+	dc := map[string]string{"location": location, "type": "nfs_iso"}
+	sr, err := xenapi.SR.Create(session, hosts[0], dc, 0, "sdk-example-iso",
 		"ISO library created by the SDK example", "iso", "iso", true, map[string]string{})
 	check(err)
 	uuid, _ := xenapi.SR.GetUUID(session, sr)
@@ -114,7 +120,7 @@ func createIsoSr(url, user, password string) {
 <details><summary>Sample output</summary>
 
 ```text
-Created ISO SR: 00000001-0000-0000-e20a-000000000000
+Created ISO SR: 00000001-0000-0000-b50a-000000000000
 OK: create-iso-sr
 ```
 
@@ -124,17 +130,19 @@ OK: create-iso-sr
 
 ```powershell
 function Invoke-CreateIsoSr {
+    # Connect an ISO-library SR to a file share of ISO images (here an NFS export, Location
+    # "server:/path").
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$Location
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $xenHost = Get-XenHost | Select-Object -First 1
-    # Connect an ISO-library SR to a file share of ISO images (here an NFS export).
-    $deviceConfig = @{ location = "192.0.2.10:/isos"; type = "nfs_iso" }
+    $deviceConfig = @{ location = $Location; type = "nfs_iso" }
     $sr = New-XenSR -XenHost $xenHost -DeviceConfig $deviceConfig -PhysicalSize 0 `
-        -NameLabel "sdk-iso-sr" -NameDescription "ISO library created by the SDK example" `
+        -NameLabel "sdk-example-iso" -NameDescription "ISO library created by the SDK example" `
         -Type "iso" -ContentType "iso" -Shared $true -PassThru
     Write-Host "Created ISO SR: $($sr.uuid)"
     Invoke-DetachAndForgetSr -Ref $sr.opaque_ref
@@ -148,7 +156,7 @@ function Invoke-CreateIsoSr {
 <details><summary>Sample output</summary>
 
 ```text
-Created ISO SR: 00000001-0000-0000-290b-000000000000
+Created ISO SR: 00000001-0000-0000-e20a-000000000000
 OK: create-iso-sr
 ```
 
@@ -158,9 +166,12 @@ OK: create-iso-sr
 
 ```bash
 w_create_iso_sr() {
-    # Connect an ISO-library SR to a file share of ISO images (here an NFS export).
+    # Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+    # "server:/path").
+    local location
+    location=$(param location "192.0.2.10:/isos")
     sr=$(xe sr-create host-uuid=$(first_host) type=iso name-label=xe-example-iso content-type=iso \
-        device-config:location=192.0.2.10:/isos device-config:type=nfs_iso shared=true)
+        device-config:location="$location" device-config:type=nfs_iso shared=true)
     echo "Created ISO SR: $sr"
     detach_and_forget_sr $sr
     echo "OK: create-iso-sr"
@@ -170,7 +181,7 @@ w_create_iso_sr() {
 <details><summary>Sample output</summary>
 
 ```text
-Created ISO SR: 00000001-0000-0000-d00a-000000000000
+Created ISO SR: 00000001-0000-0000-b80a-000000000000
 OK: create-iso-sr
 ```
 

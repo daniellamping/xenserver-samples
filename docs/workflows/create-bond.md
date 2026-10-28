@@ -23,6 +23,9 @@ private static void CreateBond(string url, string user, string password)
     var spares = PIF.get_all_records(session)
         .Where(p => p.Value.host.opaque_ref == host && !p.Value.management && p.Value.physical)
         .Take(2).Select(p => p.Key).ToList();
+    if (spares.Count < 2)
+        throw new Exception($"{Host.get_name_label(session, host)} has {spares.Count} spare NIC(s); " +
+                             "a bond needs two that aren't the management interface");
     Console.WriteLine($"Bonding:      {string.Join(", ", spares.Select(p => PIF.get_device(session, p.opaque_ref)))}");
 
     // The bond needs a network to sit on.
@@ -78,6 +81,9 @@ def create_bond(url, username, password):
     # the bond master — on a real host that is how you lose the connection you are working over.
     spares = [ref for ref, pif in x.PIF.get_all_records().items()
               if pif["host"] == host and not pif["management"] and pif["physical"]][:2]
+    if len(spares) < 2:
+        raise RuntimeError("%s has %d spare NIC(s); a bond needs two that aren't the management interface"
+                           % (x.host.get_name_label(host), len(spares)))
     print("Bonding:      " + ", ".join(x.PIF.get_device(p) for p in spares))
 
     # The bond needs a network to sit on.
@@ -136,6 +142,9 @@ private static void createBond(String url, String user, String password) throws 
                 spares.add(e.getKey());
             }
         }
+        if (spares.size() < 2)
+            throw new RuntimeException(xenHost.getNameLabel(conn) + " has " + spares.size()
+                    + " spare NIC(s); a bond needs two that aren't the management interface");
         StringBuilder devices = new StringBuilder();
         for (PIF p : spares) devices.append(devices.length() > 0 ? ", " : "").append(p.getDevice(conn));
         System.out.println("Bonding:      " + devices);
@@ -145,6 +154,7 @@ private static void createBond(String url, String user, String password) throws 
         netSpec.nameLabel = "sdk-example-bond";
         netSpec.nameDescription = "Created by the SDK example";
         netSpec.otherConfig = new HashMap<String, String>();
+        netSpec.managed = true;   // as in createNetwork: unset would send false (NETWORK_UNMANAGED)
         Network network = Network.create(conn, netSpec);
 
         Bond bond = Bond.create(conn, network, spares, "", Types.BondMode.BALANCE_SLB);
@@ -199,12 +209,18 @@ func createBond(url, user, password string) {
 			devices = append(devices, pif.Device)
 		}
 	}
+	if len(spares) < 2 {
+		name, _ := xenapi.Host.GetNameLabel(session, hosts[0])
+		panic(fmt.Sprintf("%s has %d spare NIC(s); a bond needs two that aren't the management interface",
+			name, len(spares)))
+	}
 	fmt.Printf("Bonding:      %s\n", strings.Join(devices, ", "))
 
 	// The bond needs a network to sit on.
 	network, err := xenapi.Network.Create(session, xenapi.NetworkRecord{
 		NameLabel:       "sdk-example-bond",
 		NameDescription: "Created by the SDK example",
+		Managed:         true, // as in createNetwork: the zero value would be NETWORK_UNMANAGED
 	})
 	check(err)
 
@@ -260,6 +276,9 @@ function Invoke-CreateBond {
     # the bond master — on a real host that is how you lose the connection you are working over.
     $spares = Get-XenPIF | Where-Object { $_.host -eq $xenHost.opaque_ref -and -not $_.management -and $_.physical } |
         Select-Object -First 2
+    if (@($spares).Count -lt 2) {
+        throw "$($xenHost.name_label) has $(@($spares).Count) spare NIC(s); a bond needs two that aren't the management interface"
+    }
     Write-Host "Bonding:      $(($spares | ForEach-Object { $_.device }) -join ', ')"
 
     # The bond needs a network to sit on.
@@ -307,6 +326,10 @@ w_create_bond() {
     # Spare NICs only. A bond that includes the management interface moves the management address onto
     # the bond master - on a real host that is how you lose the connection you are working over.
     spares=$(xe pif-list host-uuid="$host_uuid" management=false physical=true --minimal)
+    if [ "$(count_csv "$spares")" -lt 2 ]; then
+        echo "$(xe host-param-get uuid=$host_uuid param-name=name-label) has $(count_csv "$spares") spare NIC(s); a bond needs two that aren't the management interface" >&2
+        return 1
+    fi
     spares="$(first_csv "$spares"),$(nth_csv "$spares" 2)"
     echo "Bonding:      $spares"
 

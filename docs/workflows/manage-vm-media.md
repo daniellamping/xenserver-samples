@@ -373,8 +373,7 @@ w_manage_vm_media() {
 
     # A CD drive is a VBD like any other, distinguished by type=CD; created without a disk it arrives
     # empty, and the media is whichever VDI it is later pointed at.
-    # --minimal, because without it xe prints a list as "1; 2; 3" and nth_csv would hand back the lot.
-    device=$(nth_csv "$(xe vm-param-get uuid=$vm param-name=allowed-VBD-devices --minimal)" 1)
+    device=$(first_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=allowed-VBD-devices)")")
     drive=$(xe vbd-create vm-uuid=$vm device=$device type=CD mode=RO)
     echo "  drive $device is empty: $(xe vbd-param-get uuid=$drive param-name=empty)"
 

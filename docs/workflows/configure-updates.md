@@ -9,20 +9,29 @@ Workflow `configure-updates`. [All workflows](README.md) · [Connecting](connect
 ## C# (.NET)
 
 ```csharp
-private static void ConfigureUpdates(string url, string user, string password)
+/// <summary>
+/// Introduce the pool's update repositories the way XenCenter does: the release's base packages
+/// (update=false) and its update stream (update=true, which pool.sync_updates needs - otherwise
+/// NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so
+/// these are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}.
+/// </summary>
+private static List<XenRef<Repository>> IntroduceUpdateRepositories(Session session, string repoUrl,
+    string sourceUrl) =>
+    new[] { "base", "normal" }.Select(stage => new XenRef<Repository>(Repository.introduce(session,
+        $"sdk-example-{stage}", $"SDK example {stage} repository",
+        $"{repoUrl}/{stage}", $"{sourceUrl}/{stage}", stage != "base", "").opaque_ref)).ToList();
+
+private static void ConfigureUpdates(string url, string user, string password, string repoUrl, string sourceUrl)
 {
     var session = Connect(url, user, password);
-    // update=true: without it this introduces only a base package mirror, not an actual UPDATE
-    // repository - pool.sync_updates needs one with update=true enabled (NO_REPOSITORY_ENABLED
-    // otherwise), which is exactly what apply-update and rolling-pool-update rely on.
-    var repo = Repository.introduce(session, "sdk-cdn", "SDK example repository",
-        "https://cdn.example/base", "https://cdn.example/source", true, "").opaque_ref;
-    Console.WriteLine($"Introduced repository: {Repository.get_name_label(session, repo)}");
+    var repos = IntroduceUpdateRepositories(session, repoUrl, sourceUrl);
+    Console.WriteLine("Introduced repositories: " +
+        string.Join(", ", repos.Select(r => Repository.get_name_label(session, r.opaque_ref))));
 
     var pool = Pool.get_all(session)[0].opaque_ref;
     // Remember the pool's own repositories, to put them back afterwards.
     var previous = Pool.get_repositories(session, pool);
-    Pool.set_repositories(session, pool, new List<XenRef<Repository>> { new(repo) });
+    Pool.set_repositories(session, pool, repos);
     Pool.set_update_sync_enabled(session, pool, true);
     Console.WriteLine($"Pool repositories: {Pool.get_repositories(session, pool).Count}; " +
         $"auto-sync enabled: {Pool.get_update_sync_enabled(session, pool)}");
@@ -30,19 +39,20 @@ private static void ConfigureUpdates(string url, string user, string password)
     // Tidy up so the example is repeatable.
     Pool.set_update_sync_enabled(session, pool, false);
     Pool.set_repositories(session, pool, previous);
-    Repository.forget(session, repo);
+    foreach (var repo in repos) Repository.forget(session, repo.opaque_ref);
     Console.WriteLine("OK: configure-updates");
     session.logout();
 }
 // Run it:
-//   ConfigureUpdates("https://xenserver", "root", password);
+//   ConfigureUpdates("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+//       "https://repo-src.ops.xenserver.com/xs9");
 ```
 
 <details><summary>Sample output</summary>
 
 ```text
-Introduced repository: sdk-cdn
-Pool repositories: 1; auto-sync enabled: True
+Introduced repositories: sdk-example-base, sdk-example-normal
+Pool repositories: 2; auto-sync enabled: True
 OK: configure-updates
 ```
 
@@ -51,22 +61,28 @@ OK: configure-updates
 ## Python
 
 ```python
-def configure_updates(url, username, password):
-    """Point the pool at a CDN repository and enable automatic update sync.
+def introduce_update_repositories(session, repo_url, source_url):
+    """Introduce the pool's update repositories the way XenCenter does: the release's base packages
+    (update=False) and its update stream (update=True, which pool.sync_updates needs - otherwise
+    NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so
+    these are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}."""
+    return [session.xenapi.Repository.introduce(
+                "sdk-example-%s" % stage, "SDK example %s repository" % stage,
+                "%s/%s" % (repo_url, stage), "%s/%s" % (source_url, stage), stage != "base", "")
+            for stage in ("base", "normal")]
 
-    update=True: without it this introduces only a base package mirror, not an actual *update*
-    repository - pool.sync_updates needs one with update=True enabled (NO_REPOSITORY_ENABLED
-    otherwise), which is exactly what apply-update and rolling-pool-update rely on."""
+
+def configure_updates(url, username, password, repo_url, source_url):
+    """Point the pool at the CDN's repositories and enable automatic update sync."""
     session = connect(url, username, password)
-    repo = session.xenapi.Repository.introduce(
-        "sdk-cdn", "SDK example repository",
-        "https://cdn.example/base", "https://cdn.example/source", True, "")
-    print("Introduced repository: %s" % session.xenapi.Repository.get_name_label(repo))
+    repos = introduce_update_repositories(session, repo_url, source_url)
+    print("Introduced repositories: %s"
+          % ", ".join(session.xenapi.Repository.get_name_label(r) for r in repos))
 
     pool = session.xenapi.pool.get_all()[0]
     # Remember the pool's own repositories, to put them back afterwards.
     previous = session.xenapi.pool.get_repositories(pool)
-    session.xenapi.pool.set_repositories(pool, [repo])
+    session.xenapi.pool.set_repositories(pool, repos)
     session.xenapi.pool.set_update_sync_enabled(pool, True)
     print("Pool repositories: %d; auto-sync enabled: %s"
           % (len(session.xenapi.pool.get_repositories(pool)),
@@ -75,18 +91,20 @@ def configure_updates(url, username, password):
     # Tidy up so the example is repeatable.
     session.xenapi.pool.set_update_sync_enabled(pool, False)
     session.xenapi.pool.set_repositories(pool, previous)
-    session.xenapi.Repository.forget(repo)
+    for repo in repos:
+        session.xenapi.Repository.forget(repo)
     print("OK: configure-updates")
     session.xenapi.session.logout()
 # Run it:
-#   configure_updates("https://xenserver", "root", password)
+#   configure_updates("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+#       "https://repo-src.ops.xenserver.com/xs9")
 ```
 
 <details><summary>Sample output</summary>
 
 ```text
-Introduced repository: sdk-cdn
-Pool repositories: 1; auto-sync enabled: True
+Introduced repositories: sdk-example-base, sdk-example-normal
+Pool repositories: 2; auto-sync enabled: True
 OK: configure-updates
 ```
 
@@ -95,19 +113,36 @@ OK: configure-updates
 ## Java
 
 ```java
-private static void configureUpdates(String url, String user, String password) throws Exception {
+// Introduce the pool's update repositories the way XenCenter does: the release's base packages
+// (update=false) and its update stream (update=true, which pool.syncUpdates needs - otherwise
+// NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so
+// these are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}.
+private static Set<Repository> introduceUpdateRepositories(Connection conn, String repoUrl,
+        String sourceUrl) throws Exception {
+    Set<Repository> repos = new LinkedHashSet<>();
+    for (String stage : new String[] { "base", "normal" }) {
+        repos.add(Repository.introduce(conn, "sdk-example-" + stage,
+                "SDK example " + stage + " repository", repoUrl + "/" + stage,
+                sourceUrl + "/" + stage, !stage.equals("base"), ""));
+    }
+    return repos;
+}
+
+private static void configureUpdates(String url, String user, String password, String repoUrl,
+        String sourceUrl) throws Exception {
     Connection conn = connect(url, user, password);
-    // update=True: without it this introduces only a base package mirror, not an actual *update*
-    // repository - pool.syncUpdates needs one with update=True enabled (NO_REPOSITORY_ENABLED
-    // otherwise), which is exactly what apply-update and rolling-pool-update rely on.
-    Repository repo = Repository.introduce(conn, "sdk-cdn", "SDK example repository",
-            "https://cdn.example/base", "https://cdn.example/source", true, "");
-    System.out.println("Introduced repository: " + repo.getNameLabel(conn));
+    Set<Repository> repos = introduceUpdateRepositories(conn, repoUrl, sourceUrl);
+    StringBuilder names = new StringBuilder();
+    for (Repository repo : repos) {
+        if (names.length() > 0) names.append(", ");
+        names.append(repo.getNameLabel(conn));
+    }
+    System.out.println("Introduced repositories: " + names);
 
     Pool pool = Pool.getAll(conn).iterator().next();
     // Remember the pool's own repositories, to put them back afterwards.
     Set<Repository> previous = pool.getRepositories(conn);
-    pool.setRepositories(conn, new LinkedHashSet<>(java.util.List.of(repo)));
+    pool.setRepositories(conn, repos);
     pool.setUpdateSyncEnabled(conn, true);
     System.out.println("Pool repositories: " + pool.getRepositories(conn).size()
             + "; auto-sync enabled: " + pool.getUpdateSyncEnabled(conn));
@@ -115,19 +150,20 @@ private static void configureUpdates(String url, String user, String password) t
     // Tidy up so the example is repeatable.
     pool.setUpdateSyncEnabled(conn, false);
     pool.setRepositories(conn, previous);
-    repo.forget(conn);
+    for (Repository repo : repos) repo.forget(conn);
     System.out.println("OK: configure-updates");
     Session.logout(conn);
 }
 // Run it:
-//   configureUpdates("https://xenserver", "root", password);
+//   configureUpdates("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+//       "https://repo-src.ops.xenserver.com/xs9");
 ```
 
 <details><summary>Sample output</summary>
 
 ```text
-Introduced repository: sdk-cdn
-Pool repositories: 1; auto-sync enabled: true
+Introduced repositories: sdk-example-base, sdk-example-normal
+Pool repositories: 2; auto-sync enabled: true
 OK: configure-updates
 ```
 
@@ -136,16 +172,32 @@ OK: configure-updates
 ## Go
 
 ```go
-func configureUpdates(url, user, password string) {
+// introduceUpdateRepositories introduces the pool's update repositories the way XenCenter does: the
+// release's base packages (update=false) and its update stream (update=true, which
+// Pool.SyncUpdates needs - otherwise NO_REPOSITORY_ENABLED). A real host checks the URLs
+// (INVALID_BASE_URL for an unknown domain), so these are the XenServer CDN's, e.g.
+// https://repo.ops.xenserver.com/xs9/{base,normal}.
+func introduceUpdateRepositories(session *xenapi.Session, repoURL, sourceURL string) []xenapi.RepositoryRef {
+	var repos []xenapi.RepositoryRef
+	for _, stage := range []string{"base", "normal"} {
+		repo, err := xenapi.Repository.Introduce(session, "sdk-example-"+stage,
+			"SDK example "+stage+" repository",
+			repoURL+"/"+stage, sourceURL+"/"+stage, stage != "base", "")
+		check(err)
+		repos = append(repos, repo)
+	}
+	return repos
+}
+
+func configureUpdates(url, user, password, repoURL, sourceURL string) {
 	session := connect(url, user, password)
-	// update=true: without it this introduces only a base package mirror, not an actual UPDATE
-	// repository - pool.sync_updates needs one with update=true enabled (NO_REPOSITORY_ENABLED
-	// otherwise), which is exactly what apply-update and rolling-pool-update rely on.
-	repo, err := xenapi.Repository.Introduce(session, "sdk-cdn", "SDK example repository",
-		"https://cdn.example/base", "https://cdn.example/source", true, "")
-	check(err)
-	name, _ := xenapi.Repository.GetNameLabel(session, repo)
-	fmt.Printf("Introduced repository: %s\n", name)
+	repos := introduceUpdateRepositories(session, repoURL, sourceURL)
+	var names []string
+	for _, repo := range repos {
+		name, _ := xenapi.Repository.GetNameLabel(session, repo)
+		names = append(names, name)
+	}
+	fmt.Printf("Introduced repositories: %s\n", strings.Join(names, ", "))
 
 	pools, err := xenapi.Pool.GetAll(session)
 	check(err)
@@ -153,22 +205,25 @@ func configureUpdates(url, user, password string) {
 	// Remember the pool's own repositories, to put them back afterwards.
 	previous, perr := xenapi.Pool.GetRepositories(session, pool)
 	check(perr)
-	check(xenapi.Pool.SetRepositories(session, pool, []xenapi.RepositoryRef{repo}))
+	check(xenapi.Pool.SetRepositories(session, pool, repos))
 	check(xenapi.Pool.SetUpdateSyncEnabled(session, pool, true))
-	repos, _ := xenapi.Pool.GetRepositories(session, pool)
+	nowRepos, _ := xenapi.Pool.GetRepositories(session, pool)
 	enabled, _ := xenapi.Pool.GetUpdateSyncEnabled(session, pool)
-	fmt.Printf("Pool repositories: %d; auto-sync enabled: %v\n", len(repos), enabled)
+	fmt.Printf("Pool repositories: %d; auto-sync enabled: %v\n", len(nowRepos), enabled)
 
 	// Tidy up so the example is repeatable.
 	check(xenapi.Pool.SetUpdateSyncEnabled(session, pool, false))
 	check(xenapi.Pool.SetRepositories(session, pool, previous))
-	check(xenapi.Repository.Forget(session, repo))
+	for _, repo := range repos {
+		check(xenapi.Repository.Forget(session, repo))
+	}
 	fmt.Println("OK: configure-updates")
 	session.Logout()
 }
 
 // Run it:
-//   configureUpdates("https://xenserver", "root", password)
+//   configureUpdates("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+//       "https://repo-src.ops.xenserver.com/xs9")
 
 // diskVdis returns the VDIs backing a VM's disk VBDs (used to clean up a VM's owned disks).
 func diskVdis(session *xenapi.Session, vmRef xenapi.VMRef) []xenapi.VDIRef {
@@ -212,8 +267,8 @@ func destroyVMAndDisks(session *xenapi.Session, vm xenapi.VMRef) {
 <details><summary>Sample output</summary>
 
 ```text
-Introduced repository: sdk-cdn
-Pool repositories: 1; auto-sync enabled: true
+Introduced repositories: sdk-example-base, sdk-example-normal
+Pool repositories: 2; auto-sync enabled: true
 OK: configure-updates
 ```
 
@@ -222,26 +277,42 @@ OK: configure-updates
 ## PowerShell
 
 ```powershell
+function New-UpdateRepositories {
+    # Introduce the pool's update repositories the way XenCenter does: the release's base packages
+    # (Update=$false) and its update stream (Update=$true, which pool.sync_updates needs - otherwise
+    # NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so
+    # these are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}.
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][string]$RepoUrl,
+        [Parameter(Mandatory = $true)][string]$SourceUrl
+    )
+    return @("base", "normal") | ForEach-Object {
+        $stage = $_
+        # Repository.introduce is a static-style create, so pass the NULL ref for the (ignored)
+        # instance param.
+        Invoke-XenRepository -Ref 'OpaqueRef:NULL' -XenAction Introduce -NameLabel "sdk-example-$stage" `
+            -NameDescription "SDK example $stage repository" -BinaryUrl "$RepoUrl/$stage" `
+            -SourceUrl "$SourceUrl/$stage" -Update ($stage -ne "base") -GpgkeyPath '' -PassThru
+    }
+}
+
 function Invoke-ConfigureUpdates {
     param(
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
-        [Parameter(Mandatory = $true)][string]$Password
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$RepoUrl,
+        [Parameter(Mandatory = $true)][string]$SourceUrl
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
-    # Repository.introduce is a static-style create, so pass the NULL ref for the (ignored) instance
-    # param. Update=$true: without it this introduces only a base package mirror, not an actual *update*
-    # repository - pool.sync_updates needs one with Update enabled (NO_REPOSITORY_ENABLED otherwise),
-    # which is exactly what apply-update and rolling-pool-update rely on.
-    $repo = Invoke-XenRepository -Ref 'OpaqueRef:NULL' -XenAction Introduce -NameLabel 'sdk-cdn' `
-        -NameDescription 'SDK example repository' -BinaryUrl 'https://cdn.example/base' `
-        -SourceUrl 'https://cdn.example/source' -Update $true -GpgkeyPath '' -PassThru
-    Write-Host "Introduced repository: $($repo.name_label)"
+    $repos = @(New-UpdateRepositories -Session $session -RepoUrl $RepoUrl -SourceUrl $SourceUrl)
+    Write-Host "Introduced repositories: $(($repos | ForEach-Object { $_.name_label }) -join ', ')"
 
     $pool = Get-XenPool | Select-Object -First 1
     # Remember the pool's own repositories, to put them back afterwards.
     $previous = @((Get-XenPool -Ref $pool.opaque_ref).repositories | ForEach-Object { $_.opaque_ref })
-    $pool | Set-XenPool -Repositories @($repo.opaque_ref)
+    $pool | Set-XenPool -Repositories @($repos | ForEach-Object { $_.opaque_ref })
     $pool | Set-XenPool -UpdateSyncEnabled $true
     $p = Get-XenPool -Ref $pool.opaque_ref
     Write-Host "Pool repositories: $($p.repositories.Count); auto-sync enabled: $($p.update_sync_enabled)"
@@ -249,19 +320,20 @@ function Invoke-ConfigureUpdates {
     # Tidy up so the example is repeatable.
     $pool | Set-XenPool -UpdateSyncEnabled $false
     $pool | Set-XenPool -Repositories $previous
-    $repo | Invoke-XenRepository -XenAction Forget
+    $repos | ForEach-Object { $_ | Invoke-XenRepository -XenAction Forget }
     Write-Host "OK: configure-updates"
     $session | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-ConfigureUpdates -Url https://xenserver -UserName root -Password $password
+#   Invoke-ConfigureUpdates -Url https://xenserver -UserName root -Password $password `
+#       -RepoUrl https://repo.ops.xenserver.com/xs9 -SourceUrl https://repo-src.ops.xenserver.com/xs9
 ```
 
 <details><summary>Sample output</summary>
 
 ```text
-Introduced repository: sdk-cdn
-Pool repositories: 1; auto-sync enabled: True
+Introduced repositories: sdk-example-base, sdk-example-normal
+Pool repositories: 2; auto-sync enabled: True
 OK: configure-updates
 ```
 
@@ -271,18 +343,30 @@ OK: configure-updates
 
 ```bash
 w_configure_updates() {
+    local repo_url source_url repos repo_list names pool before
+    repo_url=$(param repo_url "https://repo.ops.xenserver.com/xs9")
+    source_url=$(param source_url "https://repo-src.ops.xenserver.com/xs9")
     pool=$(xe pool-list --minimal)
-    # update=true: without it this introduces only a base package mirror, not an actual *update*
-    # repository - pool-sync-updates needs one with update=true enabled (NO_REPOSITORY_ENABLED
-    # otherwise), which is exactly what apply-update and rolling-pool-update rely on.
-    repo=$(xe repository-introduce name-label=xe-cdn binary-url=https://cdn.example/base \
-        source-url=https://cdn.example/source update=true)
-    echo "Introduced repository: $(xe repository-param-get uuid=$repo param-name=name-label)"
+    repos=$(introduce_update_repositories "$repo_url" "$source_url")
+    repo_list="" names=""
+    for r in $repos; do
+        repo_list="${repo_list:+$repo_list,}$r"
+        names="${names:+$names, }$(xe repository-param-get uuid=$r param-name=name-label)"
+    done
+    echo "Introduced repositories: $names"
+
+    # Remember the pool's own repositories, to put them back afterwards. A set reads back "a; b" and is
+    # set as "a,b".
+    before=$(xe pool-param-get uuid=$pool param-name=repositories)
+    xe pool-param-set uuid=$pool repositories=$repo_list
     # The pool's update-sync-enabled is read-only to param-set; xe switches it with its own command.
     xe pool-set-update-sync-enabled value=true
-    echo "Auto-sync enabled: $(xe pool-param-get uuid=$pool param-name=update-sync-enabled)"
+    echo "Pool repositories: $(count_csv "$repo_list"); auto-sync enabled: $(xe pool-param-get uuid=$pool param-name=update-sync-enabled)"
+
+    # Tidy up so the example is repeatable.
     xe pool-set-update-sync-enabled value=false
-    xe repository-forget uuid=$repo
+    xe pool-param-set uuid=$pool repositories="${before//; /,}"
+    for r in $repos; do xe repository-forget uuid=$r; done
     echo "OK: configure-updates"
 }
 ```
@@ -290,8 +374,8 @@ w_configure_updates() {
 <details><summary>Sample output</summary>
 
 ```text
-Introduced repository: xe-cdn
-Auto-sync enabled: true
+Introduced repositories: sdk-example-base, sdk-example-normal
+Pool repositories: 2; auto-sync enabled: true
 OK: configure-updates
 ```
 

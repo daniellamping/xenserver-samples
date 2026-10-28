@@ -35,6 +35,7 @@ private static void AttachDisk(string url, string user, string password,
         VM = new XenRef<VM>(vm),
         VDI = new XenRef<VDI>(vdi),
         userdevice = device,
+        bootable = false,
         mode = vbd_mode.RW,
         type = vbd_type.Disk,
         empty = false,
@@ -88,6 +89,7 @@ def attach_disk(url, username, password, template_name, sr_name, new_vm_name="sd
     device = session.xenapi.VM.get_allowed_VBD_devices(vm)[0]
     session.xenapi.VBD.create({
         "VM": vm, "VDI": vdi, "userdevice": device,
+        "bootable": False,
         "mode": "RW", "type": "Disk", "empty": False, "other_config": {},
         "qos_algorithm_type": "", "qos_algorithm_params": {},
     })
@@ -141,6 +143,7 @@ private static void attachDisk(String url, String user, String password,
     vbdRec.VM = vm;
     vbdRec.VDI = vdi;
     vbdRec.userdevice = device;
+    vbdRec.bootable = false;
     vbdRec.mode = Types.VbdMode.RW;
     vbdRec.type = Types.VbdType.DISK;
     vbdRec.empty = false;
@@ -198,7 +201,8 @@ func attachDisk(url, user, password, templateName, srName, newVMName string) {
 	device := devices[0]
 	_, err = xenapi.VBD.Create(session, xenapi.VBDRecord{
 		VM: vm, VDI: vdi, Userdevice: device,
-		Mode: xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
+		Bootable: false,
+		Mode:     xenapi.VbdModeRW, Type: xenapi.VbdTypeDisk, Empty: false,
 		OtherConfig: map[string]string{}, QosAlgorithmParams: map[string]string{},
 	})
 	check(err)
@@ -253,7 +257,7 @@ function Invoke-AttachDisk {
     $vdi = New-XenVDI -NameLabel "sdk-example-data-disk" -SR $sr -VirtualSize 8GB `
         -Type user -Sharable $false -ReadOnly $false -PassThru
     $device = (Get-XenVMProperty -Ref $ref -XenProperty AllowedVBDDevices)[0]
-    New-XenVBD -VM (Get-XenVM -Ref $ref) -VDI $vdi -Userdevice $device `
+    New-XenVBD -VM (Get-XenVM -Ref $ref) -VDI $vdi -Userdevice $device -Bootable $false `
         -Mode RW -Type Disk -Empty $false | Out-Null
     Write-Host "Attached an 8 GiB disk on $($sr.name_label) as device $device"
     Write-Host "VM now has $(@((Get-XenVM -Ref $ref).VBDs).Count) VBD(s)"
@@ -286,9 +290,11 @@ w_attach_disk() {
     vm=$(xe vm-install template="$template" new-name-label=xe-example-attachdisk sr-uuid=$(shared_sr))
     vdi=$(xe vdi-create sr-uuid=$(shared_sr) name-label=xe-example-data-disk virtual-size=8GiB type=user)
     xe vbd-create vm-uuid=$vm vdi-uuid=$vdi device=1 type=Disk mode=RW >/dev/null
-    echo "Attached an 8 GiB disk; VM now has $(count_csv "$(xe vm-param-get uuid=$vm param-name=VBDs --minimal)") VBD(s)"
-    # Tidy up: vm-uninstall destroys the VM and the disks it owns, including the one just attached.
+    echo "Attached an 8 GiB disk; VM now has $(count_csv "$(set_to_csv "$(xe vm-param-get uuid=$vm param-name=VBDs)")") VBD(s)"
+    # Tidy up: vm-uninstall destroys the VM and the disks it OWNS (VBD other-config:owner, which vm-install
+    # sets on the template's disks) - not the one just attached, so destroy that too.
     xe vm-uninstall uuid=$vm force=true
+    xe vdi-destroy uuid=$vdi
     echo "OK: attach-disk"
 }
 ```

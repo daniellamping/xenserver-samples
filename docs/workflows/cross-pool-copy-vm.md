@@ -13,14 +13,18 @@ Workflow `cross-pool-copy-vm`. [All workflows](README.md) · [Connecting](connec
 // cross-pool Copy. Open a session to each pool, get a receiver token from the destination with
 // host.migrate_receive, then VM.migrate_send with copy=true on the source (which is left intact).
 private static void CrossPoolCopyVm(string url, string user, string password, string destUrl,
-    string vmName = "db-01")
+    string vmName = "db-01", string destUser = null, string destPassword = null)
 {
     var source = Connect(url, user, password);
-    var dest = Connect(destUrl, user, password);
-    // Destination: choose a host, a network and an SR, then ask for a receiver token.
-    var destHost = Host.get_all(dest)[0].opaque_ref;
-    var destNetwork = Network.get_all(dest)[0].opaque_ref;
-    var destSr = SrByName(dest, "Shared NFS");
+    var dest = Connect(destUrl, destUser ?? user, destPassword ?? password);
+    // Destination: choose a host, a network and an SR, then ask for a receiver token. The disks go to
+    // the destination pool's default SR and the data travels over the host's management network -
+    // one both pools can certainly reach (the first network listed may well not be).
+    var destPool = Pool.get_all(dest)[0];
+    var destHost = Pool.get_master(dest, destPool).opaque_ref;
+    var destSr = Pool.get_default_SR(dest, destPool).opaque_ref;
+    var managementPif = Host.get_PIFs(dest, destHost).First(pif => PIF.get_management(dest, pif.opaque_ref));
+    var destNetwork = PIF.get_network(dest, managementPif.opaque_ref).opaque_ref;
     var receiver = Host.migrate_receive(dest, destHost, destNetwork, new Dictionary<string, string>());
 
     // Source: map every disk to the destination SR and every NIC to the destination network
@@ -37,12 +41,14 @@ private static void CrossPoolCopyVm(string url, string user, string password, st
     foreach (var vifRef in VM.get_VIFs(source, vm)) vifMap[vifRef] = new XenRef<Network>(destNetwork);
 
     var options = new Dictionary<string, string> { ["copy"] = "true" };
-    VM.migrate_send(source, vm, receiver, false, vdiMap, vifMap, options,
+    var copy = VM.migrate_send(source, vm, receiver, false, vdiMap, vifMap, options,
         new Dictionary<XenRef<VGPU>, XenRef<GPU_group>>());
 
     // Copy (not move): the source VM is still on the source pool.
     Console.WriteLine($"Sent '{vmName}' to the destination pool (copy); source still present: " +
                       $"{VmByName(source, vmName) == vm}");
+    // The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
+    Console.WriteLine($"  the copy on the destination: {VM.get_name_label(dest, copy)} ({VM.get_uuid(dest, copy)})");
     Console.WriteLine("OK: cross-pool-copy-vm");
     source.logout();
     dest.logout();
@@ -60,6 +66,7 @@ private static void CrossPoolCopyVm(string url, string user, string password, st
 
 ```text
 Sent 'db-01' to the destination pool (copy); source still present: True
+  the copy on the destination: db-01 (00000001-0000-0000-9400-000000000000)
 OK: cross-pool-copy-vm
 ```
 
@@ -68,15 +75,20 @@ OK: cross-pool-copy-vm
 ## Python
 
 ```python
-def cross_pool_copy_vm(url, username, password, dest_url, vm_name="db-01"):
+def cross_pool_copy_vm(url, username, password, dest_url, vm_name="db-01",
+                       dest_username=None, dest_password=None):
     """Copy a VM from one pool to another (Storage XenMotion copy): get a receiver token from the
     destination with host.migrate_receive, then VM.migrate_send with copy=true on the source."""
     source = connect(url, username, password)
-    dest = connect(dest_url, username, password)
-    # Destination: choose a host, network and SR, then ask for a receiver token.
-    dest_host = dest.xenapi.host.get_all()[0]
-    dest_network = dest.xenapi.network.get_all()[0]
-    dest_sr = sr_by_name(dest, "Shared NFS")
+    dest = connect(dest_url, dest_username or username, dest_password or password)
+    # Destination: choose a host, network and SR, then ask for a receiver token. The disks go to
+    # the destination pool's default SR and the data travels over the host's management network -
+    # one both pools can certainly reach (the first network listed may well not be).
+    dest_pool = dest.xenapi.pool.get_all()[0]
+    dest_host = dest.xenapi.pool.get_master(dest_pool)
+    dest_sr = dest.xenapi.pool.get_default_SR(dest_pool)
+    dest_network = next(dest.xenapi.PIF.get_network(pif) for pif in dest.xenapi.host.get_PIFs(dest_host)
+                        if dest.xenapi.PIF.get_management(pif))
     receiver = dest.xenapi.host.migrate_receive(dest_host, dest_network, {})
 
     # Source: map every disk to the destination SR and every NIC to the destination network,
@@ -91,9 +103,12 @@ def cross_pool_copy_vm(url, username, password, dest_url, vm_name="db-01"):
             vdi_map[vdi] = dest_sr
     vif_map = {vif: dest_network for vif in source.xenapi.VM.get_VIFs(vm)}
 
-    source.xenapi.VM.migrate_send(vm, receiver, False, vdi_map, vif_map, {"copy": "true"}, {})
+    copy = source.xenapi.VM.migrate_send(vm, receiver, False, vdi_map, vif_map, {"copy": "true"}, {})
     print("Sent '%s' to the destination pool (copy); source still present: %s"
           % (vm_name, vm_by_name(source, vm_name) == vm))
+    # The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
+    print("  the copy on the destination: %s (%s)"
+          % (dest.xenapi.VM.get_name_label(copy), dest.xenapi.VM.get_uuid(copy)))
     print("OK: cross-pool-copy-vm")
     source.xenapi.session.logout()
     dest.xenapi.session.logout()
@@ -111,6 +126,7 @@ def cross_pool_copy_vm(url, username, password, dest_url, vm_name="db-01"):
 
 ```text
 Sent 'db-01' to the destination pool (copy); source still present: True
+  the copy on the destination: db-01 (00000001-0000-0000-9400-000000000000)
 OK: cross-pool-copy-vm
 ```
 
@@ -122,13 +138,19 @@ OK: cross-pool-copy-vm
 // Copy a VM from one pool to another (Storage XenMotion copy): get a receiver token from the
 // destination with host.migrate_receive, then VM.migrate_send with copy=true on the source.
 private static void crossPoolCopyVm(String url, String user, String password, String destUrl,
-        String vmName) throws Exception {
+        String vmName, String destUser, String destPassword) throws Exception {
     Connection source = connect(url, user, password);
-    Connection dest = connect(destUrl, user, password);
-    // Destination: choose a host, network and SR, then ask for a receiver token.
-    Host destHost = Host.getAll(dest).iterator().next();
-    Network destNetwork = Network.getAll(dest).iterator().next();
-    SR destSr = srByName(dest, "Shared NFS", false);
+    Connection dest = connect(destUrl, destUser != null ? destUser : user,
+            destPassword != null ? destPassword : password);
+    // Destination: choose a host, network and SR, then ask for a receiver token. The disks go to
+    // the destination pool's default SR and the data travels over the host's management network -
+    // one both pools can certainly reach (the first network listed may well not be).
+    Pool destPool = Pool.getAll(dest).iterator().next();
+    Host destHost = destPool.getMaster(dest);
+    SR destSr = destPool.getDefaultSR(dest);
+    Network destNetwork = null;
+    for (PIF pif : destHost.getPIFs(dest))
+        if (pif.getManagement(dest)) destNetwork = pif.getNetwork(dest);
     Map<String, String> receiver = destHost.migrateReceive(dest, destNetwork, new HashMap<>());
 
     // Source: map every disk to the destination SR and every NIC to the destination network,
@@ -142,22 +164,26 @@ private static void crossPoolCopyVm(String url, String user, String password, St
 
     Map<String, String> options = new HashMap<>();
     options.put("copy", "true");
-    vm.migrateSend(source, receiver, false, vdiMap, vifMap, options,
+    VM copy = vm.migrateSend(source, receiver, false, vdiMap, vifMap, options,
             new HashMap<VGPU, GPUGroup>());
     System.out.println("Sent '" + vmName + "' to the destination pool (copy); source still present: "
             + vmByName(source, vmName).equals(vm));
+    // The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
+    System.out.println("  the copy on the destination: " + copy.getNameLabel(dest) + " ("
+            + copy.getUuid(dest) + ")");
     System.out.println("OK: cross-pool-copy-vm");
     Session.logout(source);
     Session.logout(dest);
 }
 // Run it:
-//   crossPoolCopyVm("https://poolA", "root", password, "https://poolB", "db-01");
+//   crossPoolCopyVm("https://poolA", "root", password, "https://poolB", "db-01", null, null);
 ```
 
 <details><summary>Sample output</summary>
 
 ```text
 Sent 'db-01' to the destination pool (copy); source still present: true
+  the copy on the destination: db-01 (00000001-0000-0000-9400-000000000000)
 OK: cross-pool-copy-vm
 ```
 
@@ -168,16 +194,31 @@ OK: cross-pool-copy-vm
 ```go
 // Copy a VM from one pool to another (Storage XenMotion copy): get a receiver token from the
 // destination with host.migrate_receive, then VM.migrate_send with copy=true on the source.
-func crossPoolCopyVM(url, user, password, destURL, vmName string) {
+func crossPoolCopyVM(url, user, password, destURL, vmName, destUser, destPassword string) {
 	source := connect(url, user, password)
-	dest := connect(destURL, user, password)
-	// Destination: choose a host, network and SR, then ask for a receiver token.
-	destHosts, err := xenapi.Host.GetAll(dest)
+	if destUser == "" {
+		destUser, destPassword = user, password
+	}
+	dest := connect(destURL, destUser, destPassword)
+	// Destination: choose a host, network and SR, then ask for a receiver token. The disks go to
+	// the destination pool's default SR and the data travels over the host's management network -
+	// one both pools can certainly reach (the first network listed may well not be).
+	destPools, err := xenapi.Pool.GetAll(dest)
 	check(err)
-	destNets, err := xenapi.Network.GetAll(dest)
+	destHost, err := xenapi.Pool.GetMaster(dest, destPools[0])
 	check(err)
-	destSr := srByName(dest, "Shared NFS", true)
-	receiver, err := xenapi.Host.MigrateReceive(dest, destHosts[0], destNets[0], map[string]string{})
+	destSr, err := xenapi.Pool.GetDefaultSR(dest, destPools[0])
+	check(err)
+	pifs, err := xenapi.Host.GetPIFs(dest, destHost)
+	check(err)
+	var destNetwork xenapi.NetworkRef
+	for _, pif := range pifs {
+		if management, _ := xenapi.PIF.GetManagement(dest, pif); management {
+			destNetwork, err = xenapi.PIF.GetNetwork(dest, pif)
+			check(err)
+		}
+	}
+	receiver, err := xenapi.Host.MigrateReceive(dest, destHost, destNetwork, map[string]string{})
 	check(err)
 
 	// Source: map every disk to the destination SR and every NIC to the destination network,
@@ -195,23 +236,29 @@ func crossPoolCopyVM(url, user, password, destURL, vmName string) {
 	vifs, _ := xenapi.VM.GetVIFs(source, vm)
 	vifMap := map[xenapi.VIFRef]xenapi.NetworkRef{}
 	for _, vif := range vifs {
-		vifMap[vif] = destNets[0]
+		vifMap[vif] = destNetwork
 	}
 
 	// MigrateSend8 is the 8-argument form every pool version accepts; MigrateSend itself takes newer
 	// arguments that older hosts reject.
-	_, err = xenapi.VM.MigrateSend8(source, vm, receiver, false, vdiMap, vifMap,
+	copied, err := xenapi.VM.MigrateSend8(source, vm, receiver, false, vdiMap, vifMap,
 		map[string]string{"copy": "true"}, map[xenapi.VGPURef]xenapi.GPUGroupRef{})
 	check(err)
 	fmt.Printf("Sent '%s' to the destination pool (copy); source still present: %v\n",
 		vmName, vmByName(source, vmName) == vm)
+	// The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
+	copyName, err := xenapi.VM.GetNameLabel(dest, copied)
+	check(err)
+	copyUUID, err := xenapi.VM.GetUUID(dest, copied)
+	check(err)
+	fmt.Printf("  the copy on the destination: %s (%s)\n", copyName, copyUUID)
 	fmt.Println("OK: cross-pool-copy-vm")
 	dest.Logout()
 	source.Logout()
 }
 
 // Run it:
-//   findByUUID("https://xenserver", "root", password, "web-01")
+//   crossPoolCopyVM("https://poolA", "root", password, "https://poolB", "db-01", "", "")
 
 // Maps the <workflow> argument to the matching self-contained function above, supplying the concrete
 // objects each one operates on. In your own code you would call these functions directly (see the
@@ -222,6 +269,7 @@ func crossPoolCopyVM(url, user, password, destURL, vmName string) {
 
 ```text
 Sent 'db-01' to the destination pool (copy); source still present: true
+  the copy on the destination: db-01 (00000001-0000-0000-9400-000000000000)
 OK: cross-pool-copy-vm
 ```
 
@@ -236,19 +284,27 @@ function Invoke-CrossPoolCopyVm {
         [Parameter(Mandatory = $true)][string]$UserName,
         [Parameter(Mandatory = $true)][string]$Password,
         [Parameter(Mandatory = $true)][string]$DestUrl,
-        [string]$VmName = "db-01"
+        [string]$VmName = "db-01",
+        # The destination pool's credentials, if they differ from the source's.
+        [string]$DestUserName = $UserName,
+        [string]$DestPassword = $Password
     )
     # Two pools, so two sessions. Every cmdlet takes -SessionOpaqueRef, so we drive each pool explicitly
     # (Connect-Example sets a default session too, but being explicit keeps the two pools apart).
     $source = Connect-Example -Url $Url -UserName $UserName -Password $Password
-    $dest = Connect-Example -Url $DestUrl -UserName $UserName -Password $Password
+    $dest = Connect-Example -Url $DestUrl -UserName $DestUserName -Password $DestPassword
     $srcRef = $source.opaque_ref
     $dstRef = $dest.opaque_ref
 
     # Destination: choose a host, network and SR, then ask for a receiver token (a string->string map).
-    $destHost = Get-XenHost -SessionOpaqueRef $dstRef | Select-Object -First 1
-    $destNet = Get-XenNetwork -SessionOpaqueRef $dstRef | Select-Object -First 1
-    $destSr = Get-XenSR -SessionOpaqueRef $dstRef -Name "Shared NFS" | Select-Object -First 1
+    # The disks go to the destination pool's default SR and the data travels over the host's management
+    # network - one both pools can certainly reach (the first network listed may well not be).
+    $destPool = Get-XenPool -SessionOpaqueRef $dstRef | Select-Object -First 1
+    $destHost = Get-XenHost -SessionOpaqueRef $dstRef -Ref $destPool.master.opaque_ref
+    $destSr = Get-XenSR -SessionOpaqueRef $dstRef -Ref $destPool.default_SR.opaque_ref
+    $managementPif = Get-XenPIF -SessionOpaqueRef $dstRef |
+        Where-Object { $_.management -and $_.host.opaque_ref -eq $destHost.opaque_ref } | Select-Object -First 1
+    $destNet = Get-XenNetwork -SessionOpaqueRef $dstRef -Ref $managementPif.network.opaque_ref
     $receiver = $destHost | Invoke-XenHost -SessionOpaqueRef $dstRef -XenAction MigrateReceive `
         -Network $destNet -Options @{} -PassThru
 
@@ -282,7 +338,8 @@ function Invoke-CrossPoolCopyVm {
     $dest | Disconnect-XenServer
 }
 # Run it:
-#   Invoke-CrossPoolCopyVm -Url https://poolA -UserName root -Password $password -DestUrl https://poolB
+#   Invoke-CrossPoolCopyVm -Url https://poolA -UserName root -Password $password -DestUrl https://poolB `
+#       [-DestUserName root -DestPassword $destPassword] [-VmName db-01]
 ```
 
 <details><summary>Sample output</summary>
@@ -301,10 +358,10 @@ w_cross_pool_copy_vm() {
     # Copy a VM to another pool (Storage XenMotion copy). Real xe does the whole cross-pool dance
     # itself given the destination master's address + credentials; copy=true leaves the source intact.
     dest_host=${desturl#*://}; dest_host=${dest_host%%/*}; dest_host=${dest_host%%:*}
-    vm=$(vm_uuid db-01)
-    xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$user remote-password=$pass copy=true
-    still=$([ -n "$(vm_uuid db-01)" ] && echo True || echo False)
-    echo "Sent 'db-01' to $dest_host (copy); source still present: $still"
+    vm=$(vm_uuid "$copy_vm")
+    xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$destuser remote-password=$destpass copy=true
+    still=$([ -n "$(vm_uuid "$copy_vm")" ] && echo True || echo False)
+    echo "Sent '$copy_vm' to $dest_host (copy); source still present: $still"
     echo "OK: cross-pool-copy-vm"
 }
 ```

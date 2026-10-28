@@ -13,7 +13,8 @@ Workflow `create-hba-sr`. [All workflows](README.md) · [Connecting](connecting.
 // probing with no SCSIid fails on purpose and lists every LUN the backend can see.
 //
 // SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
-private static void CreateHbaSr(string url, string user, string password, string srName = "sdk-example-hba")
+private static void CreateHbaSr(string url, string user, string password, string scsiId = "",
+    string srName = "sdk-example-hba")
 {
     const long GiB = 1024L * 1024 * 1024;
     var session = Connect(url, user, password);
@@ -21,8 +22,11 @@ private static void CreateHbaSr(string url, string user, string password, string
 
     // The root element varies by backend; find BlockDevice entries by tag wherever they are.
     var devlistXml = XDocument.Parse(ProbeForFailure(session, host, new Dictionary<string, string>(), "lvmohba"));
-    var device = devlistXml.Descendants("BlockDevice").First();
-    var scsiId = device.Element("SCSIid")!.Value;
+    // SR.create formats the LUN: on shared FC storage name yours (scsiId); with none, the first is taken.
+    var device = devlistXml.Descendants("BlockDevice")
+                     .FirstOrDefault(d => scsiId == "" || d.Element("SCSIid")!.Value == scsiId)
+                 ?? throw new Exception($"no LUN with SCSIid {scsiId} is visible to this host");
+    scsiId = device.Element("SCSIid")!.Value;
     var path = device.Element("path")!.Value;
     Console.WriteLine($"Discovered LUN: SCSIid {scsiId} on {path}");
 
@@ -44,7 +48,7 @@ private static void CreateHbaSr(string url, string user, string password, string
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-de0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-c60a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -53,18 +57,23 @@ OK: create-hba-sr
 ## Python
 
 ```python
-def create_hba_sr(url, username, password, sr_name="sdk-example-hba"):
+def create_hba_sr(url, username, password, scsi_id="", sr_name="sdk-example-hba"):
     """Connect a shared SR to a fibre-channel (HBA) LUN, discovering it the way the New SR wizard
     does: probing with no SCSIid fails on purpose and lists every LUN the backend can see.
 
-    SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target."""
+    SR.create formats the chosen LUN - this is destructive. On shared FC storage a host sees LUNs
+    other hosts are using, so name the one that is yours (scsi_id); with none, the first LUN listed
+    is taken, which is only right on a dedicated test target."""
     GIB = 1024 * 1024 * 1024
     session = connect(url, username, password)
     host = session.xenapi.host.get_all()[0]
 
     # The root element varies by backend; find BlockDevice entries by tag wherever they are.
     devlist_xml = ET.fromstring(_probe_for_failure(session, host, {}, "lvmohba"))
-    device = devlist_xml.find(".//BlockDevice")
+    device = next((d for d in devlist_xml.iter("BlockDevice")
+                   if not scsi_id or d.find("SCSIid").text == scsi_id), None)
+    if device is None:
+        raise RuntimeError("no LUN with SCSIid %s is visible to this host" % scsi_id)
     scsi_id = device.find("SCSIid").text
     path = device.find("path").text
     print("Discovered LUN: SCSIid %s on %s" % (scsi_id, path))
@@ -85,7 +94,7 @@ def create_hba_sr(url, username, password, sr_name="sdk-example-hba"):
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-dc0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-760a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -97,7 +106,8 @@ OK: create-hba-sr
 // Connect a shared SR to a fibre-channel (HBA) LUN, discovering it the way the New SR wizard does:
 // probing with no SCSIid fails on purpose and lists every LUN the backend can see.
 // SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
-private static void createHbaSr(String url, String user, String password, String srName) throws Exception {
+private static void createHbaSr(String url, String user, String password, String scsiId, String srName)
+        throws Exception {
     final long GiB = 1024L * 1024 * 1024;
     Connection conn = connect(url, user, password);
     try {
@@ -106,8 +116,15 @@ private static void createHbaSr(String url, String user, String password, String
         // The root element varies by backend; find BlockDevice entries by tag wherever they are.
         org.w3c.dom.Element devlistRoot =
             parseXml(probeForFailure(conn, host, new java.util.HashMap<>(), "lvmohba")).getDocumentElement();
-        org.w3c.dom.Element device = (org.w3c.dom.Element) devlistRoot.getElementsByTagName("BlockDevice").item(0);
-        String scsiId = firstTagText(device, "SCSIid");
+        // SR.create formats the LUN: on shared FC storage name yours (scsiId); with none, the first is taken.
+        org.w3c.dom.NodeList devices = devlistRoot.getElementsByTagName("BlockDevice");
+        org.w3c.dom.Element device = null;
+        for (int i = 0; i < devices.getLength() && device == null; i++) {
+            org.w3c.dom.Element d = (org.w3c.dom.Element) devices.item(i);
+            if (scsiId.isEmpty() || firstTagText(d, "SCSIid").equals(scsiId)) device = d;
+        }
+        if (device == null) throw new RuntimeException("no LUN with SCSIid " + scsiId + " is visible to this host");
+        scsiId = firstTagText(device, "SCSIid");
         String path = firstTagText(device, "path");
         System.out.println("Discovered LUN: SCSIid " + scsiId + " on " + path);
 
@@ -125,14 +142,14 @@ private static void createHbaSr(String url, String user, String password, String
     }
 }
 // Run it:
-//   createHbaSr("https://xenserver", "root", password, "sdk-example-hba");
+//   createHbaSr("https://xenserver", "root", password, "<SCSIid of your LUN>", "sdk-example-hba");
 ```
 
 <details><summary>Sample output</summary>
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-d60a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-a50a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -147,14 +164,16 @@ OK: create-hba-sr
 // BlockDevice wherever it occurs.
 //
 // SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
-func createHbaSr(url, user, password, srName string) {
+func createHbaSr(url, user, password, scsiID, srName string) {
 	const GiB = 1024 * 1024 * 1024
 	session := connect(url, user, password)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
 	host := hosts[0]
 
-	device := firstXMLElement(probeForFailure(session, host, map[string]string{}, "lvmohba"), "BlockDevice")
+	// SR.create formats the LUN: on shared FC storage name yours (scsiID); with none, the first is taken.
+	device := findXMLElement(probeForFailure(session, host, map[string]string{}, "lvmohba"), "BlockDevice",
+		"SCSIid", scsiID)
 	fmt.Printf("Discovered LUN: SCSIid %s on %s\n", device["SCSIid"], device["path"])
 
 	// SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
@@ -176,7 +195,7 @@ func createHbaSr(url, user, password, srName string) {
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-e10a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-c90a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -190,18 +209,23 @@ function Invoke-CreateHbaSr {
         [Parameter(Mandatory = $true)][string]$Url,
         [Parameter(Mandatory = $true)][string]$UserName,
         [Parameter(Mandatory = $true)][string]$Password,
+        [string]$ScsiId = "",
         [string]$SrName = "sdk-example-hba"
     )
     # Connect a shared SR to a fibre-channel (HBA) LUN, discovering it the way the New SR wizard does:
     # probing with no SCSIid fails on purpose and lists every LUN the backend can see.
     #
-    # SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
+    # SR.create formats the chosen LUN - this is destructive. On shared FC storage a host sees LUNs other
+    # hosts are using, so name the one that is yours (-ScsiId); with none, the first LUN listed is taken,
+    # which is only right on a dedicated test target.
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $xenHost = Get-XenHost | Select-Object -First 1
 
     # The root element varies by backend; find BlockDevice entries by tag wherever they are.
     $devlistXml = [xml](Invoke-ProbeForFailure -XenHostRef $xenHost.opaque_ref -DeviceConfig @{} -SmType lvmohba)
-    $device = $devlistXml.SelectSingleNode("//BlockDevice")
+    $device = $devlistXml.SelectNodes("//BlockDevice") |
+        Where-Object { -not $ScsiId -or $_.SCSIid -eq $ScsiId } | Select-Object -First 1
+    if (-not $device) { throw "no LUN with SCSIid $ScsiId is visible to this host" }
     $scsiId = $device.SCSIid
     $path = $device.path
     Write-Host "Discovered LUN: SCSIid $scsiId on $path"
@@ -225,7 +249,7 @@ function Invoke-CreateHbaSr {
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-260b-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-df0a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -242,8 +266,17 @@ w_create_hba_sr() {
     sr_name=$(param sr_name "xe-example-hba")
     h=$(first_host)
     xml=$(probe_for_failure lvmohba host-uuid="$h")
-    block=${xml#*<BlockDevice>}; block="<BlockDevice>${block%%</BlockDevice>*}"
-    scsi_id=$(xml_tag_text "$block" SCSIid)
+    # sr-create formats the LUN: on shared FC storage name yours (scsi_id=); with none, the first is taken.
+    local want rest
+    want=$(param scsi_id "")
+    rest=$xml
+    while [[ $rest == *"<BlockDevice>"* ]]; do
+        block=${rest#*<BlockDevice>}; rest=${block#*</BlockDevice>}; block="<BlockDevice>${block%%</BlockDevice>*}"
+        scsi_id=$(xml_tag_text "$block" SCSIid)
+        [ -z "$want" ] || [ "$scsi_id" = "$want" ] && break
+        scsi_id=""
+    done
+    [ -n "$scsi_id" ] || { echo "no LUN with SCSIid $want is visible to this host" >&2; return 1; }
     path=$(xml_tag_text "$block" path)
     echo "Discovered LUN: SCSIid $scsi_id on $path"
 
@@ -261,7 +294,7 @@ w_create_hba_sr() {
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created HBA SR: 00000001-0000-0000-df0a-000000000000 (512 GiB)
+Created HBA SR: 00000001-0000-0000-f10a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 

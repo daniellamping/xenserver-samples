@@ -229,7 +229,7 @@ w_gpu_inventory() {
     echo "GPU groups:"
     groups=$(xe gpu-group-list --minimal)
     for g in ${groups//,/ }; do
-        vtypes=$(xe gpu-group-param-get uuid=$g param-name=supported-VGPU-types --minimal)
+        vtypes=$(set_to_csv "$(xe gpu-group-param-get uuid=$g param-name=supported-VGPU-types)")
         models=""
         for t in ${vtypes//,/ }; do models="$models $(xe vgpu-type-param-get uuid=$t param-name=model-name)"; done
         echo "  - $(xe gpu-group-param-get uuid=$g param-name=name-label): vGPU types:$models"
@@ -239,7 +239,7 @@ w_gpu_inventory() {
     # full before using the next, breadth-first spreads them out.
     group=$(first_csv "$groups")
     before=$(xe gpu-group-param-get uuid=$group param-name=allocation-algorithm)
-    xe gpu-group-param-set uuid=$group allocation-algorithm=breadth_first
+    xe gpu-group-param-set uuid=$group allocation-algorithm=breadth-first
     echo "Allocation:      $before -> $(xe gpu-group-param-get uuid=$group param-name=allocation-algorithm)"
     xe gpu-group-param-set uuid=$group allocation-algorithm=$before
     echo "OK: gpu-inventory"
@@ -252,7 +252,7 @@ w_gpu_inventory() {
 GPU groups:
   - Group of NVIDIA GRID K1: vGPU types: passthrough GRID K100
   - Group of NVIDIA GRID K1: vGPU types: passthrough GRID K100
-Allocation:      depth_first -> breadth_first
+Allocation:      depth-first -> breadth-first
 OK: gpu-inventory
 ```
 

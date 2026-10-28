@@ -24,14 +24,21 @@ private static void BackupHostConfig(string url, string user, string password)
     var hostUrl = HostUrl(url, Host.get_address(session, host));
     Console.WriteLine($"Backing up {Host.get_name_label(session, host)}");
 
+    // Stream it: a real host's backup can be hundreds of MB, too large to hold in memory (and,
+    // unlike Python's binding, each XenAPI call below opens its own fresh HttpClient - see
+    // RestoreHostConfig - so there's no idle keep-alive connection here that needs dropping first).
     var path = Path.Combine(Path.GetTempPath(), $"sdk-example-host-{Guid.NewGuid():N}.backup");
     using (var client = InsecureHttpClient())
     {
-        var bytes = client.GetByteArrayAsync(
-            $"{hostUrl}/host_backup?session_id={session.opaque_ref}&ref={host}").Result;
-        File.WriteAllBytes(path, bytes);
-        Console.WriteLine($"  wrote {bytes.Length} bytes to {Path.GetFileName(path)}");
+        using var response = client.GetAsync(
+            $"{hostUrl}/host_backup?session_id={session.opaque_ref}&ref={host}",
+            HttpCompletionOption.ResponseHeadersRead).Result;
+        response.EnsureSuccessStatusCode();
+        using (var httpStream = response.Content.ReadAsStreamAsync().Result)
+        using (var fileStream = File.Create(path))
+            httpStream.CopyTo(fileStream);
     }
+    Console.WriteLine($"  wrote {new FileInfo(path).Length} bytes to {Path.GetFileName(path)}");
 
     Console.WriteLine($"  restoring it to {Host.get_name_label(session, host)}: "
                       + RestoreHostConfig(session, hostUrl, host, path));
@@ -75,11 +82,17 @@ private static string RestoreHostConfig(Session session, string hostUrl, string 
     var task = Task.create(session, "host_restore", "restoring a configuration backup").opaque_ref;
     try
     {
+        // Stream the upload too, rather than reading the whole backup into memory first. Every
+        // XenAPI call this binding makes (including task.create/get_status below) opens a brand new
+        // HttpClient and tears it down again - unlike Python's single long-lived xmlrpc.client
+        // connection, there is no idle keep-alive connection here left over from the transfer that
+        // would need to be dropped before the next call.
         using (var client = InsecureHttpClient())
+        using (var fileStream = File.OpenRead(path))
         {
             var response = client.PutAsync(
                 $"{hostUrl}/host_restore?session_id={session.opaque_ref}&ref={host}&task_id={task}",
-                new ByteArrayContent(File.ReadAllBytes(path))).Result;
+                new StreamContent(fileStream)).Result;
             response.EnsureSuccessStatusCode();
         }
 
@@ -99,9 +112,9 @@ private static string RestoreHostConfig(Session session, string hostUrl, string 
 
 ```text
 Backing up sdk-host1
-  wrote 83 bytes to sdk-example-host-8350e69a143a499ba128576c942aa3dc.backup
+  wrote 83 bytes to sdk-example-host-efe3df2d4b684282be8b8de48c4d4d11.backup
   restoring it to sdk-host1: accepted
-  restoring it to sdk-host2: could not connect to https://10.0.0.2:51478 directly (One or more errors occurred. (A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond. (10.0.0.2:51478)))
+  restoring it to sdk-host2: could not connect to https://10.0.0.2:63977 directly (One or more errors occurred. (A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond. (10.0.0.2:63977)))
 OK: backup-host-config
 ```
 
@@ -138,8 +151,9 @@ def backup_host_config(url, username, password):
     with urllib.request.urlopen(
             "%s/host_backup?session_id=%s&ref=%s" % (host_url, session._session, host),
             context=ctx, timeout=10) as response, open(path, "wb") as out:
-        out.write(response.read())
+        shutil.copyfileobj(response, out)       # hundreds of MB: stream it, don't hold it in memory
     print("  wrote %d bytes to %s" % (os.path.getsize(path), os.path.basename(path)))
+    _drop_idle_connection(session)
 
     print("  restoring it to %s: %s"
           % (x.host.get_name_label(host), restore_host_config(session, ctx, host_url, host, path)))
@@ -161,6 +175,14 @@ def backup_host_config(url, username, password):
     session.logout()
 
 
+def _drop_idle_connection(session):
+    """Close the session's HTTP connection after a long transfer; the next call opens a new one.
+    The session itself is still valid - but its one keep-alive connection sat idle for as long as
+    the transfer took, and a network that dropped it meanwhile leaves the next call hanging until
+    the socket times out. (ServerProxy("close")() is xmlrpc.client's way to close its transport.)"""
+    session("close")()
+
+
 def restore_host_config(session, ctx, host_url, host, path):
     """Upload a backup to a host - over a connection opened to THAT host's own address - and
     report what the task says about it."""
@@ -170,8 +192,9 @@ def restore_host_config(session, ctx, host_url, host, path):
         with open(path, "rb") as f:
             request = urllib.request.Request(
                 "%s/host_restore?session_id=%s&ref=%s&task_id=%s" % (host_url, session._session, host, task),
-                data=f.read(), method="PUT")
+                data=f, headers={"Content-Length": str(os.path.getsize(path))}, method="PUT")
             urllib.request.urlopen(request, context=ctx, timeout=10).read()
+        _drop_idle_connection(session)
 
         while x.task.get_status(task) == "pending":
             time.sleep(0.5)
@@ -192,7 +215,7 @@ def restore_host_config(session, ctx, host_url, host, path):
 Backing up sdk-host1
   wrote 83 bytes to sdk-example-host.backup
   restoring it to sdk-host1: accepted
-  restoring it to sdk-host2: could not connect to https://10.0.0.2:51482 directly (<urlopen error timed out>)
+  restoring it to sdk-host2: could not connect to https://10.0.0.2:63983 directly (<urlopen error timed out>)
 OK: backup-host-config
 ```
 
@@ -221,21 +244,34 @@ private static void backupHostConfig(String url, String user, String password) t
         java.io.File file = java.io.File.createTempFile("sdk-example-host", ".backup");
         HttpGet get = new HttpGet(hostUrl + "/host_backup?session_id=" + session
                 + "&ref=" + host.toWireString());
-        byte[] backup;
+        // Hundreds of MB: stream it to disk rather than holding the whole backup in memory.
         try (CloseableHttpClient http = trustingHttpClient()) {
-            backup = http.execute(get, resp -> EntityUtils.toByteArray(resp.getEntity()));
+            http.execute(get, resp -> {
+                try (java.io.InputStream in = resp.getEntity().getContent()) {
+                    java.nio.file.Files.copy(in, file.toPath(),
+                            java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+                return null;
+            });
         }
-        java.nio.file.Files.write(file.toPath(), backup);
-        System.out.printf("  wrote %d bytes to %s%n", backup.length, file.getName());
+        System.out.printf("  wrote %d bytes to %s%n", file.length(), file.getName());
+        // The connection's one keep-alive HTTP connection sat idle for as long as the download
+        // took; a network that silently dropped it meanwhile would otherwise leave the next call
+        // (Task.create below) hanging until the socket times out, so get a fresh one for the same
+        // session before making another API call.
+        conn = dropIdleConnection(conn, url);
 
-        System.out.println("  restoring it to " + host.getNameLabel(conn) + ": "
-                + restoreHostConfig(conn, hostUrl, session, host, backup));
+        Map.Entry<String, Connection> restored = restoreHostConfig(conn, hostUrl, session, host, file);
+        conn = restored.getValue();
+        System.out.println("  restoring it to " + host.getNameLabel(conn) + ": " + restored.getKey());
         if (hosts.size() > 1) {
             Host other = hosts.get(1);
             String result;
             try {
                 String otherUrl = hostUrl(url, other.getAddress(conn));
-                result = restoreHostConfig(conn, otherUrl, session, other, backup);
+                Map.Entry<String, Connection> r = restoreHostConfig(conn, otherUrl, session, other, file);
+                conn = r.getValue();
+                result = r.getKey();
             } catch (Exception e) {
                 // A real pool's hosts are all reachable from a management client; this only guards an
                 // environment (e.g. a simulator whose second host's address isn't actually routable
@@ -254,31 +290,57 @@ private static void backupHostConfig(String url, String user, String password) t
 // Run it:
 //   backupHostConfig("https://xenserver", "root", password);
 
+// Close the connection's HTTP connection pool after a long transfer, so the next XenAPI call opens
+// a fresh one - the previous JsonRpcClient's one keep-alive connection sat idle for as long as the
+// transfer took, and a network that dropped it meanwhile leaves the next call hanging until the
+// socket times out. Connection has no public way to discard its pooled connections or to attach a
+// custom JsonRpcClient to an existing session at the same time, so build a fresh Connection (still
+// trusting the host's certificate, like connect() does) and set its session reference directly -
+// there is no public setter for that field.
+private static Connection dropIdleConnection(Connection conn, String url) throws Exception {
+    Connection fresh = new Connection(new JsonRpcClient(trustingHttpClient(), new URL(url + "/jsonrpc")));
+    java.lang.reflect.Field sessionField = Connection.class.getDeclaredField("sessionReference");
+    sessionField.setAccessible(true);
+    sessionField.set(fresh, conn.getSessionReference());
+    return fresh;
+}
+
 /**
  * Uploads a backup to a host - over a connection opened to THAT host's own address - and reports
- * what the task says about it.
+ * what the task says about it, alongside the (possibly renewed) connection to continue with.
  *
  * An upload answers 200 as soon as it has read the request headers, because the client waits for
  * that before it starts sending the file. The outcome therefore cannot be in the status line: it
  * arrives on a task you create first, name in the URL, and poll once the upload has finished.
  */
-private static String restoreHostConfig(Connection conn, String hostUrl, String session,
-                                        Host host, byte[] backup) throws Exception {
+private static Map.Entry<String, Connection> restoreHostConfig(Connection conn, String hostUrl,
+        String session, Host host, java.io.File file) throws Exception {
     Task task = Task.create(conn, "host_restore", "restoring a configuration backup");
     try {
         HttpPut put = new HttpPut(hostUrl + "/host_restore?session_id=" + session
                 + "&ref=" + host.toWireString() + "&task_id=" + task.toWireString());
-        put.setEntity(new org.apache.hc.core5.http.io.entity.ByteArrayEntity(backup, null));
+        // Stream the file rather than reading it into memory first; the entity reports the file's
+        // own length as the Content-Length the server needs up front.
+        put.setEntity(new org.apache.hc.core5.http.io.entity.FileEntity(
+                file, org.apache.hc.core5.http.ContentType.APPLICATION_OCTET_STREAM));
         try (CloseableHttpClient http = trustingHttpClient()) {
             http.execute(put, resp -> EntityUtils.toString(resp.getEntity()));
         }
+        // As above: the connection sat idle for as long as the upload took.
+        conn = dropIdleConnection(conn, hostUrl);
 
         while (task.getStatus(conn) == Types.TaskStatusType.PENDING) Thread.sleep(500);
-        if (task.getStatus(conn) == Types.TaskStatusType.SUCCESS) return "accepted";
-        // error_info is declared as a SET of strings, and the Java binding hands back a real Set - so
-        // there is no "last element" to read the detail from. Print it whole rather than indexing
-        // into something unordered; see the WLB example, where guessing at an order silently lied.
-        return "refused " + task.getErrorInfo(conn);
+        String result;
+        if (task.getStatus(conn) == Types.TaskStatusType.SUCCESS) {
+            result = "accepted";
+        } else {
+            // error_info is declared as a SET of strings, and the Java binding hands back a real
+            // Set - so there is no "last element" to read the detail from. Print it whole rather
+            // than indexing into something unordered; see the WLB example, where guessing at an
+            // order silently lied.
+            result = "refused " + task.getErrorInfo(conn);
+        }
+        return new java.util.AbstractMap.SimpleEntry<>(result, conn);
     } finally {
         task.destroy(conn);
     }
@@ -289,9 +351,9 @@ private static String restoreHostConfig(Connection conn, String hostUrl, String 
 
 ```text
 Backing up sdk-host1
-  wrote 83 bytes to sdk-example-host4183349966063919553.backup
+  wrote 83 bytes to sdk-example-host2003074249991085424.backup
   restoring it to sdk-host1: accepted
-  restoring it to sdk-host2: could not connect directly (org.apache.hc.client5.http.HttpHostConnectException: Connect to https://10.0.0.2:51465 [/10.0.0.2] failed: Connection timed out: getsockopt)
+  restoring it to sdk-host2: could not connect directly (org.apache.hc.client5.http.HttpHostConnectException: Connect to https://10.0.0.2:63995 [/10.0.0.2] failed: Connection timed out: getsockopt)
 OK: backup-host-config
 ```
 
@@ -306,8 +368,15 @@ OK: backup-host-config
 // to THAT host's own address, not to the pool's (coordinator) url - a restore sent to the wrong
 // host's connection silently restores the WRONG host, not the one named by ref=. ref= is kept in
 // the query string purely for log-readability (a real host ignores it).
+//
+// Both halves are hundreds of MB on a real host, so they stream to/from a temp file rather than
+// holding the backup in memory. A transfer takes long enough on a slow link for the network to drop
+// an API connection left idle meanwhile, and the next call would then hang on it until the socket
+// timed out - so this session sends "Connection: close", giving every API call its own connection.
 func backupHostConfig(url, user, password string) {
-	session := connect(url, user, password)
+	session := xenapi.NewSession(&xenapi.ClientOpts{URL: url, Headers: map[string]string{"Connection": "close"}})
+	_, err := session.LoginWithPassword(user, password, "1.0", "sdk-examples")
+	check(err)
 	defer session.Logout()
 
 	hosts, err := xenapi.Host.GetAll(session)
@@ -326,18 +395,20 @@ func backupHostConfig(url, user, password string) {
 	temp, err := os.CreateTemp("", "sdk-example-host-*.backup")
 	check(err)
 	path := temp.Name()
-	temp.Close()
 
 	resp, err := insecureClient().Get(
 		fmt.Sprintf("%s/host_backup?session_id=%s&ref=%s", hostAddr, sid, host))
 	check(err)
-	backup, err := io.ReadAll(resp.Body)
+	// Hundreds of MB on a real host: stream it to disk, don't hold it in memory.
+	_, err = io.Copy(temp, resp.Body)
 	check(err)
 	resp.Body.Close()
-	check(os.WriteFile(path, backup, 0o600))
-	fmt.Printf("  wrote %d bytes to %s\n", len(backup), filepath.Base(path))
+	check(temp.Close())
+	info, err := os.Stat(path)
+	check(err)
+	fmt.Printf("  wrote %d bytes to %s\n", info.Size(), filepath.Base(path))
 
-	fmt.Printf("  restoring it to %s: %s\n", name, restoreHostConfig(session, hostAddr, sid, host, backup))
+	fmt.Printf("  restoring it to %s: %s\n", name, restoreHostConfig(session, hostAddr, sid, host, path))
 	if len(hosts) > 1 {
 		other := hosts[1]
 		otherName, err := xenapi.Host.GetNameLabel(session, other)
@@ -352,7 +423,7 @@ func backupHostConfig(url, user, password string) {
 		// matters in topologies (like this simulator fixture) where a second host's address isn't
 		// actually routable from the caller.
 		fmt.Printf("  restoring it to %s: %s\n", otherName,
-			safeRestoreHostConfig(session, otherURL, sid, other, backup))
+			safeRestoreHostConfig(session, otherURL, sid, other, path))
 	}
 
 	check(os.Remove(path))
@@ -361,13 +432,13 @@ func backupHostConfig(url, user, password string) {
 
 // safeRestoreHostConfig calls restoreHostConfig but turns any transport error into a friendly
 // message instead of letting the whole example fail.
-func safeRestoreHostConfig(session *xenapi.Session, hostURL, sid string, host xenapi.HostRef, backup []byte) (result string) {
+func safeRestoreHostConfig(session *xenapi.Session, hostURL, sid string, host xenapi.HostRef, path string) (result string) {
 	defer func() {
 		if r := recover(); r != nil {
 			result = fmt.Sprintf("could not connect to %s directly (%v)", hostURL, r)
 		}
 	}()
-	return restoreHostConfig(session, hostURL, sid, host, backup)
+	return restoreHostConfig(session, hostURL, sid, host, path)
 }
 
 // restoreHostConfig uploads a backup to a host - over a connection opened to THAT host's own
@@ -376,16 +447,26 @@ func safeRestoreHostConfig(session *xenapi.Session, hostURL, sid string, host xe
 // An upload answers 200 as soon as it has read the request headers, because the client waits for that
 // before it starts sending the file. The outcome therefore cannot be in the status line: it arrives on a
 // task you create first, name in the URL, and poll once the upload has finished.
-func restoreHostConfig(session *xenapi.Session, url, sid string, host xenapi.HostRef, backup []byte) string {
+func restoreHostConfig(session *xenapi.Session, url, sid string, host xenapi.HostRef, path string) string {
 	task, err := xenapi.Task.Create(session, "host_restore", "restoring a configuration backup")
 	check(err)
 	defer xenapi.Task.Destroy(session, task)
 
+	file, err := os.Open(path)
+	check(err)
+	defer file.Close()
+	info, err := os.Stat(path)
+	check(err)
+
+	// Stream the file as the request body rather than reading it into memory first: a real host's
+	// backup is hundreds of MB. http.NewRequest can't infer the length of an arbitrary io.Reader, so
+	// set ContentLength explicitly - without it Go would send chunked Transfer-Encoding, which isn't
+	// what a real host's /host_restore handler expects.
 	request, err := http.NewRequest(http.MethodPut,
 		fmt.Sprintf("%s/host_restore?session_id=%s&ref=%s&task_id=%s", url, sid, host, task),
-		bytes.NewReader(backup))
+		file)
 	check(err)
-	request.ContentLength = int64(len(backup))
+	request.ContentLength = info.Size()
 	resp, err := insecureClient().Do(request)
 	check(err)
 	io.Copy(io.Discard, resp.Body)
@@ -411,9 +492,9 @@ func restoreHostConfig(session *xenapi.Session, url, sid string, host xenapi.Hos
 
 ```text
 Backing up sdk-host1
-  wrote 83 bytes to sdk-example-host-2638023276.backup
+  wrote 83 bytes to sdk-example-host-1718503786.backup
   restoring it to sdk-host1: accepted
-  restoring it to sdk-host2: could not connect to https://10.0.0.2:51468 directly (Put "https://10.0.0.2:51468/host_restore?session_id=OpaqueRef:00000001-session-2812&ref=OpaqueRef:00000001-host-77&task_id=OpaqueRef:00000001-task-2814": dial tcp 10.0.0.2:51468: connectex: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond.)
+  restoring it to sdk-host2: could not connect to https://10.0.0.2:60284 directly (Put "https://10.0.0.2:60284/host_restore?session_id=OpaqueRef:00000001-session-2879&ref=OpaqueRef:00000001-host-77&task_id=OpaqueRef:00000001-task-2881": dial tcp 10.0.0.2:60284: connectex: A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond.)
 OK: backup-host-config
 ```
 
@@ -442,6 +523,12 @@ function Invoke-BackupHostConfig {
     # restores the WRONG host, not the one named by ref=. ref= is kept in the query string purely for
     # log-readability (a real host ignores it; it is not what makes this correct). Still pure
     # PowerShell: Connect-Example has already trusted the server's certificate.
+    #
+    # -OutFile/-InFile below already stream straight to/from disk rather than buffering the whole file,
+    # and there is no idle-connection step to take after the transfer (unlike the Python/Java ports):
+    # this module's cmdlets dispatch through the C# binding's Session/JsonRpcClient, whose
+    # PerformPostRequest opens a brand-new HttpClient per XenAPI call and disposes it immediately
+    # afterwards - there is no kept-alive session connection that a long transfer could leave idle.
     $path = Join-Path ([IO.Path]::GetTempPath()) "sdk-example-host-$([guid]::NewGuid().Guid).backup"
     Invoke-WebRequest -UseBasicParsing -OutFile $path -TimeoutSec 10 `
         -Uri "$hostUrl/host_backup?session_id=$($session.opaque_ref)&ref=$($vmHost.opaque_ref)"
@@ -510,9 +597,9 @@ function Restore-ExampleHostConfig {
 
 ```text
 Backing up sdk-host1
-  wrote 83 bytes to sdk-example-host-f10d06a6-10e4-4446-8794-6474d78c2df5.backup
+  wrote 83 bytes to sdk-example-host-f7a2bb9c-7e7e-41b2-978b-7dfda06a4a9e.backup
   restoring it to sdk-host1: accepted
-  restoring it to sdk-host2: could not connect to https://10.0.0.2:51503 directly (The request was canceled due to the configured HttpClient.Timeout of 10 seconds elapsing.)
+  restoring it to sdk-host2: could not connect to https://10.0.0.2:60313 directly (The request was canceled due to the configured HttpClient.Timeout of 10 seconds elapsing.)
 OK: backup-host-config
 ```
 

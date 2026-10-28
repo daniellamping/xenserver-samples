@@ -93,6 +93,9 @@ private static void createNetwork(String url, String user, String password,
     record.nameDescription = "Internal network created by the SDK example";
     record.MTU = 1500L;
     record.otherConfig = new java.util.HashMap<>();
+    // Managed by xapi (bridge and PIFs created for it). Say so: this binding sends every field,
+    // and an unset boolean goes as false - an unmanaged network, which a bond refuses.
+    record.managed = true;
 
     Network net = Network.create(conn, record);
     System.out.println("Created network: " + net.getUuid(conn));
@@ -113,7 +116,7 @@ private static void createNetwork(String url, String user, String password,
 <details><summary>Sample output</summary>
 
 ```text
-Created network: 00000001-0000-0000-2e0a-000000000000
+Created network: 00000001-0000-0000-fd0a-000000000000
 MTU now:         9000
 OK: create-network
 ```
@@ -130,6 +133,9 @@ func createNetwork(url, user, password, networkName string) {
 		NameDescription: "Internal network created by the SDK example",
 		MTU:             1500,
 		OtherConfig:     map[string]string{},
+		// Managed by xapi (bridge and PIFs created for it). Say so: the binding sends every field, and
+		// the zero value is false - an unmanaged network, which a bond refuses.
+		Managed: true,
 	})
 	check(err)
 	uuid, _ := xenapi.Network.GetUUID(session, netRef)
@@ -153,7 +159,7 @@ func createNetwork(url, user, password, networkName string) {
 <details><summary>Sample output</summary>
 
 ```text
-Created network: 00000001-0000-0000-260a-000000000000
+Created network: 00000001-0000-0000-910a-000000000000
 MTU now:         9000
 OK: create-network
 ```

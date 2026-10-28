@@ -332,14 +332,21 @@ OK: create-vm-with-vgpu
 
 ```bash
 w_create_vm_with_vgpu() {
-    group=$(first_csv "$(xe gpu-group-list --minimal)")
-    type=""
-    vtypes=$(xe gpu-group-param-get uuid=$group param-name=supported-VGPU-types --minimal)
-    for t in ${vtypes//,/ }; do
-        if [ "$(xe vgpu-type-param-get uuid=$t param-name=model-name)" != "passthrough" ]; then type=$t; break; fi
+    # A GPU group that offers a real (non-passthrough) vGPU type, and that type. Not simply the first
+    # group: a host's onboard display adapter is a GPU group too, with no vGPU types at all.
+    group="" type=""
+    for g in $(each_csv "$(xe gpu-group-list --minimal)"); do
+        vtypes=$(set_to_csv "$(xe gpu-group-param-get uuid=$g param-name=supported-VGPU-types)")
+        for t in ${vtypes//,/ }; do
+            if [ "$(xe vgpu-type-param-get uuid=$t param-name=model-name)" != "passthrough" ]; then
+                group=$g; type=$t; break 2
+            fi
+        done
     done
+    [ -n "$type" ] || { echo "no GPU group offers a vGPU type (is the GPU vendor's host driver installed?)" >&2; return 1; }
     local template=$(param template_name "Rocky Linux 8")
-    vm=$(xe vm-install template="$template" new-name-label=xe-example-vgpu sr-uuid=$(shared_sr))
+    # No sr-uuid: the template's disks go to the pool's default SR, as VM.provision does.
+    vm=$(xe vm-install template="$template" new-name-label=xe-example-vgpu)
     vgpu=$(xe vgpu-create vm-uuid=$vm gpu-group-uuid=$group vgpu-type-uuid=$type)
     echo "Created vGPU: $vgpu of type $(xe vgpu-type-param-get uuid=$type param-name=model-name)"
     # Tidy up so the example is repeatable: the vGPU, then the VM and the disks it owns.
@@ -352,7 +359,7 @@ w_create_vm_with_vgpu() {
 <details><summary>Sample output</summary>
 
 ```text
-Created vGPU: 00000001-0000-0000-460a-000000000000 of type GRID K100
+Created vGPU: 00000001-0000-0000-7a0a-000000000000 of type GRID K100
 OK: create-vm-with-vgpu
 ```
 

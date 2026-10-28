@@ -32,12 +32,15 @@ import subprocess
 import tarfile
 import tempfile
 import os
+import re
+import shutil
 import ssl
 import sys
 import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import xmlrpc.client
 
 # The SDK's Python binding: `pip install XenAPI`, or copy XenServerPython/XenAPI.py from the SDK
 # next to this file.
@@ -237,20 +240,33 @@ def _self_signed_cert_pem():
             os.remove(certpath)
 
 
-def _reconnect_after_master_change(url, username, password, timeout=600, interval=5):
+def _reconnect_after_master_change(url, username, password, new_master_uuid, timeout=600, interval=5):
     """Wait out a pool-wide xapi restart (pool.designate_new_master) and reconnect.
 
-    XenRT's own helper for this call treats the connection dropping as the expected, successful
-    outcome and then waits several minutes before trusting the pool again, rather than retrying
-    immediately - do the same here."""
+    designate_new_master returns BEFORE the change: for a while the old coordinator still answers,
+    and still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+    enough - keep reconnecting until the pool names the new coordinator (by uuid; connect() follows
+    HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits minutes
+    before trusting the pool again."""
     deadline = time.time() + timeout
     last_error = None
     while time.time() < deadline:
         try:
-            return connect(url, username, password)
+            session = connect(url, username, password)
+            x = session.xenapi
+            master = x.pool.get_master(x.pool.get_all()[0])
+            # The new coordinator answers before the pool has settled - calls made too soon fail
+            # (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+            # live and enabled.
+            if x.host.get_uuid(master) == new_master_uuid and all(
+                    r["enabled"] and x.host_metrics.get_live(r["metrics"])
+                    for r in x.host.get_all_records().values()):
+                return session
+            x.session.logout()
+            last_error = "the pool has not settled under the new coordinator"
         except Exception as e:
             last_error = e
-            time.sleep(interval)
+        time.sleep(interval)
     raise RuntimeError("the pool did not come back after the master change: %s" % last_error)
 
 
@@ -263,6 +279,41 @@ def _wait_for_host_live(x, host, want, timeout=60, interval=2):
         if time.time() > deadline:
             raise RuntimeError("host did not reach live=%s in time" % want)
         time.sleep(interval)
+
+
+def _wait_for_restart(url, username, password, host_uuid, key, before, timeout=1800, interval=10):
+    """Wait for a host to come back from a reboot (key "boot_time") or toolstack restart
+    ("agent_start_time"): until that other_config entry differs from `before` and the host is live.
+    Reconnects every time round, because the host restarting may be the coordinator this session
+    talks to; returns the new session."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            session = connect(url, username, password)
+            x = session.xenapi
+            host = x.host.get_by_uuid(host_uuid)
+            if x.host.get_other_config(host).get(key) != before and host_live(x, host):
+                return session
+            x.session.logout()
+        except (OSError, xmlrpc.client.ProtocolError, XenAPI.Failure):
+            pass                     # down, or xapi still starting
+        if time.time() > deadline:
+            raise RuntimeError("host %s did not come back in time" % host_uuid)
+        time.sleep(interval)
+
+
+def _enable_when_booted(x, host, timeout=600, interval=10):
+    """Re-enable a host that has just come back. It reports itself live before xapi on it has
+    finished starting, and until then host.enable fails HOST_STILL_BOOTING - so retry that."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            x.host.enable(host)
+            return
+        except XenAPI.Failure as e:
+            if e.details[0] != "HOST_STILL_BOOTING" or time.time() > deadline:
+                raise
+            time.sleep(interval)
 
 
 def _host_url(url, address):
@@ -388,7 +439,7 @@ def _has_suspend_sr(session, vm):
 
 
 # --- 4. Manage VM disks: Deactivate / Resize / Activate -------------------------------
-def manage_vm_disks(url, username, password, template_name, sr_name, new_vm_name="sdk-example-vm-disks"):
+def manage_vm_disks(url, username, password, source_vm, sr_name, new_vm_name="sdk-example-vm-disks"):
     """Deactivate a data disk, resize it, and reactivate it.
 
     Not the VM's root/boot disk: a real VM's system disk is unpluggable=false (only a template's
@@ -397,12 +448,16 @@ def manage_vm_disks(url, username, password, template_name, sr_name, new_vm_name
     VM_BAD_POWER_STATE. Work on a data disk this example adds to its own throwaway VM instead,
     matching XenCenter's own "deactivate" action, which only ever targets additional disks, and
     tidy up afterwards so the example is repeatable. No shrink: real SR backends refuse one
-    outright (SR_BACKEND_FAILURE_79), so this only ever grows."""
+    outright (SR_BACKEND_FAILURE_79), so this only ever grows.
+
+    Plugging and unplugging a disk on a running VM needs the guest's PV drivers
+    (VM_MISSING_PV_DRIVERS otherwise), so the VM is a throwaway copy of source_vm, a VM with a
+    guest OS and PV drivers."""
     GIB = 1024 * 1024 * 1024
     session = connect(url, username, password)
-    vm_ref = session.xenapi.VM.clone(template_by_name(session, template_name), new_vm_name)
-    provision(session, vm_ref)
+    vm_ref = copy_of_guest(session, source_vm, new_vm_name)
     session.xenapi.VM.start(vm_ref, False, True)
+    wait_for_guest_agent(session, vm_ref)
 
     sr_ref = sr_by_name(session, sr_name)
     vdi_ref = session.xenapi.VDI.create({
@@ -412,6 +467,7 @@ def manage_vm_disks(url, username, password, template_name, sr_name, new_vm_name
     vbd_ref = session.xenapi.VBD.create({
         "VM": vm_ref, "VDI": vdi_ref,
         "userdevice": session.xenapi.VM.get_allowed_VBD_devices(vm_ref)[0],
+        "bootable": False,
         "mode": "RW", "type": "Disk", "empty": False, "other_config": {},
         "qos_algorithm_type": "", "qos_algorithm_params": {},
     })
@@ -430,10 +486,18 @@ def manage_vm_disks(url, username, password, template_name, sr_name, new_vm_name
     print("After plug:     %s" % session.xenapi.VBD.get_currently_attached(vbd_ref))
 
     # Growing a disk that is attached and live is a DIFFERENT call, not a flag on the same one:
-    # resize_online tells the storage layer the guest is using the disk while it grows.
-    grown = int(session.xenapi.VDI.get_virtual_size(vdi_ref)) + (1024 * 1024 * 1024)
-    session.xenapi.VDI.resize_online(vdi_ref, str(grown))
-    print("Grown online:   %s bytes" % session.xenapi.VDI.get_virtual_size(vdi_ref))
+    # resize_online tells the storage layer the guest is using the disk while it grows. Only some
+    # storage drivers can (none of a stock XenServer 9's do), and the rest refuse with
+    # SR_OPERATION_NOT_SUPPORTED - so ask the SR's driver (its SM record's features) first.
+    sr_type = session.xenapi.SR.get_type(sr_ref)
+    features = next((r["features"] for r in session.xenapi.SM.get_all_records().values()
+                     if r["type"] == sr_type), {})
+    if "VDI_RESIZE_ONLINE" in features:
+        grown = int(session.xenapi.VDI.get_virtual_size(vdi_ref)) + GIB
+        session.xenapi.VDI.resize_online(vdi_ref, str(grown))
+        print("Grown online:   %s bytes" % session.xenapi.VDI.get_virtual_size(vdi_ref))
+    else:
+        print("Grown online:   not supported by %s storage; unplug, resize, plug as above" % sr_type)
 
     session.xenapi.VM.hard_shutdown(vm_ref)
     destroy_vm_and_disks(session, vm_ref)
@@ -1146,22 +1210,28 @@ def tags_and_folders(url, username, password, vm_name):
 
 
 # --- 16. Configure updates (CDN) ------------------------------------------------------
-def configure_updates(url, username, password):
-    """Point the pool at a CDN repository and enable automatic update sync.
+def introduce_update_repositories(session, repo_url, source_url):
+    """Introduce the pool's update repositories the way XenCenter does: the release's base packages
+    (update=False) and its update stream (update=True, which pool.sync_updates needs - otherwise
+    NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so
+    these are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}."""
+    return [session.xenapi.Repository.introduce(
+                "sdk-example-%s" % stage, "SDK example %s repository" % stage,
+                "%s/%s" % (repo_url, stage), "%s/%s" % (source_url, stage), stage != "base", "")
+            for stage in ("base", "normal")]
 
-    update=True: without it this introduces only a base package mirror, not an actual *update*
-    repository - pool.sync_updates needs one with update=True enabled (NO_REPOSITORY_ENABLED
-    otherwise), which is exactly what apply-update and rolling-pool-update rely on."""
+
+def configure_updates(url, username, password, repo_url, source_url):
+    """Point the pool at the CDN's repositories and enable automatic update sync."""
     session = connect(url, username, password)
-    repo = session.xenapi.Repository.introduce(
-        "sdk-cdn", "SDK example repository",
-        "https://cdn.example/base", "https://cdn.example/source", True, "")
-    print("Introduced repository: %s" % session.xenapi.Repository.get_name_label(repo))
+    repos = introduce_update_repositories(session, repo_url, source_url)
+    print("Introduced repositories: %s"
+          % ", ".join(session.xenapi.Repository.get_name_label(r) for r in repos))
 
     pool = session.xenapi.pool.get_all()[0]
     # Remember the pool's own repositories, to put them back afterwards.
     previous = session.xenapi.pool.get_repositories(pool)
-    session.xenapi.pool.set_repositories(pool, [repo])
+    session.xenapi.pool.set_repositories(pool, repos)
     session.xenapi.pool.set_update_sync_enabled(pool, True)
     print("Pool repositories: %d; auto-sync enabled: %s"
           % (len(session.xenapi.pool.get_repositories(pool)),
@@ -1170,11 +1240,13 @@ def configure_updates(url, username, password):
     # Tidy up so the example is repeatable.
     session.xenapi.pool.set_update_sync_enabled(pool, False)
     session.xenapi.pool.set_repositories(pool, previous)
-    session.xenapi.Repository.forget(repo)
+    for repo in repos:
+        session.xenapi.Repository.forget(repo)
     print("OK: configure-updates")
     session.xenapi.session.logout()
 # Run it:
-#   configure_updates("https://xenserver", "root", password)
+#   configure_updates("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+#       "https://repo-src.ops.xenserver.com/xs9")
 
 
 # --- 17. Clone a VM (fast, copy-on-write) ---------------------------------------------
@@ -1258,7 +1330,7 @@ def storage_migrate(url, username, password, source_vm, new_vm_name="sdk-example
 
 
 # --- 20. Apply updates from the CDN ---------------------------------------------------
-def apply_update(url, username, password):
+def apply_update(url, username, password, repo_url, source_url):
     """Sync the pool's update metadata from the CDN, then apply the synced updates to each host.
 
     pool.sync_updates needs at least one repository with update=True enabled
@@ -1270,12 +1342,10 @@ def apply_update(url, username, password):
     HOST_PENDING_MANDATORY_GUIDANCES_NOT_EMPTY)."""
     session = connect(url, username, password)
     pool = session.xenapi.pool.get_all()[0]
-    repo = session.xenapi.Repository.introduce(
-        "sdk-cdn", "SDK example repository",
-        "https://cdn.example/base", "https://cdn.example/source", True, "")
+    repos = introduce_update_repositories(session, repo_url, source_url)
     # Remember the pool's own repositories, to put them back afterwards.
     previous = session.xenapi.pool.get_repositories(pool)
-    session.xenapi.pool.set_repositories(pool, [repo])
+    session.xenapi.pool.set_repositories(pool, repos)
     try:
         # Sync the pool's update metadata; the returned hash identifies the synced set.
         hash_ = session.xenapi.pool.sync_updates(pool, False, "", "")
@@ -1296,17 +1366,28 @@ def apply_update(url, username, password):
                 session.xenapi.host.enable(host_ref)
             guidance = session.xenapi.host.get_pending_guidances(host_ref)
             print("  %s: applied; pending guidance = [%s]" % (host["name_label"], ", ".join(guidance)))
-            if "reboot_host" in guidance:
-                session.xenapi.host.reboot(host_ref)
-            elif "restart_toolstack" in guidance:
-                session.xenapi.host.restart_agent(host_ref)
+            if "reboot_host" in guidance or "restart_toolstack" in guidance:
+                # As in rolling-pool-update: either restart returns before it has happened, and the
+                # coordinator's takes this session with it - so wait for it, reconnecting.
+                key = "boot_time" if "reboot_host" in guidance else "agent_start_time"
+                before = session.xenapi.host.get_other_config(host_ref).get(key)
+                if key == "boot_time":
+                    session.xenapi.host.reboot(host_ref)
+                else:
+                    session.xenapi.host.restart_agent(host_ref)
+                session = _wait_for_restart(url, username, password, host["uuid"], key, before)
+            # apply_updates disables the host while it works (auto_enable: a restart puts it back) - with
+            # no restart to do, nothing re-enables it. Return it to service either way.
+            _enable_when_booted(session.xenapi, host_ref)
     finally:
         session.xenapi.pool.set_repositories(pool, previous)
-        session.xenapi.Repository.forget(repo)
+        for repo in repos:
+            session.xenapi.Repository.forget(repo)
     print("OK: apply-update")
     session.xenapi.session.logout()
 # Run it:
-#   apply_update("https://xenserver", "root", password)
+#   apply_update("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+#       "https://repo-src.ops.xenserver.com/xs9")
 
 
 # --- 21. Checkpoint & revert ----------------------------------------------------------
@@ -1366,6 +1447,7 @@ def attach_disk(url, username, password, template_name, sr_name, new_vm_name="sd
     device = session.xenapi.VM.get_allowed_VBD_devices(vm)[0]
     session.xenapi.VBD.create({
         "VM": vm, "VDI": vdi, "userdevice": device,
+        "bootable": False,
         "mode": "RW", "type": "Disk", "empty": False, "other_config": {},
         "qos_algorithm_type": "", "qos_algorithm_params": {},
     })
@@ -1756,7 +1838,7 @@ def find_by_uuid(url, username, password, vm_name):
 
 
 # --- 41. Rolling pool update ---------------------------------------------------------
-def rolling_pool_update(url, username, password):
+def rolling_pool_update(url, username, password, repo_url, source_url):
     """Apply the CDN's updates host-by-host so the pool never goes fully offline.
 
     Needs an enabled update repository the same way apply-update does - introduce and attach a
@@ -1765,12 +1847,10 @@ def rolling_pool_update(url, username, password):
     applied batch actually asks for it."""
     session = connect(url, username, password)
     pool = session.xenapi.pool.get_all()[0]
-    repo = session.xenapi.Repository.introduce(
-        "sdk-cdn", "SDK example repository",
-        "https://cdn.example/base", "https://cdn.example/source", True, "")
+    repos = introduce_update_repositories(session, repo_url, source_url)
     # Remember the pool's own repositories, to put them back afterwards.
     previous = session.xenapi.pool.get_repositories(pool)
-    session.xenapi.pool.set_repositories(pool, [repo])
+    session.xenapi.pool.set_repositories(pool, repos)
     try:
         hash_ = session.xenapi.pool.sync_updates(pool, False, "", "")
         print("Synced updates; hash length %d" % len(hash_))
@@ -1784,30 +1864,44 @@ def rolling_pool_update(url, username, password):
             session.xenapi.host.apply_updates(host_ref, hash_)  # apply the synced updates
             guidance = session.xenapi.host.get_pending_guidances(host_ref)
             print("  applied; pending guidance = [%s]" % ", ".join(guidance))
-            if "reboot_host" in guidance:
-                session.xenapi.host.reboot(host_ref)           # reboot into the updated software
-            elif "restart_toolstack" in guidance:
-                session.xenapi.host.restart_agent(host_ref)
-            session.xenapi.host.enable(host_ref)                # return the host to service
+            if "reboot_host" in guidance or "restart_toolstack" in guidance:
+                # Either restart returns before it has happened, and if this host is the coordinator
+                # it takes this session with it - so note when the host last started, restart it, and
+                # reconnect until it reports a newer start and is live again.
+                key = "boot_time" if "reboot_host" in guidance else "agent_start_time"
+                before = session.xenapi.host.get_other_config(host_ref).get(key)
+                if key == "boot_time":
+                    session.xenapi.host.reboot(host_ref)       # reboot into the updated software
+                else:
+                    session.xenapi.host.restart_agent(host_ref)
+                session = _wait_for_restart(url, username, password, host["uuid"], key, before)
+            _enable_when_booted(session.xenapi, host_ref)       # return the host to service
     finally:
         session.xenapi.pool.set_repositories(pool, previous)
-        session.xenapi.Repository.forget(repo)
+        for repo in repos:
+            session.xenapi.Repository.forget(repo)
     print("OK: rolling-pool-update")
     session.xenapi.session.logout()
 # Run it:
-#   rolling_pool_update("https://xenserver", "root", password)
+#   rolling_pool_update("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+#       "https://repo-src.ops.xenserver.com/xs9")
 
 
 # --- 42. Cross-pool copy a VM -------------------------------------------------------
-def cross_pool_copy_vm(url, username, password, dest_url, vm_name="db-01"):
+def cross_pool_copy_vm(url, username, password, dest_url, vm_name="db-01",
+                       dest_username=None, dest_password=None):
     """Copy a VM from one pool to another (Storage XenMotion copy): get a receiver token from the
     destination with host.migrate_receive, then VM.migrate_send with copy=true on the source."""
     source = connect(url, username, password)
-    dest = connect(dest_url, username, password)
-    # Destination: choose a host, network and SR, then ask for a receiver token.
-    dest_host = dest.xenapi.host.get_all()[0]
-    dest_network = dest.xenapi.network.get_all()[0]
-    dest_sr = sr_by_name(dest, "Shared NFS")
+    dest = connect(dest_url, dest_username or username, dest_password or password)
+    # Destination: choose a host, network and SR, then ask for a receiver token. The disks go to
+    # the destination pool's default SR and the data travels over the host's management network -
+    # one both pools can certainly reach (the first network listed may well not be).
+    dest_pool = dest.xenapi.pool.get_all()[0]
+    dest_host = dest.xenapi.pool.get_master(dest_pool)
+    dest_sr = dest.xenapi.pool.get_default_SR(dest_pool)
+    dest_network = next(dest.xenapi.PIF.get_network(pif) for pif in dest.xenapi.host.get_PIFs(dest_host)
+                        if dest.xenapi.PIF.get_management(pif))
     receiver = dest.xenapi.host.migrate_receive(dest_host, dest_network, {})
 
     # Source: map every disk to the destination SR and every NIC to the destination network,
@@ -1822,9 +1916,12 @@ def cross_pool_copy_vm(url, username, password, dest_url, vm_name="db-01"):
             vdi_map[vdi] = dest_sr
     vif_map = {vif: dest_network for vif in source.xenapi.VM.get_VIFs(vm)}
 
-    source.xenapi.VM.migrate_send(vm, receiver, False, vdi_map, vif_map, {"copy": "true"}, {})
+    copy = source.xenapi.VM.migrate_send(vm, receiver, False, vdi_map, vif_map, {"copy": "true"}, {})
     print("Sent '%s' to the destination pool (copy); source still present: %s"
           % (vm_name, vm_by_name(source, vm_name) == vm))
+    # The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
+    print("  the copy on the destination: %s (%s)"
+          % (dest.xenapi.VM.get_name_label(copy), dest.xenapi.VM.get_uuid(copy)))
     print("OK: cross-pool-copy-vm")
     source.xenapi.session.logout()
     dest.xenapi.session.logout()
@@ -1953,20 +2050,31 @@ def vm_ip_address(url, username, password, timeout=60, interval=2):
 
 # --- 47. Manage Active Directory users -----------------------------------------------
 def manage_ad_users(url, username, password, domain="", admin_user="alice",
-                     admin_password="Password1", new_user="alice"):
+                     admin_password="Password1", new_user="alice", ldaps="false"):
     """Join AD, add a user as a subject with an RBAC role, read it back, then tidy up.
 
     Needs a real, reachable AD domain controller - enable_external_auth fails at the very first
     call (DNS/LDAP/Kerberos) without one, so domain/admin_user/admin_password have to identify a
-    real domain to join. new_user is the account to grant a role to; its subject identity is
-    looked up against the directory just joined, so it has to be a real account there too. The
-    simulator models a single-user, domain-less fake directory (hence the empty domain default) -
-    override every one of these on a real pool."""
+    real domain to join. Before joining, every host must resolve the domain (point its DNS at a
+    domain controller) and keep its clock close to the DC's (Kerberos). Current Windows DCs want
+    LDAPS (ldaps="true"), which also needs the pool to trust the DC's CA certificate
+    (pool.install_trusted_certificate with purpose "ldaps"). new_user is the account to grant a
+    role to; its subject identity is looked up against the directory, so it has to be a real
+    account there too. A pool already joined to this domain is used as it is - and left joined.
+    The simulator models a single-user, domain-less fake directory (hence the empty domain
+    default) - override every one of these on a real pool."""
     session = connect(url, username, password)
     pool = session.xenapi.pool.get_all()[0]
-    session.xenapi.pool.enable_external_auth(
-        pool, {"user": admin_user, "pass": admin_password, "ldaps": "false"}, domain, "AD")
-    print("Joined domain: %s" % (domain or "(none - simulator's fake directory)"))
+    coordinator = session.xenapi.pool.get_master(pool)
+    already_joined = (domain and session.xenapi.host.get_external_auth_type(coordinator) == "AD"
+                      and session.xenapi.host.get_external_auth_service_name(coordinator).lower()
+                      == domain.lower())
+    if already_joined:
+        print("Already joined to domain: %s" % domain)
+    else:
+        session.xenapi.pool.enable_external_auth(
+            pool, {"user": admin_user, "pass": admin_password, "ldaps": ldaps}, domain, "AD")
+        print("Joined domain: %s" % (domain or "(none - simulator's fake directory)"))
 
     subject_name = "%s@%s" % (new_user, domain) if domain else new_user
     sid = session.xenapi.auth.get_subject_identifier(subject_name)
@@ -1989,7 +2097,10 @@ def manage_ad_users(url, username, password, domain="", admin_user="alice",
 
     session.xenapi.subject.remove_from_roles(subject, admin_role)
     session.xenapi.subject.destroy(subject)
-    session.xenapi.pool.disable_external_auth(pool, {})
+    if not already_joined:
+        # Leave the way it was found. Passing the admin credentials also removes the pool's computer
+        # accounts from the directory; with {} they stay behind in AD.
+        session.xenapi.pool.disable_external_auth(pool, {"user": admin_user, "pass": admin_password})
     print("OK: manage-ad-users")
     session.logout()
 
@@ -2049,7 +2160,8 @@ def create_smb_sr(url, username, password, server, share, smb_username, smb_pass
     host = session.xenapi.host.get_all()[0]
 
     secret = session.xenapi.secret.create({"value": smb_password, "other_config": {}})
-    dc = {"server": server, "serverpath": share, "username": smb_username,
+    # server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
+    dc = {"server": "//%s%s" % (server, share), "username": smb_username,
           "password_secret": session.xenapi.secret.get_uuid(secret)}
     sr = session.xenapi.SR.create(host, dc, "0", sr_name,
                                   "SMB SR created by the SDK example", "smb", "user", True, {})
@@ -2062,18 +2174,23 @@ def create_smb_sr(url, username, password, server, share, smb_username, smb_pass
 
 
 # --- 50. Create an HBA SR -----------------------------------------------------------
-def create_hba_sr(url, username, password, sr_name="sdk-example-hba"):
+def create_hba_sr(url, username, password, scsi_id="", sr_name="sdk-example-hba"):
     """Connect a shared SR to a fibre-channel (HBA) LUN, discovering it the way the New SR wizard
     does: probing with no SCSIid fails on purpose and lists every LUN the backend can see.
 
-    SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target."""
+    SR.create formats the chosen LUN - this is destructive. On shared FC storage a host sees LUNs
+    other hosts are using, so name the one that is yours (scsi_id); with none, the first LUN listed
+    is taken, which is only right on a dedicated test target."""
     GIB = 1024 * 1024 * 1024
     session = connect(url, username, password)
     host = session.xenapi.host.get_all()[0]
 
     # The root element varies by backend; find BlockDevice entries by tag wherever they are.
     devlist_xml = ET.fromstring(_probe_for_failure(session, host, {}, "lvmohba"))
-    device = devlist_xml.find(".//BlockDevice")
+    device = next((d for d in devlist_xml.iter("BlockDevice")
+                   if not scsi_id or d.find("SCSIid").text == scsi_id), None)
+    if device is None:
+        raise RuntimeError("no LUN with SCSIid %s is visible to this host" % scsi_id)
     scsi_id = device.find("SCSIid").text
     path = device.find("path").text
     print("Discovered LUN: SCSIid %s on %s" % (scsi_id, path))
@@ -2091,12 +2208,13 @@ def create_hba_sr(url, username, password, sr_name="sdk-example-hba"):
 
 
 # --- 51. Create an ISO library SR ---------------------------------------------------
-def create_iso_sr(url, username, password):
-    """Connect an ISO-library SR to a file share of ISO images (here an NFS export)."""
+def create_iso_sr(url, username, password, location):
+    """Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+    "server:/path")."""
     session = connect(url, username, password)
     host = session.xenapi.host.get_all()[0]
-    dc = {"location": "192.0.2.10:/isos", "type": "nfs_iso"}
-    sr = session.xenapi.SR.create(host, dc, "0", "sdk-iso-sr",
+    dc = {"location": location, "type": "nfs_iso"}
+    sr = session.xenapi.SR.create(host, dc, "0", "sdk-example-iso",
                                   "ISO library created by the SDK example", "iso", "iso", True, {})
     print("Created ISO SR: %s" % session.xenapi.SR.get_uuid(sr))
     detach_and_forget_sr(session, sr)
@@ -2184,7 +2302,9 @@ def manage_vapp(url, username, password, vm_name):
     x.VM_appliance.start(vapp, False)
     print(f"Started:        {x.VM.get_power_state(vm)}")
 
-    x.VM_appliance.clean_shutdown(vapp)
+    # shutdown tries each VM's clean shutdown and falls back to a hard one. clean_shutdown alone fails
+    # OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+    x.VM_appliance.shutdown(vapp)
     print(f"Shut down:      {x.VM.get_power_state(vm)}")
 
     x.VM.set_appliance(vm, "OpaqueRef:NULL")
@@ -2232,47 +2352,79 @@ def attach_usb_device(url, username, password, vm_name):
 
 # --- Read workload-balancing recommendations -------------------------------------------
 def wlb_recommendations(url, username, password, vm_name, wlb_host_port="wlb.example:8012",
-                         wlb_username="wlbuser", wlb_password="wlbpass"):
+                         wlb_username="wlbuser", wlb_password="wlbpass", wlb_certificate=""):
     """Connect a workload-balancing appliance and read its placement advice.
 
     Needs a real, reachable WLB appliance: pool.initialize_wlb makes a synchronous HTTP call to it
     and raises WLB_CONNECTION_REFUSED/WLB_CONNECTION_RESET if it can't connect - there is no way to
     fake this with a placeholder. wlb_host_port is host:port, with no URL scheme - that is the
-    real wire format (xe pool-initialize-wlb wlb_url="10.x.x.x:30601" ...), not a URL."""
+    real wire format (xe pool-initialize-wlb wlb_url="10.x.x.x:30601" ...), not a URL.
+
+    The pool checks the appliance's TLS certificate (pool.wlb_verify_cert), and only against the
+    certificates installed with pool.certificate_install - not install_trusted_certificate's. A
+    fresh appliance has a self-signed one, so pass it as wlb_certificate (a PEM file): without it
+    initialize_wlb fails with INTERNAL_ERROR "Connection failed: configuration failed." and no
+    hint that the certificate is the reason."""
     session = connect(url, username, password)
     x = session.xenapi
     pool = x.pool.get_all()[0]
 
+    cert_name = ""
+    if wlb_certificate:
+        cert_name = "sdk-example-wlb.pem"
+        with open(wlb_certificate) as f:
+            x.pool.certificate_install(cert_name, f.read())   # a pool-wide call: no pool argument
     x.pool.initialize_wlb(wlb_host_port, wlb_username, wlb_password, username, password)
-    print(f"WLB: {x.pool.get_wlb_url(pool)}")
+    try:
+        # Initializing connects the pool to the appliance but leaves balancing off: every WLB call
+        # after this would fail WLB_DISABLED until it's switched on.
+        x.pool.set_wlb_enabled(pool, True)
+        print(f"WLB: {x.pool.get_wlb_url(pool)}")
 
-    # Read BY POSITION, and the two calls do not share a shape. The pool's recommendations are keyed by
-    # VM and say where to move it: [0] "wlb", [1] the destination host's UUID (a uuid, not a ref),
-    # [2] and [3] ids, [4] the reason.
-    for vm_ref, fields in x.pool.retrieve_wlb_recommendations().items():
-        print(f"  move {x.VM.get_name_label(vm_ref)} -> host {fields[1]} ({fields[4]})")
+        # Read BY POSITION, and the two calls do not share a shape. The pool's recommendations are
+        # keyed by VM and say where to move it: [0] "wlb", [1] the destination host's UUID (a uuid,
+        # not a ref), [2] and [3] ids, [4] the reason. A freshly connected pool has none yet.
+        for vm_ref, fields in x.pool.retrieve_wlb_recommendations().items():
+            print(f"  move {x.VM.get_name_label(vm_ref)} -> host {fields[1]} ({fields[4]})")
 
-    # A VM's own recommendations are keyed by host and star-rate each as a destination:
-    # [0] "wlb", [1] the rating from 0.0 to 5.0.
-    vm = x.VM.get_by_name_label(vm_name)[0]
-    for host, fields in x.VM.retrieve_wlb_recommendations(vm).items():
-        print(f"  {x.host.get_name_label(host)} rated {fields[1]}")
+        # A VM's own recommendations are keyed by host and star-rate each as a destination:
+        # [0] "wlb", [1] the rating - higher is better (a real appliance rated hosts 6.1 here, so not
+        # capped at XenCenter's five stars). Right after connecting, the appliance is still
+        # discovering the pool: WLB_INTERNAL_ERROR 4024 ("Pool discovery has not been started"), 4025
+        # ("... has not been completed"), then 4016 ("WLB does not have current metrics") - keep asking.
+        vm = x.VM.get_by_name_label(vm_name)[0]
+        deadline = time.time() + 600
+        while True:
+            try:
+                ratings = x.VM.retrieve_wlb_recommendations(vm)
+                break
+            except XenAPI.Failure as e:
+                if (e.details[0] != "WLB_INTERNAL_ERROR" or e.details[1:2] not in (["4024"], ["4025"], ["4016"])
+                        or time.time() > deadline):
+                    raise
+                time.sleep(15)
+        for host, fields in ratings.items():
+            print(f"  {x.host.get_name_label(host)} rated {fields[1]}")
 
-    # The appliance's own settings are read and written as one flat map of strings. Send a
-    # nightly reporting schedule, then read the configuration back to confirm it took.
-    x.pool.send_wlb_configuration({"ReportingCronString": "0 3 * * *"})
-    config = x.pool.retrieve_wlb_configuration()
-    print("  appliance configuration: %s"
-          % ", ".join("%s=%s" % kv for kv in sorted(config.items())))
-
-    x.pool.deconfigure_wlb()
+        # The appliance's own settings are read and written as one flat map of strings. Send a
+        # nightly reporting schedule, then read the configuration back to confirm it took.
+        x.pool.send_wlb_configuration({"ReportingCronString": "0 3 * * *"})
+        config = x.pool.retrieve_wlb_configuration()
+        print("  appliance configuration: %s"
+              % ", ".join("%s=%s" % kv for kv in sorted(config.items())))
+    finally:
+        # Disconnect from the appliance however the above went, or the pool stays attached to it.
+        x.pool.deconfigure_wlb()
+        if cert_name:
+            x.pool.certificate_uninstall(cert_name)
     print("OK: wlb-recommendations")
     x.session.logout()
 
 
 # Run it:
 #   wlb_recommendations("https://xenserver", "root", password, "web-01",
-#                        wlb_host_port="10.0.0.5:30601", wlb_username="wlbuser", wlb_password="wlbpass")
+#                        wlb_host_port="10.0.0.5:30601", wlb_username="wlbuser", wlb_password="wlbpass",
+#                        wlb_certificate="wlb-appliance.pem")
 
 
 # --- Configure clustering (GFS2) -------------------------------------------------------
@@ -2337,7 +2489,7 @@ def manage_pool_membership(url, username, password):
     x.pool.designate_new_master(other)
     print(f"Promoting:   {hosts[other]['name_label']} (xapi restarts pool-wide; reconnecting)")
 
-    session = _reconnect_after_master_change(url, username, password)
+    session = _reconnect_after_master_change(url, username, password, hosts[other]["uuid"])
     x = session.xenapi
     pool = x.pool.get_all()[0]
     print(f"Promoted:    {x.host.get_name_label(x.pool.get_master(pool))}")
@@ -2347,7 +2499,7 @@ def manage_pool_membership(url, username, password):
     x.pool.designate_new_master(original)
     print(f"Restoring:   {hosts[original]['name_label']} (reconnecting again)")
 
-    session = _reconnect_after_master_change(url, username, password)
+    session = _reconnect_after_master_change(url, username, password, hosts[original]["uuid"])
     x = session.xenapi
     pool = x.pool.get_all()[0]
     print(f"Restored:    {x.host.get_name_label(x.pool.get_master(pool))}")
@@ -2375,6 +2527,9 @@ def create_bond(url, username, password):
     # the bond master — on a real host that is how you lose the connection you are working over.
     spares = [ref for ref, pif in x.PIF.get_all_records().items()
               if pif["host"] == host and not pif["management"] and pif["physical"]][:2]
+    if len(spares) < 2:
+        raise RuntimeError("%s has %d spare NIC(s); a bond needs two that aren't the management interface"
+                           % (x.host.get_name_label(host), len(spares)))
     print("Bonding:      " + ", ".join(x.PIF.get_device(p) for p in spares))
 
     # The bond needs a network to sit on.
@@ -2401,15 +2556,27 @@ def create_bond(url, username, password):
 
 
 # --- Configure PVS Accelerator ---------------------------------------------------------
-def configure_pvs_accelerator(url, username, password):
+def configure_pvs_accelerator(url, username, password, vm_name):
     """Build a PVS Accelerator site from nothing: a site, a PVS server, a read cache on each
-    host, and one accelerated VM. Then take it all down again.
+    host, and one accelerated VM (vm_name). Then take it all down again.
 
     The inventory example above reads a configuration someone else made; this one makes it."""
     session = connect(url, username, password)
     x = session.xenapi
 
-    site = x.PVS_site.introduce("sdk-pvs-farm", "Created by the SDK examples", "")
+    # Check the VM first, before creating anything: it needs a NIC for the proxy to sit on, and one
+    # that no site accelerates yet (a VIF takes one proxy: PVS_PROXY_ALREADY_PRESENT). It need not be
+    # running - a proxy on a halted VM just reports "stopped" until it starts.
+    vm = vm_by_name(session, vm_name)
+    vifs = sorted(x.VM.get_VIFs(vm), key=lambda v: int(x.VIF.get_device(v)))
+    if not vifs:
+        raise RuntimeError("%s has no network interface to accelerate" % vm_name)
+    for proxy in x.PVS_proxy.get_all_records().values():
+        if proxy["VIF"] == vifs[0]:
+            raise RuntimeError("%s is already accelerated by site '%s'"
+                               % (vm_name, x.PVS_site.get_name_label(proxy["site"])))
+
+    site = x.PVS_site.introduce("sdk-example-pvs", "Created by the SDK examples", "")
     x.PVS_server.introduce(["10.62.0.90"], 6910, 6930, site)
 
     # The read cache must be on LOCAL storage. The point of the accelerator is to keep reads off
@@ -2423,10 +2590,8 @@ def configure_pvs_accelerator(url, username, password):
             x.PVS_cache_storage.create({"host": host, "SR": local, "site": site,
                                         "size": str(10 * 1024 ** 3)})
 
-    # A proxy may only sit on the VM's LOWEST-numbered VIF, so sort by device rather than taking
-    # VIFs[0] — the list comes back in creation order, which is the same thing only by luck.
-    vm = first_unaccelerated_guest(x)
-    vifs = sorted(x.VM.get_VIFs(vm), key=lambda v: int(x.VIF.get_device(v)))
+    # A proxy may only sit on the VM's LOWEST-numbered VIF, hence sorting by device above rather than
+    # taking VIFs[0] — the list comes back in creation order, which is the same thing only by luck.
     proxy = x.PVS_proxy.create(site, vifs[0])
 
     print("Site '%s' with %d cache(s) and %d server(s)"
@@ -2458,23 +2623,8 @@ def local_sr(x, host):
     return None
 
 
-def first_unaccelerated_guest(x):
-    """A running guest with a NIC that no proxy already covers.
-
-    A VIF can carry only one proxy, so a VM the pool already accelerates fails with
-    PVS_PROXY_ALREADY_PRESENT — and the pool may well have been configured before this ran."""
-    taken = set()
-    for proxy in x.PVS_proxy.get_all():
-        taken.add(x.VIF.get_VM(x.PVS_proxy.get_VIF(proxy)))
-    for ref, vm in x.VM.get_all_records().items():
-        if (not vm["is_a_template"] and not vm["is_control_domain"] and not vm["is_a_snapshot"]
-                and vm["power_state"] == "Running" and vm["VIFs"] and ref not in taken):
-            return ref
-    raise Exception("no unaccelerated running guest with a NIC")
-
-
 # Run it:
-#   configure_pvs_accelerator("https://xenserver", "root", password)
+#   configure_pvs_accelerator("https://xenserver", "root", password, "db-01")
 
 
 # --- Manage SSH access -----------------------------------------------------------------
@@ -2643,8 +2793,8 @@ def first_disk(x, vm):
 
 
 # --- Export and import a VM ------------------------------------------------------------
-def export_import_vm(url, username, password):
-    """Export a VM to an XVA file and import it back as a new VM.
+def export_import_vm(url, username, password, vm_name):
+    """Export a halted VM (vm_name) to an XVA file and import it back as a new VM.
 
     Export and import are not XenAPI calls: they are HTTP transfers alongside the API, and
     the session id goes in the query string. Everything else about them is ordinary HTTP -
@@ -2663,11 +2813,13 @@ def export_import_vm(url, username, password):
     x = session.xenapi
     session_id = session._session
 
-    # Only a halted VM can be exported: its disks must not be changing underneath the copy.
-    vm = next(ref for ref, v in x.VM.get_all_records().items()
-              if not v["is_a_template"] and not v["is_control_domain"]
-              and not v["is_a_snapshot"] and v["power_state"] == "Halted")
-    name = x.VM.get_name_label(vm)
+    # Name the VM: an export carries every block of its disks, so which VM matters (a large one
+    # takes a long time, and fills the disk). Only a halted VM can be exported: its disks must not
+    # be changing underneath the copy.
+    vm = vm_by_name(session, vm_name)
+    if x.VM.get_power_state(vm) != "Halted":
+        raise RuntimeError("%s must be halted to be exported" % vm_name)
+    name = vm_name
     print("Exporting %s" % name)
 
     # A unique file, not a fixed name: an export is a real file on disk and two of them running at once
@@ -2696,17 +2848,20 @@ def export_import_vm(url, username, password):
 
     task = x.task.create("vm_import", "importing %s back" % name)
     try:
+        # Stream the file rather than reading it into memory: a real VM's export is gigabytes.
         with open(path, "rb") as f:
             request = urllib.request.Request(
                 "%s/import?session_id=%s&task_id=%s" % (url, session_id, task),
-                data=f.read(), method="PUT")
+                data=f, method="PUT", headers={"Content-Length": str(os.path.getsize(path))})
             urllib.request.urlopen(request, context=ctx).read()
 
         while x.task.get_status(task) == "pending":
             time.sleep(0.5)
         if x.task.get_status(task) != "success":
             raise RuntimeError("import failed: %s" % x.task.get_error_info(task))
-        imported = x.task.get_result(task).replace("<value>", "").replace("</value>", "").strip()
+        # The result lists the imported VMs (<value><array><data>OpaqueRef:...</data></array></value>
+        # on a real host), so take the first reference in it.
+        imported = re.search(r"OpaqueRef:[^<]+", x.task.get_result(task)).group(0)
     finally:
         x.task.destroy(task)
     print("  imported as %s" % x.VM.get_name_label(imported))
@@ -2719,7 +2874,7 @@ def export_import_vm(url, username, password):
 
 
 # Run it:
-#   export_import_vm("https://xenserver", "root", password)
+#   export_import_vm("https://xenserver", "root", password, "db-01")
 
 
 # --- Configure dynamic memory ----------------------------------------------------------
@@ -2844,8 +2999,9 @@ def backup_host_config(url, username, password):
     with urllib.request.urlopen(
             "%s/host_backup?session_id=%s&ref=%s" % (host_url, session._session, host),
             context=ctx, timeout=10) as response, open(path, "wb") as out:
-        out.write(response.read())
+        shutil.copyfileobj(response, out)       # hundreds of MB: stream it, don't hold it in memory
     print("  wrote %d bytes to %s" % (os.path.getsize(path), os.path.basename(path)))
+    _drop_idle_connection(session)
 
     print("  restoring it to %s: %s"
           % (x.host.get_name_label(host), restore_host_config(session, ctx, host_url, host, path)))
@@ -2867,6 +3023,14 @@ def backup_host_config(url, username, password):
     session.logout()
 
 
+def _drop_idle_connection(session):
+    """Close the session's HTTP connection after a long transfer; the next call opens a new one.
+    The session itself is still valid - but its one keep-alive connection sat idle for as long as
+    the transfer took, and a network that dropped it meanwhile leaves the next call hanging until
+    the socket times out. (ServerProxy("close")() is xmlrpc.client's way to close its transport.)"""
+    session("close")()
+
+
 def restore_host_config(session, ctx, host_url, host, path):
     """Upload a backup to a host - over a connection opened to THAT host's own address - and
     report what the task says about it."""
@@ -2876,8 +3040,9 @@ def restore_host_config(session, ctx, host_url, host, path):
         with open(path, "rb") as f:
             request = urllib.request.Request(
                 "%s/host_restore?session_id=%s&ref=%s&task_id=%s" % (host_url, session._session, host, task),
-                data=f.read(), method="PUT")
+                data=f, headers={"Content-Length": str(os.path.getsize(path))}, method="PUT")
             urllib.request.urlopen(request, context=ctx, timeout=10).read()
+        _drop_idle_connection(session)
 
         while x.task.get_status(task) == "pending":
             time.sleep(0.5)
@@ -3013,23 +3178,27 @@ def server_status_report(url, username, password):
     host = x.pool.get_master(x.pool.get_all()[0])
     print("Status report for %s" % x.host.get_name_label(host))
 
-    keys = []
+    keys, defaults = [], []
     for capability in ET.fromstring(x.host.get_system_status_capabilities(host)):
         keys.append(capability.get("key"))
+        if capability.get("default-checked") == "yes":
+            defaults.append(capability.get("key"))
         print("  %-22s max %9s bytes  default=%-3s pii=%s"
               % (capability.get("key"), capability.get("max-size"),
                  capability.get("default-checked"), capability.get("pii")))
 
-    whole = fetch_status_report(url, session, ctx, keys)
-    print("everything (%d sections): %d bytes" % (len(keys), len(whole)))
+    # Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+    # section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+    whole = fetch_status_report(url, session, ctx, defaults)
+    print("default sections (%d of %d): %d bytes" % (len(defaults), len(keys), whole))
 
     # Pick a real, small section from the host's own catalogue rather than assuming a name: the
     # catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
     # list, and "xenserver-config" isn't one of the real keys any host actually publishes.
     subset_key = next((k for k in keys if k in ("firstboot", "network-status")), keys[0])
     subset = fetch_status_report(url, session, ctx, [subset_key])
-    print("%s only:   %d bytes" % (subset_key, len(subset)))
-    if len(subset) >= len(whole):
+    print("%s only:   %d bytes" % (subset_key, subset))
+    if subset >= whole:
         print("  ERROR: selecting fewer sections did not produce a smaller bundle")
 
     print("OK: server-status-report")
@@ -3037,11 +3206,17 @@ def server_status_report(url, username, password):
 
 
 def fetch_status_report(url, session, ctx, entries):
-    """Download the bundle for the given capability keys (a tar archive)."""
+    """Download the bundle for the given capability keys (a tar archive) to a file, streaming it -
+    a report can be large - and return its size. This example then deletes it; you'd keep it."""
     request = "%s/system-status?session_id=%s&output=tar&entries=%s" \
               % (url, session._session, ",".join(entries))
-    with urllib.request.urlopen(request, context=ctx) as response:
-        return response.read()
+    handle, path = tempfile.mkstemp(prefix="sdk-example-status-", suffix=".tar")
+    try:
+        with os.fdopen(handle, "wb") as out, urllib.request.urlopen(request, context=ctx) as response:
+            shutil.copyfileobj(response, out, 1024 * 1024)
+        return os.path.getsize(path)
+    finally:
+        os.remove(path)
 # Run it:
 #   server_status_report("https://xenserver", "root", password)
 
@@ -3178,8 +3353,8 @@ def restart_host(url, username, password):
 
     Rebooting a host is never just the reboot: anything running on it has to go
     somewhere first, and the host has to stop accepting new VMs while that happens.
-    Disable, evacuate, reboot, re-enable -- disabling does not clear itself, not even across a
-    reboot, so an explicit enable is the only thing that brings the host back into service.
+    Disable, evacuate, reboot, re-enable. Disabling with the default auto_enable=true clears itself
+    once the host's toolstack is back up; an explicit enable doesn't depend on that, or on when.
     Powering it right off and back on again is a second, separate demonstration, and only a
     meaningful one if the host actually has an out-of-band power-on mode configured: a real
     host.power_on has no retry of its own and simply fails if none is set up, leaving the host off
@@ -3205,12 +3380,13 @@ def restart_host(url, username, password):
     print("  evacuated:  guests=%d" % guest_count(x, host))
 
     x.host.reboot(host)
-    # A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long
-    # as XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the
-    # reboot to get underway, then explicitly re-enables -- nothing does that for us, not even the
-    # reboot itself.
-    time.sleep(5)
-    x.host.enable(host)
+    # A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+    # host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+    # itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+    # never does - so enable it explicitly rather than depend on either.
+    _wait_for_host_live(x, host, False, timeout=600)
+    _wait_for_host_live(x, host, True, timeout=1200, interval=10)
+    _enable_when_booted(x, host)
     print("  rebooted, re-enabled: enabled=%s" % x.host.get_enabled(host))
 
     # The other ending: off, and back on out of band -- but only demonstrated if that is actually
@@ -3221,9 +3397,9 @@ def restart_host(url, username, password):
         _wait_for_host_live(x, host, False)
         print("  shut down:  live=%s" % host_live(x, host))
         x.host.power_on(host)
-        _wait_for_host_live(x, host, True)
+        _wait_for_host_live(x, host, True, timeout=1200, interval=10)
         print("  powered on: live=%s" % host_live(x, host))
-        x.host.enable(host)
+        _enable_when_booted(x, host)
         print("  re-enabled: enabled=%s" % x.host.get_enabled(host))
     else:
         print("  skipping shutdown/power-on: no out-of-band power-on mode is configured on this host")
@@ -3327,6 +3503,7 @@ def attach_vdi(x, vm, vdi):
     """Join an existing disk to a VM on its next free device slot."""
     return x.VBD.create({
         "VM": vm, "VDI": vdi, "userdevice": x.VM.get_allowed_VBD_devices(vm)[0],
+        "bootable": False,
         "mode": "RW", "type": "Disk", "empty": False, "other_config": {},
         "qos_algorithm_type": "", "qos_algorithm_params": {},
     })
@@ -3544,11 +3721,14 @@ def manage_driver_variants(url, username, password):
 
     # Select a variant explicitly. It becomes the selected one immediately; whether it is also
     # active depends on whether the hardware is present and the driver already loaded.
-    # Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
-    # and variant order isn't guaranteed to put the usable one first.
-    ref, driver = sorted(drivers.items(), key=lambda kv: kv[1]["name"])[0]
-    variant = next((v for v in driver["variants"] if x.Driver_variant.get_hardware_present(v)),
-                   driver["variants"][0])
+    # Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE) -
+    # and a host lists drivers for plenty of devices it doesn't have - so pick a driver for hardware
+    # this host actually has, and one of its variants that is usable.
+    usable = [(ref, v) for ref, d in sorted(drivers.items(), key=lambda kv: kv[1]["name"])
+              for v in d["variants"] if x.Driver_variant.get_hardware_present(v)]
+    if not usable:
+        raise RuntimeError("no driver on %s has a variant for hardware it has" % x.host.get_name_label(host))
+    ref, variant = usable[0]
     x.Host_driver.select(ref, variant)
     after = x.Host_driver.get_record(ref)
     print("  %s: selected %s, active %s"
@@ -3582,7 +3762,7 @@ WORKFLOWS = {
     "connect-inventory": _wf(connect_inventory),
     "create-vm": _wf(create_vm, template_name="Rocky Linux 8"),
     "vm-lifecycle": _wf(vm_lifecycle, source_vm="web-01"),
-    "manage-vm-disks": _wf(manage_vm_disks, template_name="Rocky Linux 8", sr_name="Shared NFS"),
+    "manage-vm-disks": _wf(manage_vm_disks, source_vm="web-01", sr_name="Shared NFS"),
     "dismiss-alerts": _wf(dismiss_alerts),
     "host-power-on": _wf(host_power_on),
     "rotate-pool-secret": _wf(rotate_pool_secret),
@@ -3602,11 +3782,13 @@ WORKFLOWS = {
     "copy-vm": _wf(copy_vm, vm_name="db-01", sr_name="Shared NFS"),
     "create-vm-with-vgpu": _wf(create_vm_with_vgpu, template_name="Rocky Linux 8"),
     "tags-and-folders": _wf(tags_and_folders, vm_name="web-01"),
-    "configure-updates": _wf(configure_updates),
+    "configure-updates": _wf(configure_updates, repo_url="https://repo.ops.xenserver.com/xs9",
+                             source_url="https://repo-src.ops.xenserver.com/xs9"),
     "clone-vm": _wf(clone_vm, vm_name="db-01"),
     "delete-vm": _wf(delete_vm, template_name="Rocky Linux 8"),
     "storage-migrate": _wf(storage_migrate, source_vm="web-01"),
-    "apply-update": _wf(apply_update),
+    "apply-update": _wf(apply_update, repo_url="https://repo.ops.xenserver.com/xs9",
+                        source_url="https://repo-src.ops.xenserver.com/xs9"),
     "checkpoint-vm": _wf(checkpoint_vm, source_vm="web-01"),
     "attach-disk": _wf(attach_disk, template_name="Rocky Linux 8", sr_name="Shared NFS"),
     "wait-for-task": _wf(wait_for_task, template_name="Rocky Linux 8"),
@@ -3627,9 +3809,10 @@ WORKFLOWS = {
     "pool-tags": _wf(pool_tags),
     "convert-to-template": _wf(convert_to_template, template_name="Rocky Linux 8"),
     "find-by-uuid": _wf(find_by_uuid, vm_name="web-01"),
-    "rolling-pool-update": _wf(rolling_pool_update),
+    "rolling-pool-update": _wf(rolling_pool_update, repo_url="https://repo.ops.xenserver.com/xs9",
+                               source_url="https://repo-src.ops.xenserver.com/xs9"),
     "pvs-accelerator": _wf(pvs_accelerator),
-    "configure-pvs-accelerator": _wf(configure_pvs_accelerator),
+    "configure-pvs-accelerator": _wf(configure_pvs_accelerator, vm_name="db-01"),
     "manage-ssh-access": _wf(manage_ssh_access),
     "manage-vtpm": _wf(manage_vtpm),
     "configure-dynamic-memory": _wf(configure_dynamic_memory),
@@ -3649,7 +3832,7 @@ WORKFLOWS = {
     "manage-driver-variants": _wf(manage_driver_variants),
     "vm-from-snapshot": _wf(vm_from_snapshot, vm_name="db-01"),
     "attach-existing-disk": _wf(attach_existing_disk),
-    "export-import-vm": _wf(export_import_vm),
+    "export-import-vm": _wf(export_import_vm, vm_name="db-01"),
     "changed-block-tracking": _wf(changed_block_tracking),
     "control-domain-memory": _wf(control_domain_memory),
     "rrd-metrics": _wf(rrd_metrics),
@@ -3661,7 +3844,7 @@ WORKFLOWS = {
     "create-smb-sr": _wf(create_smb_sr, server="192.0.2.40", share="/vmstore",
                           smb_username="Administrator", smb_password="Password1"),
     "create-hba-sr": _wf(create_hba_sr),
-    "create-iso-sr": _wf(create_iso_sr),
+    "create-iso-sr": _wf(create_iso_sr, location="192.0.2.10:/isos"),
     "configure-nrpe": _wf(configure_nrpe),
     "configure-snmp": _wf(configure_snmp, trap_destination="192.0.2.50"),
     "configure-clustering": _wf(configure_clustering),
@@ -3675,13 +3858,17 @@ WORKFLOWS = {
 
 
 def main():
-    # cross-pool-copy-vm spans two pools, so it takes an extra 5th argument: the destination pool URL.
+    # cross-pool-copy-vm spans two pools, so it takes the destination pool's URL as a 5th argument,
+    # then optionally that pool's credentials (if they differ from the source's) and the VM to copy.
     if len(sys.argv) >= 2 and sys.argv[1] == "cross-pool-copy-vm":
-        if len(sys.argv) != 6:
-            print("usage: python workflows.py cross-pool-copy-vm <sourceUrl> <user> <password> <destUrl>",
-                  file=sys.stderr)
+        if len(sys.argv) not in (6, 8, 9):
+            print("usage: python workflows.py cross-pool-copy-vm <sourceUrl> <user> <password> <destUrl>"
+                  " [<destUser> <destPassword> [<vmName>]]", file=sys.stderr)
             return 2
-        cross_pool_copy_vm(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
+        dest_creds = sys.argv[6:8] if len(sys.argv) >= 8 else [None, None]
+        cross_pool_copy_vm(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5],
+                           vm_name=sys.argv[8] if len(sys.argv) == 9 else "db-01",
+                           dest_username=dest_creds[0], dest_password=dest_creds[1])
         return 0
 
     if len(sys.argv) < 5 or sys.argv[1] not in WORKFLOWS:

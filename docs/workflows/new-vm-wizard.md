@@ -626,9 +626,11 @@ w_new_vm_wizard() {
     echo "power-state: $(xe vm-param-get uuid=$vm param-name=power-state)"
     echo "vCPUs:       $(xe vm-param-get uuid=$vm param-name=VCPUs-max)"
     # Tidy up so the example is repeatable: stop the VM, then vm-uninstall destroys it and the disks it
-    # owns (vm-destroy would leave the disks behind).
+    # owns (vm-destroy would leave the disks behind). It owns only the template's disks - vm-install marks
+    # those (VBD other-config:owner) - not one added with a plain vbd-create, so destroy that one too.
     xe vm-shutdown uuid=$vm force=true
     xe vm-uninstall uuid=$vm force=true
+    xe vdi-destroy uuid=$vdi
     echo "OK: new-vm-wizard"
 }
 ```

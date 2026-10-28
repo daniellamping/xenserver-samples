@@ -155,23 +155,39 @@ internal static class Program
     }
 
     /// <summary>
-    /// Wait out a pool-wide xapi restart (Pool.designate_new_master) and reconnect. XenRT's own helper
-    /// for this call treats the connection dropping as the expected, successful outcome and then waits
-    /// several minutes before trusting the pool again, rather than retrying immediately - do the same.
+    /// Wait out a pool-wide xapi restart (Pool.designate_new_master) and reconnect.
+    ///
+    /// designate_new_master returns BEFORE the change: for a while the old coordinator still answers,
+    /// and still says it is the coordinator, until xapi restarts across the pool. So reconnecting is not
+    /// enough - keep reconnecting until the pool names the new coordinator (by uuid; Connect follows
+    /// HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits minutes
+    /// before trusting the pool again.
     /// </summary>
     private static Session ReconnectAfterMasterChange(string url, string user, string password,
-        int timeoutSeconds = 600, int intervalSeconds = 5)
+        string newMasterUuid, int timeoutSeconds = 600, int intervalSeconds = 5)
     {
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
-        Exception lastError = null;
+        object lastError = null;
         while (DateTime.UtcNow < deadline)
         {
-            try { return Connect(url, user, password); }
+            try
+            {
+                var session = Connect(url, user, password);
+                var master = Pool.get_master(session, Pool.get_all(session)[0].opaque_ref).opaque_ref;
+                // The new coordinator answers before the pool has settled - calls made too soon fail
+                // (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
+                // live and enabled.
+                if (Host.get_uuid(session, master) == newMasterUuid && Host.get_all_records(session).Values.All(
+                        r => r.enabled && Host_metrics.get_live(session, r.metrics.opaque_ref)))
+                    return session;
+                session.logout();
+                lastError = "the pool has not settled under the new coordinator";
+            }
             catch (Exception e)
             {
                 lastError = e;
-                System.Threading.Thread.Sleep(intervalSeconds * 1000);
             }
+            System.Threading.Thread.Sleep(intervalSeconds * 1000);
         }
         throw new Exception($"the pool did not come back after the master change: {lastError}");
     }
@@ -189,6 +205,60 @@ internal static class Program
         {
             if (DateTime.UtcNow > deadline) throw new Exception($"host did not reach live={want} in time");
             System.Threading.Thread.Sleep(intervalSeconds * 1000);
+        }
+    }
+
+    /// <summary>
+    /// Wait for a host to come back from a reboot (key "boot_time") or toolstack restart
+    /// ("agent_start_time"): until that other_config entry differs from <paramref name="before"/> and the
+    /// host is live. Reconnects every time round, because the host restarting may be the coordinator this
+    /// session talks to; returns the new session.
+    /// </summary>
+    private static Session WaitForRestart(string url, string user, string password, string hostUuid,
+        string key, string before, int timeoutSeconds = 1800, int intervalSeconds = 10)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        while (true)
+        {
+            try
+            {
+                var session = Connect(url, user, password);
+                var host = Host.get_by_uuid(session, hostUuid).opaque_ref;
+                var otherConfig = Host.get_other_config(session, host);
+                var value = otherConfig.TryGetValue(key, out var v) ? v : null;
+                if (value != before && HostLive(session, host))
+                    return session;
+                session.logout();
+            }
+            catch (Exception)
+            {
+                // down, or xapi still starting
+            }
+            if (DateTime.UtcNow > deadline) throw new Exception($"host {hostUuid} did not come back in time");
+            System.Threading.Thread.Sleep(intervalSeconds * 1000);
+        }
+    }
+
+    /// <summary>
+    /// Re-enable a host that has just come back. It reports itself live before xapi on it has finished
+    /// starting, and until then Host.enable fails HOST_STILL_BOOTING - so retry that.
+    /// </summary>
+    private static void EnableWhenBooted(Session session, string host, int timeoutSeconds = 600,
+        int intervalSeconds = 10)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        while (true)
+        {
+            try
+            {
+                Host.enable(session, host);
+                return;
+            }
+            catch (Failure e)
+            {
+                if (e.ErrorDescription[0] != "HOST_STILL_BOOTING" || DateTime.UtcNow > deadline) throw;
+                System.Threading.Thread.Sleep(intervalSeconds * 1000);
+            }
         }
     }
 
@@ -393,7 +463,7 @@ internal static class Program
 
     // --- Manage VM disks: Deactivate / Resize / Activate ----------------------------------
     private static void ManageVmDisks(string url, string user, string password,
-        string templateName, string srName, string newVmName = "sdk-example-vm-disks")
+        string sourceVm, string srName, string newVmName = "sdk-example-vm-disks")
     {
         const long GiB = 1024L * 1024 * 1024;
         var session = Connect(url, user, password);
@@ -402,9 +472,13 @@ internal static class Program
         // VBD_NOT_UNPLUGGABLE - and the VM has to be running in the first place, or unplug fails with
         // VM_BAD_POWER_STATE. Work on a data disk this example adds to its own throwaway VM instead,
         // matching XenCenter's own "deactivate" action, which only ever targets additional disks.
-        var vmRef = VM.clone(session, TemplateByName(session, templateName), newVmName).opaque_ref;
-        Provision(session, vmRef);
+        //
+        // Plugging and unplugging a disk on a running VM needs the guest's PV drivers
+        // (VM_MISSING_PV_DRIVERS otherwise), so the VM is a throwaway copy of sourceVm, a VM with a
+        // guest OS and PV drivers.
+        var vmRef = CopyOfGuest(session, sourceVm, newVmName);
         VM.start(session, vmRef, false, true);
+        WaitForGuestAgent(session, vmRef);
 
         var srRef = SrByName(session, srName);
         var vdiRef = VDI.create(session, new VDI
@@ -422,6 +496,7 @@ internal static class Program
             VM = new XenRef<VM>(vmRef),
             VDI = new XenRef<VDI>(vdiRef),
             userdevice = VM.get_allowed_VBD_devices(session, vmRef)[0],
+            bootable = false,
             mode = vbd_mode.RW,
             type = vbd_type.Disk,
             empty = false,
@@ -444,10 +519,22 @@ internal static class Program
         Console.WriteLine($"After plug:     {VBD.get_currently_attached(session, vbdRef)}");
 
         // Growing a disk that is attached and live is a DIFFERENT call, not a flag on the same one:
-        // resize_online tells the storage layer the guest is using the disk while it grows.
-        var grown = VDI.get_virtual_size(session, vdiRef) + 1024L * 1024 * 1024;
-        VDI.resize_online(session, vdiRef, grown);
-        Console.WriteLine($"Grown online:   {VDI.get_virtual_size(session, vdiRef)} bytes");
+        // resize_online tells the storage layer the guest is using the disk while it grows. Only some
+        // storage drivers can (none of a stock XenServer 9's do), and the rest refuse with
+        // SR_OPERATION_NOT_SUPPORTED - so ask the SR's driver (its SM record's features) first.
+        var srType = SR.get_type(session, srRef);
+        var features = SM.get_all_records(session).Values
+            .FirstOrDefault(r => r.type == srType)?.features ?? new Dictionary<string, long>();
+        if (features.ContainsKey("VDI_RESIZE_ONLINE"))
+        {
+            var grown = VDI.get_virtual_size(session, vdiRef) + GiB;
+            VDI.resize_online(session, vdiRef, grown);
+            Console.WriteLine($"Grown online:   {VDI.get_virtual_size(session, vdiRef)} bytes");
+        }
+        else
+        {
+            Console.WriteLine($"Grown online:   not supported by {srType} storage; unplug, resize, plug as above");
+        }
 
         VM.hard_shutdown(session, vmRef);
         DestroyVmAndDisks(session, vmRef);
@@ -1171,20 +1258,29 @@ internal static class Program
     //   TagsAndFolders("https://xenserver", "root", password, "web-01");
 
     // --- 16. Configure updates (CDN) ---------------------------------------------------
-    private static void ConfigureUpdates(string url, string user, string password)
+    /// <summary>
+    /// Introduce the pool's update repositories the way XenCenter does: the release's base packages
+    /// (update=false) and its update stream (update=true, which pool.sync_updates needs - otherwise
+    /// NO_REPOSITORY_ENABLED). A real host checks the URLs (INVALID_BASE_URL for an unknown domain), so
+    /// these are the XenServer CDN's, e.g. https://repo.ops.xenserver.com/xs9/{base,normal}.
+    /// </summary>
+    private static List<XenRef<Repository>> IntroduceUpdateRepositories(Session session, string repoUrl,
+        string sourceUrl) =>
+        new[] { "base", "normal" }.Select(stage => new XenRef<Repository>(Repository.introduce(session,
+            $"sdk-example-{stage}", $"SDK example {stage} repository",
+            $"{repoUrl}/{stage}", $"{sourceUrl}/{stage}", stage != "base", "").opaque_ref)).ToList();
+
+    private static void ConfigureUpdates(string url, string user, string password, string repoUrl, string sourceUrl)
     {
         var session = Connect(url, user, password);
-        // update=true: without it this introduces only a base package mirror, not an actual UPDATE
-        // repository - pool.sync_updates needs one with update=true enabled (NO_REPOSITORY_ENABLED
-        // otherwise), which is exactly what apply-update and rolling-pool-update rely on.
-        var repo = Repository.introduce(session, "sdk-cdn", "SDK example repository",
-            "https://cdn.example/base", "https://cdn.example/source", true, "").opaque_ref;
-        Console.WriteLine($"Introduced repository: {Repository.get_name_label(session, repo)}");
+        var repos = IntroduceUpdateRepositories(session, repoUrl, sourceUrl);
+        Console.WriteLine("Introduced repositories: " +
+            string.Join(", ", repos.Select(r => Repository.get_name_label(session, r.opaque_ref))));
 
         var pool = Pool.get_all(session)[0].opaque_ref;
         // Remember the pool's own repositories, to put them back afterwards.
         var previous = Pool.get_repositories(session, pool);
-        Pool.set_repositories(session, pool, new List<XenRef<Repository>> { new(repo) });
+        Pool.set_repositories(session, pool, repos);
         Pool.set_update_sync_enabled(session, pool, true);
         Console.WriteLine($"Pool repositories: {Pool.get_repositories(session, pool).Count}; " +
             $"auto-sync enabled: {Pool.get_update_sync_enabled(session, pool)}");
@@ -1192,12 +1288,13 @@ internal static class Program
         // Tidy up so the example is repeatable.
         Pool.set_update_sync_enabled(session, pool, false);
         Pool.set_repositories(session, pool, previous);
-        Repository.forget(session, repo);
+        foreach (var repo in repos) Repository.forget(session, repo.opaque_ref);
         Console.WriteLine("OK: configure-updates");
         session.logout();
     }
     // Run it:
-    //   ConfigureUpdates("https://xenserver", "root", password);
+    //   ConfigureUpdates("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+    //       "https://repo-src.ops.xenserver.com/xs9");
 
     // --- 17. Clone a VM (fast, copy-on-write) ------------------------------------------
     private static void CloneVm(string url, string user, string password,
@@ -1284,18 +1381,17 @@ internal static class Program
     //   StorageMigrate("https://xenserver", "root", password, "web-01");
 
     // --- 20. Apply updates from the CDN ------------------------------------------------
-    private static void ApplyUpdate(string url, string user, string password)
+    private static void ApplyUpdate(string url, string user, string password, string repoUrl, string sourceUrl)
     {
         var session = Connect(url, user, password);
         // pool.sync_updates needs at least one repository with update=true enabled
         // (NO_REPOSITORY_ENABLED otherwise) - introduce and attach a throwaway one, and forget it again
         // afterwards.
         var pool = Pool.get_all(session)[0].opaque_ref;
-        var repo = Repository.introduce(session, "sdk-cdn", "SDK example repository",
-            "https://cdn.example/base", "https://cdn.example/source", true, "").opaque_ref;
+        var repos = IntroduceUpdateRepositories(session, repoUrl, sourceUrl);
         // Remember the pool's own repositories, to put them back afterwards.
         var previous = Pool.get_repositories(session, pool);
-        Pool.set_repositories(session, pool, new List<XenRef<Repository>> { new(repo) });
+        Pool.set_repositories(session, pool, repos);
         try
         {
             // Sync the pool's update metadata; the returned hash identifies the synced set.
@@ -1325,22 +1421,34 @@ internal static class Program
                                   $"[{string.Join(", ", guidance)}]");
                 // Modern xapi (>=23.18.0) doesn't reboot a host for you: it only records pending_guidances,
                 // so only reboot (or restart the toolstack) when the applied batch actually asks for it.
-                if (guidance.Contains(update_guidances.reboot_host))
-                    Host.reboot(session, hostRef.opaque_ref);
-                else if (guidance.Contains(update_guidances.restart_toolstack))
-                    Host.restart_agent(session, hostRef.opaque_ref);
+                if (guidance.Contains(update_guidances.reboot_host) ||
+                    guidance.Contains(update_guidances.restart_toolstack))
+                {
+                    // As in rolling-pool-update: either restart returns before it has happened, and the
+                    // coordinator's takes this session with it - so wait for it, reconnecting.
+                    var rebooting = guidance.Contains(update_guidances.reboot_host);
+                    var key = rebooting ? "boot_time" : "agent_start_time";
+                    Host.get_other_config(session, hostRef.opaque_ref).TryGetValue(key, out var before);
+                    if (rebooting) Host.reboot(session, hostRef.opaque_ref);
+                    else Host.restart_agent(session, hostRef.opaque_ref);
+                    session = WaitForRestart(url, user, password, host.uuid, key, before);
+                }
+                // apply_updates disables the host while it works (auto_enable: a restart puts it back) -
+                // with no restart to do, nothing re-enables it. Return it to service either way.
+                EnableWhenBooted(session, hostRef.opaque_ref);
             }
         }
         finally
         {
             Pool.set_repositories(session, pool, previous);
-            Repository.forget(session, repo);
+            foreach (var repo in repos) Repository.forget(session, repo.opaque_ref);
         }
         Console.WriteLine("OK: apply-update");
         session.logout();
     }
     // Run it:
-    //   ApplyUpdate("https://xenserver", "root", password);
+    //   ApplyUpdate("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+    //       "https://repo-src.ops.xenserver.com/xs9");
 
     // --- 21. Checkpoint & revert -------------------------------------------------------
     private static void CheckpointVm(string url, string user, string password,
@@ -1405,6 +1513,7 @@ internal static class Program
             VM = new XenRef<VM>(vm),
             VDI = new XenRef<VDI>(vdi),
             userdevice = device,
+            bootable = false,
             mode = vbd_mode.RW,
             type = vbd_type.Disk,
             empty = false,
@@ -1813,17 +1922,16 @@ internal static class Program
     //   FindByUuid("https://xenserver", "root", password, "web-01");
 
     // --- 41. Rolling pool update -------------------------------------------------------
-    private static void RollingPoolUpdate(string url, string user, string password)
+    private static void RollingPoolUpdate(string url, string user, string password, string repoUrl, string sourceUrl)
     {
         var session = Connect(url, user, password);
         // Needs an enabled update repository the same way apply-update does - introduce and attach a
         // throwaway one, forget it again afterwards.
         var pool = Pool.get_all(session)[0].opaque_ref;
-        var repo = Repository.introduce(session, "sdk-cdn", "SDK example repository",
-            "https://cdn.example/base", "https://cdn.example/source", true, "").opaque_ref;
+        var repos = IntroduceUpdateRepositories(session, repoUrl, sourceUrl);
         // Remember the pool's own repositories, to put them back afterwards.
         var previous = Pool.get_repositories(session, pool);
-        Pool.set_repositories(session, pool, new List<XenRef<Repository>> { new(repo) });
+        Pool.set_repositories(session, pool, repos);
         try
         {
             // Sync the pool's update metadata; the returned hash identifies the synced set.
@@ -1844,37 +1952,51 @@ internal static class Program
                 Host.apply_updates(session, h, hash);  // apply the synced updates
                 var guidance = Host.get_pending_guidances(session, h);
                 Console.WriteLine($"  applied; pending guidance = [{string.Join(", ", guidance)}]");
-                if (guidance.Contains(update_guidances.reboot_host))
-                    Host.reboot(session, h);           // reboot into the updated software
-                else if (guidance.Contains(update_guidances.restart_toolstack))
-                    Host.restart_agent(session, h);
-                Host.enable(session, h);               // return the host to service
+                if (guidance.Contains(update_guidances.reboot_host) ||
+                    guidance.Contains(update_guidances.restart_toolstack))
+                {
+                    // Either restart returns before it has happened, and if this host is the coordinator
+                    // it takes this session with it - so note when the host last started, restart it, and
+                    // reconnect until it reports a newer start and is live again.
+                    var rebooting = guidance.Contains(update_guidances.reboot_host);
+                    var key = rebooting ? "boot_time" : "agent_start_time";
+                    Host.get_other_config(session, h).TryGetValue(key, out var before);
+                    if (rebooting) Host.reboot(session, h);           // reboot into the updated software
+                    else Host.restart_agent(session, h);
+                    session = WaitForRestart(url, user, password, host.uuid, key, before);
+                }
+                EnableWhenBooted(session, h);          // return the host to service
             }
         }
         finally
         {
             Pool.set_repositories(session, pool, previous);
-            Repository.forget(session, repo);
+            foreach (var repo in repos) Repository.forget(session, repo.opaque_ref);
         }
         Console.WriteLine("OK: rolling-pool-update");
         session.logout();
     }
     // Run it:
-    //   RollingPoolUpdate("https://xenserver", "root", password);
+    //   RollingPoolUpdate("https://xenserver", "root", password, "https://repo.ops.xenserver.com/xs9",
+    //       "https://repo-src.ops.xenserver.com/xs9");
 
     // --- 42. Cross-pool copy a VM ------------------------------------------------------
     // Copy a VM from one pool to another (Storage XenMotion copy) — the API behind XenCenter's
     // cross-pool Copy. Open a session to each pool, get a receiver token from the destination with
     // host.migrate_receive, then VM.migrate_send with copy=true on the source (which is left intact).
     private static void CrossPoolCopyVm(string url, string user, string password, string destUrl,
-        string vmName = "db-01")
+        string vmName = "db-01", string destUser = null, string destPassword = null)
     {
         var source = Connect(url, user, password);
-        var dest = Connect(destUrl, user, password);
-        // Destination: choose a host, a network and an SR, then ask for a receiver token.
-        var destHost = Host.get_all(dest)[0].opaque_ref;
-        var destNetwork = Network.get_all(dest)[0].opaque_ref;
-        var destSr = SrByName(dest, "Shared NFS");
+        var dest = Connect(destUrl, destUser ?? user, destPassword ?? password);
+        // Destination: choose a host, a network and an SR, then ask for a receiver token. The disks go to
+        // the destination pool's default SR and the data travels over the host's management network -
+        // one both pools can certainly reach (the first network listed may well not be).
+        var destPool = Pool.get_all(dest)[0];
+        var destHost = Pool.get_master(dest, destPool).opaque_ref;
+        var destSr = Pool.get_default_SR(dest, destPool).opaque_ref;
+        var managementPif = Host.get_PIFs(dest, destHost).First(pif => PIF.get_management(dest, pif.opaque_ref));
+        var destNetwork = PIF.get_network(dest, managementPif.opaque_ref).opaque_ref;
         var receiver = Host.migrate_receive(dest, destHost, destNetwork, new Dictionary<string, string>());
 
         // Source: map every disk to the destination SR and every NIC to the destination network
@@ -1891,12 +2013,14 @@ internal static class Program
         foreach (var vifRef in VM.get_VIFs(source, vm)) vifMap[vifRef] = new XenRef<Network>(destNetwork);
 
         var options = new Dictionary<string, string> { ["copy"] = "true" };
-        VM.migrate_send(source, vm, receiver, false, vdiMap, vifMap, options,
+        var copy = VM.migrate_send(source, vm, receiver, false, vdiMap, vifMap, options,
             new Dictionary<XenRef<VGPU>, XenRef<GPU_group>>());
 
         // Copy (not move): the source VM is still on the source pool.
         Console.WriteLine($"Sent '{vmName}' to the destination pool (copy); source still present: " +
                           $"{VmByName(source, vmName) == vm}");
+        // The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
+        Console.WriteLine($"  the copy on the destination: {VM.get_name_label(dest, copy)} ({VM.get_uuid(dest, copy)})");
         Console.WriteLine("OK: cross-pool-copy-vm");
         source.logout();
         dest.logout();
@@ -2053,19 +2177,36 @@ internal static class Program
     // Join AD, add a user as a subject with an RBAC role, read it back, then tidy up. Needs a real,
     // reachable AD domain controller - enable_external_auth fails at the very first call
     // (DNS/LDAP/Kerberos) without one, so domain/admin_user/admin_password have to identify a real
-    // domain to join. new_user is the account to grant a role to; its subject identity is looked up
-    // against the directory just joined, so it has to be a real account there too. The simulator models
-    // a single-user, domain-less fake directory (hence the empty domain default) - override every one of
-    // these on a real pool.
+    // domain to join. Before joining, every host must resolve the domain (point its DNS at a domain
+    // controller) and keep its clock close to the DC's (Kerberos). Current Windows DCs want LDAPS
+    // (ldaps="true"), which also needs the pool to trust the DC's CA certificate
+    // (Pool.install_trusted_certificate with purpose "ldaps"). new_user is the account to grant a
+    // role to; its subject identity is looked up against the directory, so it has to be a real
+    // account there too. A pool already joined to this domain is used as it is - and left joined.
+    // The simulator models a single-user, domain-less fake directory (hence the empty domain
+    // default) - override every one of these on a real pool.
     private static void ManageAdUsers(string url, string user, string password, string domain = "",
-        string adminUser = "alice", string adminPassword = "Password1", string newUser = "alice")
+        string adminUser = "alice", string adminPassword = "Password1", string newUser = "alice",
+        string ldaps = "false")
     {
         var session = Connect(url, user, password);
         var pool = Pool.get_all(session)[0].opaque_ref;
-        Pool.enable_external_auth(session, pool,
-            new Dictionary<string, string> { ["user"] = adminUser, ["pass"] = adminPassword, ["ldaps"] = "false" },
-            domain, "AD");
-        Console.WriteLine($"Joined domain: {(string.IsNullOrEmpty(domain) ? "(none - simulator's fake directory)" : domain)}");
+        var coordinator = Pool.get_master(session, pool).opaque_ref;
+        var alreadyJoined = !string.IsNullOrEmpty(domain)
+            && Host.get_external_auth_type(session, coordinator) == "AD"
+            && string.Equals(Host.get_external_auth_service_name(session, coordinator), domain,
+                StringComparison.OrdinalIgnoreCase);
+        if (alreadyJoined)
+        {
+            Console.WriteLine($"Already joined to domain: {domain}");
+        }
+        else
+        {
+            Pool.enable_external_auth(session, pool,
+                new Dictionary<string, string> { ["user"] = adminUser, ["pass"] = adminPassword, ["ldaps"] = ldaps },
+                domain, "AD");
+            Console.WriteLine($"Joined domain: {(string.IsNullOrEmpty(domain) ? "(none - simulator's fake directory)" : domain)}");
+        }
 
         var subjectName = string.IsNullOrEmpty(domain) ? newUser : $"{newUser}@{domain}";
         var sid = Auth.get_subject_identifier(session, subjectName);
@@ -2092,7 +2233,13 @@ internal static class Program
 
         Subject.remove_from_roles(session, subject, adminRole);
         Subject.destroy(session, subject);
-        Pool.disable_external_auth(session, pool, new Dictionary<string, string>());
+        if (!alreadyJoined)
+        {
+            // Leave the way it was found. Passing the admin credentials also removes the pool's
+            // computer accounts from the directory; with {} they stay behind in AD.
+            Pool.disable_external_auth(session, pool,
+                new Dictionary<string, string> { ["user"] = adminUser, ["pass"] = adminPassword });
+        }
         Console.WriteLine("OK: manage-ad-users");
         session.logout();
     }
@@ -2164,8 +2311,8 @@ internal static class Program
         }).opaque_ref;
         var dc = new Dictionary<string, string>
         {
-            ["server"] = server,
-            ["serverpath"] = share,
+            // server is the share as one UNC path, //server/share: the SMB driver has no separate serverpath.
+            ["server"] = $"//{server}{share}",
             ["username"] = smbUsername,
             ["password_secret"] = Secret.get_uuid(session, secret),
         };
@@ -2185,7 +2332,8 @@ internal static class Program
     // probing with no SCSIid fails on purpose and lists every LUN the backend can see.
     //
     // SR.create formats the chosen LUN - this is destructive, so pick carefully on a real target.
-    private static void CreateHbaSr(string url, string user, string password, string srName = "sdk-example-hba")
+    private static void CreateHbaSr(string url, string user, string password, string scsiId = "",
+        string srName = "sdk-example-hba")
     {
         const long GiB = 1024L * 1024 * 1024;
         var session = Connect(url, user, password);
@@ -2193,8 +2341,11 @@ internal static class Program
 
         // The root element varies by backend; find BlockDevice entries by tag wherever they are.
         var devlistXml = XDocument.Parse(ProbeForFailure(session, host, new Dictionary<string, string>(), "lvmohba"));
-        var device = devlistXml.Descendants("BlockDevice").First();
-        var scsiId = device.Element("SCSIid")!.Value;
+        // SR.create formats the LUN: on shared FC storage name yours (scsiId); with none, the first is taken.
+        var device = devlistXml.Descendants("BlockDevice")
+                         .FirstOrDefault(d => scsiId == "" || d.Element("SCSIid")!.Value == scsiId)
+                     ?? throw new Exception($"no LUN with SCSIid {scsiId} is visible to this host");
+        scsiId = device.Element("SCSIid")!.Value;
         var path = device.Element("path")!.Value;
         Console.WriteLine($"Discovered LUN: SCSIid {scsiId} on {path}");
 
@@ -2212,13 +2363,14 @@ internal static class Program
     //   CreateHbaSr("https://xenserver", "root", password);
 
     // --- 51. Create an ISO library SR --------------------------------------------------
-    private static void CreateIsoSr(string url, string user, string password)
+    // Connect an ISO-library SR to a file share of ISO images (here an NFS export, location
+    // "server:/path").
+    private static void CreateIsoSr(string url, string user, string password, string location)
     {
         var session = Connect(url, user, password);
         var host = Host.get_all(session)[0].opaque_ref;
-        // Connect an ISO-library SR to a file share of ISO images (here an NFS export).
-        var dc = new Dictionary<string, string> { ["location"] = "192.0.2.10:/isos", ["type"] = "nfs_iso" };
-        var sr = SR.create(session, host, dc, 0, "sdk-iso-sr", "ISO library created by the SDK example",
+        var dc = new Dictionary<string, string> { ["location"] = location, ["type"] = "nfs_iso" };
+        var sr = SR.create(session, host, dc, 0, "sdk-example-iso", "ISO library created by the SDK example",
             "iso", "iso", true, new Dictionary<string, string>());
         Console.WriteLine($"Created ISO SR: {SR.get_uuid(session, sr)}");
         DetachAndForgetSr(session, sr);
@@ -2226,7 +2378,7 @@ internal static class Program
         session.logout();
     }
     // Run it:
-    //   CreateIsoSr("https://xenserver", "root", password);
+    //   CreateIsoSr("https://xenserver", "root", password, "192.0.2.10:/isos");
 
     // --- 52. Configure NRPE monitoring -------------------------------------------------
     private static void ConfigureNrpe(string url, string user, string password)
@@ -2323,7 +2475,9 @@ internal static class Program
         VM_appliance.start(session, vapp.opaque_ref, false);
         Console.WriteLine($"Started:        {VM.get_power_state(session, vm.opaque_ref)}");
 
-        VM_appliance.clean_shutdown(session, vapp.opaque_ref);
+        // shutdown tries each VM's clean shutdown and falls back to a hard one. clean_shutdown alone fails
+        // OPERATION_PARTIALLY_FAILED if any member can't shut down cleanly (no guest OS or PV drivers).
+        VM_appliance.shutdown(session, vapp.opaque_ref);
         Console.WriteLine($"Shut down:      {VM.get_power_state(session, vm.opaque_ref)}");
 
         VM.set_appliance(session, vm.opaque_ref, null);
@@ -2367,42 +2521,87 @@ internal static class Program
     // WLB_CONNECTION_REFUSED/WLB_CONNECTION_RESET if it can't connect - there is no way to fake this with
     // a placeholder. wlbHostPort is host:port, with no URL scheme - that is the real wire format
     // (xe pool-initialize-wlb wlb_url="10.x.x.x:30601" ...), not a URL.
+    //
+    // The pool checks the appliance's TLS certificate (pool.wlb_verify_cert), and only against the
+    // certificates installed with Pool.certificate_install - not install_trusted_certificate's. A fresh
+    // appliance has a self-signed one, so pass it as wlbCertificate (a PEM file): without it
+    // initialize_wlb fails with INTERNAL_ERROR "Connection failed: configuration failed." and no hint
+    // that the certificate is the reason.
     private static void WlbRecommendations(string url, string user, string password, string vmName,
-        string wlbHostPort = "wlb.example:8012", string wlbUsername = "wlbuser", string wlbPassword = "wlbpass")
+        string wlbHostPort = "wlb.example:8012", string wlbUsername = "wlbuser", string wlbPassword = "wlbpass",
+        string wlbCertificate = "")
     {
         var session = Connect(url, user, password);
         var poolRef = Pool.get_all(session)[0].opaque_ref;
 
+        var certName = "";
+        if (wlbCertificate != "")
+        {
+            certName = "sdk-example-wlb.pem";
+            Pool.certificate_install(session, certName, File.ReadAllText(wlbCertificate)); // pool-wide: no pool argument
+        }
         Pool.initialize_wlb(session, wlbHostPort, wlbUsername, wlbPassword, user, password);
-        Console.WriteLine($"WLB: {Pool.get_wlb_url(session, poolRef)}");
+        try
+        {
+            // Initializing connects the pool to the appliance but leaves balancing off: every WLB call
+            // after this would fail WLB_DISABLED until it's switched on.
+            Pool.set_wlb_enabled(session, poolRef, true);
+            Console.WriteLine($"WLB: {Pool.get_wlb_url(session, poolRef)}");
 
-        // Read BY POSITION, and the two calls do not share a shape. The pool's recommendations are keyed
-        // by VM and say where to move it: [0] "wlb", [1] the destination host's UUID (a uuid, not a ref),
-        // [2] and [3] ids, [4] the reason.
-        foreach (var entry in Pool.retrieve_wlb_recommendations(session))
-            Console.WriteLine($"  move {VM.get_name_label(session, entry.Key.opaque_ref)} " +
-                              $"-> host {entry.Value[1]} ({entry.Value[4]})");
+            // Read BY POSITION, and the two calls do not share a shape. The pool's recommendations are
+            // keyed by VM and say where to move it: [0] "wlb", [1] the destination host's UUID (a uuid,
+            // not a ref), [2] and [3] ids, [4] the reason.
+            foreach (var entry in Pool.retrieve_wlb_recommendations(session))
+                Console.WriteLine($"  move {VM.get_name_label(session, entry.Key.opaque_ref)} " +
+                                  $"-> host {entry.Value[1]} ({entry.Value[4]})");
 
-        // A VM's own recommendations are keyed by host and star-rate each as a destination:
-        // [0] "wlb", [1] the rating from 0.0 to 5.0.
-        var vm = VM.get_by_name_label(session, vmName)[0];
-        foreach (var entry in VM.retrieve_wlb_recommendations(session, vm.opaque_ref))
-            Console.WriteLine($"  {Host.get_name_label(session, entry.Key.opaque_ref)} " +
-                              $"rated {entry.Value[1]}");
+            // A VM's own recommendations are keyed by host and star-rate each as a destination:
+            // [0] "wlb", [1] the rating - higher is better (a real appliance rated hosts 6.1 here, so not
+            // capped at XenCenter's five stars). Right after connecting, the appliance is still
+            // discovering the pool: WLB_INTERNAL_ERROR 4024 ("Pool discovery has not been started"), 4025
+            // ("... has not been completed"), then 4016 ("WLB does not have current metrics") - keep asking.
+            var vm = VM.get_by_name_label(session, vmName)[0];
+            var deadline = DateTime.UtcNow.AddMinutes(10);
+            Dictionary<XenRef<Host>, string[]> vmRecs;
+            while (true)
+            {
+                try
+                {
+                    vmRecs = VM.retrieve_wlb_recommendations(session, vm.opaque_ref);
+                    break;
+                }
+                catch (Failure e)
+                {
+                    if (e.ErrorDescription[0] != "WLB_INTERNAL_ERROR" ||
+                        !new[] { "4024", "4025", "4016" }.Contains(e.ErrorDescription[1]) ||
+                        DateTime.UtcNow > deadline) throw;
+                    System.Threading.Thread.Sleep(15000);
+                }
+            }
+            foreach (var entry in vmRecs)
+                Console.WriteLine($"  {Host.get_name_label(session, entry.Key.opaque_ref)} " +
+                                  $"rated {entry.Value[1]}");
 
-        // The appliance's own settings are read and written as one flat map of strings. Send a
-        // nightly reporting schedule, then read the configuration back to confirm it took.
-        Pool.send_wlb_configuration(session, new Dictionary<string, string> { ["ReportingCronString"] = "0 3 * * *" });
-        var wlbConfig = Pool.retrieve_wlb_configuration(session);
-        Console.WriteLine("  appliance configuration: " +
-            string.Join(", ", wlbConfig.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value}")));
-
-        Pool.deconfigure_wlb(session);
+            // The appliance's own settings are read and written as one flat map of strings. Send a
+            // nightly reporting schedule, then read the configuration back to confirm it took.
+            Pool.send_wlb_configuration(session, new Dictionary<string, string> { ["ReportingCronString"] = "0 3 * * *" });
+            var wlbConfig = Pool.retrieve_wlb_configuration(session);
+            Console.WriteLine("  appliance configuration: " +
+                string.Join(", ", wlbConfig.OrderBy(kv => kv.Key).Select(kv => $"{kv.Key}={kv.Value}")));
+        }
+        finally
+        {
+            // Disconnect from the appliance however the above went, or the pool stays attached to it.
+            Pool.deconfigure_wlb(session);
+            if (certName != "") Pool.certificate_uninstall(session, certName);
+        }
         Console.WriteLine("OK: wlb-recommendations");
         session.logout();
     }
     // Run it:
-    //   WlbRecommendations("https://xenserver", "root", password, "web-01");
+    //   WlbRecommendations("https://xenserver", "root", password, "web-01",
+    //                       wlbHostPort: "10.0.0.5:30601", wlbUsername: "wlbuser", wlbPassword: "wlbpass",
+    //                       wlbCertificate: "wlb-appliance.pem");
 
     // --- Configure clustering (GFS2) ----------------------------------------------------------
     private static void ConfigureClustering(string url, string user, string password)
@@ -2463,7 +2662,7 @@ internal static class Program
         // Reconnect (with a bounded wait, the same way XenRT's own helper for this call does) before
         // touching the pool again, and re-resolve every ref from the fresh session rather than assuming
         // the old ones are still good.
-        session = ReconnectAfterMasterChange(url, user, password);
+        session = ReconnectAfterMasterChange(url, user, password, hosts[new XenRef<Host>(other)].uuid);
         poolRef = Pool.get_all(session)[0].opaque_ref;
         Console.WriteLine($"Promoted:    {Host.get_name_label(session, Pool.get_master(session, poolRef).opaque_ref)}");
 
@@ -2473,7 +2672,7 @@ internal static class Program
         Pool.designate_new_master(session, original);
         Console.WriteLine($"Restoring:   {hosts[new XenRef<Host>(original)].name_label} (reconnecting again)");
 
-        session = ReconnectAfterMasterChange(url, user, password);
+        session = ReconnectAfterMasterChange(url, user, password, hosts[new XenRef<Host>(original)].uuid);
         poolRef = Pool.get_all(session)[0].opaque_ref;
         Console.WriteLine($"Restored:    {Host.get_name_label(session, Pool.get_master(session, poolRef).opaque_ref)}");
 
@@ -2498,6 +2697,9 @@ internal static class Program
         var spares = PIF.get_all_records(session)
             .Where(p => p.Value.host.opaque_ref == host && !p.Value.management && p.Value.physical)
             .Take(2).Select(p => p.Key).ToList();
+        if (spares.Count < 2)
+            throw new Exception($"{Host.get_name_label(session, host)} has {spares.Count} spare NIC(s); " +
+                                 "a bond needs two that aren't the management interface");
         Console.WriteLine($"Bonding:      {string.Join(", ", spares.Select(p => PIF.get_device(session, p.opaque_ref)))}");
 
         // The bond needs a network to sit on.
@@ -2524,11 +2726,23 @@ internal static class Program
     //   CreateBond("https://xenserver", "root", password);
 
     // --- Configure PVS Accelerator -----------------------------------------------------
-    private static void ConfigurePvsAccelerator(string url, string user, string password)
+    private static void ConfigurePvsAccelerator(string url, string user, string password, string vmName)
     {
         var session = Connect(url, user, password);
 
-        var site = PVS_site.introduce(session, "sdk-pvs-farm", "Created by the SDK examples", "");
+        // Check the VM first, before creating anything: it needs a NIC for the proxy to sit on, and one
+        // that no site accelerates yet (a VIF takes one proxy: PVS_PROXY_ALREADY_PRESENT). It need not be
+        // running - a proxy on a halted VM just reports "stopped" until it starts.
+        var vm = VmByName(session, vmName);
+        var vifs = VM.get_VIFs(session, vm)
+            .OrderBy(r => int.Parse(VIF.get_device(session, r.opaque_ref))).ToList();
+        if (vifs.Count == 0) throw new Exception($"{vmName} has no network interface to accelerate");
+        foreach (var existing in PVS_proxy.get_all_records(session).Values)
+            if (existing.VIF.opaque_ref == vifs[0].opaque_ref)
+                throw new Exception($"{vmName} is already accelerated by site " +
+                                    $"'{PVS_site.get_name_label(session, existing.site)}'");
+
+        var site = PVS_site.introduce(session, "sdk-example-pvs", "Created by the SDK examples", "");
         PVS_server.introduce(session, new[] { "10.62.0.90" }, 6910, 6930, site);
 
         // The read cache must be on LOCAL storage. The point of the accelerator is to keep reads off
@@ -2546,20 +2760,17 @@ internal static class Program
             });
         }
 
-        // A proxy may only sit on the VM's LOWEST-numbered NIC, so sort by device rather than taking
-        // VIFs[0] — the list comes back in creation order, which is the same thing only by luck.
-        var vm = FirstUnacceleratedGuest(session);
-        var vif = VM.get_VIFs(session, vm.opaque_ref)
-            .OrderBy(r => int.Parse(VIF.get_device(session, r.opaque_ref)))
-            .First();
-        var proxy = PVS_proxy.create(session, site, vif.opaque_ref);
+        // A proxy may only sit on the VM's LOWEST-numbered NIC, hence sorting by device above rather
+        // than taking VIFs[0] — the list comes back in creation order, which is the same thing only by
+        // luck.
+        var proxy = PVS_proxy.create(session, site, vifs[0].opaque_ref);
 
         var record = PVS_site.get_record(session, site);
         Console.WriteLine($"Site '{record.name_label}' with {record.cache_storage.Count} cache(s) "
                           + $"and {record.servers.Count} server(s)");
         // "caching" means it is actually accelerating. A site with no cache storage reports
         // "initialised", and a proxy on a VM whose NIC is unplugged reports "stopped".
-        Console.WriteLine($"  {vm.name_label}: {PVS_proxy.get_status(session, proxy)}");
+        Console.WriteLine($"  {VM.get_name_label(session, vm)}: {PVS_proxy.get_status(session, proxy)}");
 
         // Forgetting the site only cascades its cache storage - a running proxy or a server it still has
         // makes forget refuse with PVS_SITE_CONTAINS_RUNNING_PROXIES/_SERVERS, so tear those down
@@ -2571,7 +2782,7 @@ internal static class Program
         session.logout();
     }
     // Run it:
-    //   ConfigurePvsAccelerator("https://xenserver", "root", password);
+    //   ConfigurePvsAccelerator("https://xenserver", "root", password, "db-01");
 
     /// <summary>The host's own non-ISO storage, found through its PBDs.</summary>
     private static string LocalSr(Session session, XenRef<Host> host)
@@ -2586,30 +2797,6 @@ internal static class Program
                 return srRef.opaque_ref;
         }
         return null;
-    }
-
-    /// <summary>
-    /// A running guest with a NIC that no proxy already covers. A VIF can carry only one proxy, so a VM
-    /// the pool already accelerates fails with PVS_PROXY_ALREADY_PRESENT.
-    /// </summary>
-    private static VM FirstUnacceleratedGuest(Session session)
-    {
-        var taken = new HashSet<string>();
-        foreach (var proxyRef in PVS_proxy.get_all(session))
-        {
-            var vifRef = PVS_proxy.get_VIF(session, proxyRef.opaque_ref);
-            taken.Add(VIF.get_VM(session, vifRef.opaque_ref).opaque_ref);
-        }
-        foreach (var kv in VM.get_all_records(session))
-        {
-            var v = kv.Value;
-            if (v.is_a_template || v.is_control_domain || v.is_a_snapshot) continue;
-            if (v.power_state != vm_power_state.Running || v.VIFs.Count == 0) continue;
-            if (taken.Contains(kv.Key.opaque_ref)) continue;
-            v.opaque_ref = kv.Key.opaque_ref;
-            return v;
-        }
-        throw new Exception("no unaccelerated running guest with a NIC");
     }
 
     // --- Manage SSH access -------------------------------------------------------------
@@ -2754,73 +2941,93 @@ internal static class Program
     }
 
     // --- Export and import a VM ---------------------------------------------------------
-    private static void ExportImportVm(string url, string user, string password)
+    private static void ExportImportVm(string url, string user, string password, string vmName)
     {
         var session = Connect(url, user, password);
 
-        // Only a halted VM can be exported: its disks must not be changing underneath the copy.
-        var vm = VM.get_all_records(session).First(kv =>
-            !kv.Value.is_a_template && !kv.Value.is_control_domain && !kv.Value.is_a_snapshot &&
-            kv.Value.power_state == vm_power_state.Halted);
-        Console.WriteLine($"Exporting {vm.Value.name_label}");
+        // Name the VM: an export carries every block of its disks, so which VM matters (a large one
+        // takes a long time, and fills the disk). Only a halted VM can be exported: its disks must not
+        // be changing underneath the copy.
+        var vm = VmByName(session, vmName);
+        if (VM.get_power_state(session, vm) != vm_power_state.Halted)
+            throw new Exception($"{vmName} must be halted to be exported");
+        Console.WriteLine($"Exporting {vmName}");
 
         // Export and import are HTTP transfers alongside the API, not API calls, so the session id
         // travels in the query string.
         // A unique file, not a fixed name: an export is a real file on disk and two of them running at
         // once would otherwise fight over it.
         var path = Path.Combine(Path.GetTempPath(), $"sdk-example-export-{Guid.NewGuid():N}.xva");
-        using (var client = InsecureHttpClient())
-        {
-            var uuid = VM.get_uuid(session, vm.Key.opaque_ref);
-            var bytes = client.GetByteArrayAsync(
-                $"{url}/export?session_id={session.opaque_ref}&uuid={uuid}").Result;
-            File.WriteAllBytes(path, bytes);
-            Console.WriteLine($"  wrote {bytes.Length / (1024.0 * 1024):F1} MiB to {Path.GetFileName(path)}");
-        }
-
-        // An XVA is a tar: ova.xml describes the VM, and the disk blocks follow in 1 MiB pieces, each
-        // with its own checksum.
-        var names = new List<string>();
-        using (var reader = new System.Formats.Tar.TarReader(File.OpenRead(path)))
-            while (reader.GetNextEntry() is { } entry) names.Add(entry.Name);
-        Console.WriteLine($"  archive holds {names[0]} and "
-                          + $"{names.Count(n => !n.EndsWith(".checksum")) - 1} disk block(s)");
-
-        // The imported VM's ref is NOT in the /import response body on a real host (only this simulator's
-        // convenience echoes it there). Create a task first, append &task_id=<task> to the /import URL,
-        // poll the task, and parse the ref out of task.get_result() (same <value>...</value> string-strip
-        // wait-for-task already uses).
-        var task = Task.create(session, "vm_import", $"importing {vm.Value.name_label} back").opaque_ref;
-        string imported;
         try
         {
+            // Stream both directions: a real VM's export is gigabytes, too large to hold in memory.
             using (var client = InsecureHttpClient())
             {
-                var response = client.PutAsync(
-                    $"{url}/import?session_id={session.opaque_ref}&task_id={task}",
-                    new ByteArrayContent(File.ReadAllBytes(path))).Result;
+                var uuid = VM.get_uuid(session, vm);
+                using var response = client.GetAsync(
+                    $"{url}/export?session_id={session.opaque_ref}&uuid={uuid}",
+                    HttpCompletionOption.ResponseHeadersRead).Result;
                 response.EnsureSuccessStatusCode();
+                using (var httpStream = response.Content.ReadAsStreamAsync().Result)
+                using (var fileStream = File.Create(path))
+                    httpStream.CopyTo(fileStream);
             }
+            Console.WriteLine($"  wrote {new FileInfo(path).Length / (1024.0 * 1024):F1} MiB to "
+                              + $"{Path.GetFileName(path)}");
 
-            while (Task.get_status(session, task) == task_status_type.pending)
-                System.Threading.Thread.Sleep(500);
-            if (Task.get_status(session, task) != task_status_type.success)
-                throw new Exception($"import failed: {string.Join(", ", Task.get_error_info(session, task))}");
-            imported = Task.get_result(session, task).Replace("<value>", "").Replace("</value>", "").Trim();
+            // An XVA is a tar: ova.xml describes the VM, and the disk blocks follow in 1 MiB pieces, each
+            // with its own checksum.
+            var names = new List<string>();
+            using (var reader = new System.Formats.Tar.TarReader(File.OpenRead(path)))
+                while (reader.GetNextEntry() is { } entry) names.Add(entry.Name);
+            Console.WriteLine($"  archive holds {names[0]} and "
+                              + $"{names.Count(n => !n.EndsWith(".checksum")) - 1} disk block(s)");
+
+            // The imported VM's ref is NOT in the /import response body on a real host (only this
+            // simulator's convenience echoes it there). Create a task first, append &task_id=<task> to
+            // the /import URL, poll the task, and parse the ref out of task.get_result() (same
+            // <value>...</value> string-strip wait-for-task already uses).
+            var task = Task.create(session, "vm_import", $"importing {vmName} back").opaque_ref;
+            string imported;
+            try
+            {
+                using (var client = InsecureHttpClient())
+                using (var fileStream = File.OpenRead(path))
+                {
+                    var response = client.PutAsync(
+                        $"{url}/import?session_id={session.opaque_ref}&task_id={task}",
+                        new StreamContent(fileStream)).Result;
+                    response.EnsureSuccessStatusCode();
+                }
+
+                while (Task.get_status(session, task) == task_status_type.pending)
+                    System.Threading.Thread.Sleep(500);
+                if (Task.get_status(session, task) != task_status_type.success)
+                    throw new Exception($"import failed: {string.Join(", ", Task.get_error_info(session, task))}");
+                // The result lists the imported VMs (<value><array><data>OpaqueRef:...</data></array></value>
+                // on a real host), so take the first reference in it.
+                imported = System.Text.RegularExpressions.Regex.Match(
+                    Task.get_result(session, task), "OpaqueRef:[^<]+").Value;
+            }
+            finally
+            {
+                Task.destroy(session, task);
+            }
+            Console.WriteLine($"  imported as {VM.get_name_label(session, imported)}");
+
+            DestroyVmAndDisks(session, imported);
+            Console.WriteLine("OK: export-import-vm");
         }
         finally
         {
-            Task.destroy(session, task);
+            // Always clean up the file, on failure too: a real export is gigabytes, not worth leaving
+            // behind in %TEMP%.
+            File.Delete(path);
         }
-        Console.WriteLine($"  imported as {VM.get_name_label(session, imported)}");
-
-        DestroyVmAndDisks(session, imported);
-        File.Delete(path);
-        Console.WriteLine("OK: export-import-vm");
         session.logout();
     }
     // Run it:
-    //   ExportImportVm("https://xenserver", "root", password);
+    //   ExportImportVm("https://xenserver", "root", password, "db-01");
 
     /// <summary>An HTTP client that accepts the host's self-signed certificate, as Connect does.</summary>
     private static HttpClient InsecureHttpClient() =>
@@ -2939,14 +3146,21 @@ internal static class Program
         var hostUrl = HostUrl(url, Host.get_address(session, host));
         Console.WriteLine($"Backing up {Host.get_name_label(session, host)}");
 
+        // Stream it: a real host's backup can be hundreds of MB, too large to hold in memory (and,
+        // unlike Python's binding, each XenAPI call below opens its own fresh HttpClient - see
+        // RestoreHostConfig - so there's no idle keep-alive connection here that needs dropping first).
         var path = Path.Combine(Path.GetTempPath(), $"sdk-example-host-{Guid.NewGuid():N}.backup");
         using (var client = InsecureHttpClient())
         {
-            var bytes = client.GetByteArrayAsync(
-                $"{hostUrl}/host_backup?session_id={session.opaque_ref}&ref={host}").Result;
-            File.WriteAllBytes(path, bytes);
-            Console.WriteLine($"  wrote {bytes.Length} bytes to {Path.GetFileName(path)}");
+            using var response = client.GetAsync(
+                $"{hostUrl}/host_backup?session_id={session.opaque_ref}&ref={host}",
+                HttpCompletionOption.ResponseHeadersRead).Result;
+            response.EnsureSuccessStatusCode();
+            using (var httpStream = response.Content.ReadAsStreamAsync().Result)
+            using (var fileStream = File.Create(path))
+                httpStream.CopyTo(fileStream);
         }
+        Console.WriteLine($"  wrote {new FileInfo(path).Length} bytes to {Path.GetFileName(path)}");
 
         Console.WriteLine($"  restoring it to {Host.get_name_label(session, host)}: "
                           + RestoreHostConfig(session, hostUrl, host, path));
@@ -2990,11 +3204,17 @@ internal static class Program
         var task = Task.create(session, "host_restore", "restoring a configuration backup").opaque_ref;
         try
         {
+            // Stream the upload too, rather than reading the whole backup into memory first. Every
+            // XenAPI call this binding makes (including task.create/get_status below) opens a brand new
+            // HttpClient and tears it down again - unlike Python's single long-lived xmlrpc.client
+            // connection, there is no idle keep-alive connection here left over from the transfer that
+            // would need to be dropped before the next call.
             using (var client = InsecureHttpClient())
+            using (var fileStream = File.OpenRead(path))
             {
                 var response = client.PutAsync(
                     $"{hostUrl}/host_restore?session_id={session.opaque_ref}&ref={host}&task_id={task}",
-                    new ByteArrayContent(File.ReadAllBytes(path))).Result;
+                    new StreamContent(fileStream)).Result;
                 response.EnsureSuccessStatusCode();
             }
 
@@ -3124,18 +3344,23 @@ internal static class Program
         // whether it may contain personal data, so a client can offer an informed choice rather than
         // hard-coding the list.
         var keys = new List<string>();
+        var defaults = new List<string>();
         foreach (var capability in XDocument.Parse(
                      Host.get_system_status_capabilities(session, host)).Root!.Elements())
         {
-            keys.Add((string)capability.Attribute("key")!);
-            Console.WriteLine($"  {(string)capability.Attribute("key")!,-22} "
+            var key = (string)capability.Attribute("key")!;
+            keys.Add(key);
+            if ((string)capability.Attribute("default-checked")! == "yes") defaults.Add(key);
+            Console.WriteLine($"  {key,-22} "
                               + $"max {(string)capability.Attribute("max-size")!,9} bytes  "
                               + $"default={(string)capability.Attribute("default-checked")!,-3} "
                               + $"pii={(string)capability.Attribute("pii")!}");
         }
 
-        var whole = FetchStatusReport(session, url, keys);
-        Console.WriteLine($"everything ({keys.Count} sections): {whole} bytes");
+        // Take the sections the host marks default-checked, as XenCenter's dialog does: asking for every
+        // section can mean gigabytes (VM memory dumps, every log) and a long wait while the host builds it.
+        var whole = FetchStatusReport(session, url, defaults);
+        Console.WriteLine($"default sections ({defaults.Count} of {keys.Count}): {whole} bytes");
 
         // Pick a real, small section from the host's own catalogue rather than assuming a name: the
         // catalogue is server-defined (xen-bugtool's own --capabilities output), not a fixed client
@@ -3150,16 +3375,33 @@ internal static class Program
         session.logout();
     }
 
-    /// <summary>Download the bundle for the given capability keys (a tar archive) and report its size.</summary>
-    private static int FetchStatusReport(Session session, string url, IEnumerable<string> entries)
+    /// <summary>
+    /// Download the bundle for the given capability keys (a tar archive) to a temp file, streaming it - a
+    /// report can be large - and return its size. This example then deletes it; you'd keep it.
+    /// </summary>
+    private static long FetchStatusReport(Session session, string url, IEnumerable<string> entries)
     {
-        using var client = InsecureHttpClient();
-        // A full report (all sections) can take well over the default 5-minute client timeout on a real
-        // host with a lot to report on; this download alone gets a much longer allowance.
-        client.Timeout = TimeSpan.FromMinutes(30);
-        return client.GetByteArrayAsync(
-            $"{url}/system-status?session_id={session.opaque_ref}&output=tar"
-            + $"&entries={string.Join(",", entries)}").Result.Length;
+        var path = Path.Combine(Path.GetTempPath(), $"sdk-example-status-{Guid.NewGuid():N}.tar");
+        try
+        {
+            using var client = InsecureHttpClient();
+            // A full report (all sections) can take well over the default 5-minute client timeout on a
+            // real host with a lot to report on; this download alone gets a much longer allowance.
+            client.Timeout = TimeSpan.FromMinutes(30);
+            using var response = client.GetAsync(
+                $"{url}/system-status?session_id={session.opaque_ref}&output=tar"
+                + $"&entries={string.Join(",", entries)}",
+                HttpCompletionOption.ResponseHeadersRead).Result;
+            response.EnsureSuccessStatusCode();
+            using (var httpStream = response.Content.ReadAsStreamAsync().Result)
+            using (var fileStream = File.Create(path))
+                httpStream.CopyTo(fileStream);
+            return new FileInfo(path).Length;
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
     // Run it:
     //   ServerStatusReport("https://xenserver", "root", password);
@@ -3309,12 +3551,13 @@ internal static class Program
         Console.WriteLine($"  evacuated:  guests={GuestCount(session, host)}");
 
         Host.reboot(session, host);
-        // A real reboot takes minutes; a production tool would poll host_metrics/boot_time for as long as
-        // XenRT's own waitForEnabled() does (up to 900s). This demo waits only long enough for the reboot
-        // to get underway, then explicitly re-enables - disabling does not clear itself, not even across
-        // a reboot, so nothing else re-enables the host for us.
-        System.Threading.Thread.Sleep(5000);
-        Host.enable(session, host);
+        // A real reboot takes minutes. Wait for the host to drop out and come back (live in its
+        // host_metrics), then enable it. A host disabled the default way (auto_enable=true) re-enables
+        // itself once its toolstack is up again, but only then - and one disabled with auto_enable=false
+        // never does - so enable it explicitly rather than depend on either.
+        WaitForHostLive(session, host, false, 600);
+        WaitForHostLive(session, host, true, 1200, 10);
+        EnableWhenBooted(session, host);
         Console.WriteLine($"  rebooted, re-enabled: enabled={Host.get_enabled(session, host)}");
 
         // The other ending: off, and back on out of band - but only demonstrated if that is actually
@@ -3327,9 +3570,9 @@ internal static class Program
             WaitForHostLive(session, host, false);
             Console.WriteLine($"  shut down:  live={HostLive(session, host)}");
             Host.power_on(session, host);
-            WaitForHostLive(session, host, true);
+            WaitForHostLive(session, host, true, 1200, 10);
             Console.WriteLine($"  powered on: live={HostLive(session, host)}");
-            Host.enable(session, host);
+            EnableWhenBooted(session, host);
             Console.WriteLine($"  re-enabled: enabled={Host.get_enabled(session, host)}");
         }
         else
@@ -3432,6 +3675,7 @@ internal static class Program
         VM = new XenRef<VM>(vm),
         VDI = new XenRef<VDI>(vdi),
         userdevice = VM.get_allowed_VBD_devices(session, vm).First(),
+        bootable = false,
         mode = vbd_mode.RW,
         type = vbd_type.Disk,
         empty = false,
@@ -3650,12 +3894,17 @@ internal static class Program
 
         // Select a variant explicitly. It becomes the selected one immediately; whether it is also
         // active depends on whether the hardware is present and the driver already loaded.
-        // Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE),
-        // and variant order isn't guaranteed to put the usable one first.
-        var (chosenRef, chosen) = drivers[0];
-        var variant = chosen.variants
-            .FirstOrDefault(v => Driver_variant.get_hardware_present(session, v.opaque_ref))
-            ?.opaque_ref ?? chosen.variants[0].opaque_ref;
+        // Host_driver.select refuses a variant whose hardware isn't present (HOST_DRIVER_NO_HARDWARE) -
+        // and a host lists drivers for plenty of devices it doesn't have - so pick a driver for
+        // hardware this host actually has, and one of its variants that is usable.
+        var usable = drivers
+            .SelectMany(kv => kv.Value.variants.Select(v => (driverRef: kv.Key, variant: v)))
+            .Where(p => Driver_variant.get_hardware_present(session, p.variant.opaque_ref))
+            .ToList();
+        if (usable.Count == 0)
+            throw new Exception($"no driver on {Host.get_name_label(session, host)} has a variant for hardware it has");
+        var (chosenRef, chosenVariant) = usable[0];
+        var variant = chosenVariant.opaque_ref;
         Host_driver.select(session, chosenRef.opaque_ref, variant);
         var after = Host_driver.get_record(session, chosenRef.opaque_ref);
         Console.WriteLine($"  {after.name}: selected {VariantName(session, after.selected_variant.opaque_ref)}, " +
@@ -3694,9 +3943,9 @@ internal static class Program
         },
         ["manage-vm-disks"] = (u, n, p, ov) =>
         {
-            var d = Merge(new() { ["template_name"] = "Rocky Linux 8", ["sr_name"] = "Shared NFS",
+            var d = Merge(new() { ["source_vm"] = "web-01", ["sr_name"] = "Shared NFS",
                                    ["new_vm_name"] = "sdk-example-vm-disks" }, ov);
-            ManageVmDisks(u, n, p, d["template_name"], d["sr_name"], d["new_vm_name"]);
+            ManageVmDisks(u, n, p, d["source_vm"], d["sr_name"], d["new_vm_name"]);
         },
         ["dismiss-alerts"] = (u, n, p, ov) => DismissAlerts(u, n, p),
         ["host-power-on"] = (u, n, p, ov) => HostPowerOn(u, n, p),
@@ -3777,7 +4026,12 @@ internal static class Program
             var d = Merge(new() { ["vm_name"] = "web-01" }, ov);
             TagsAndFolders(u, n, p, d["vm_name"]);
         },
-        ["configure-updates"] = (u, n, p, ov) => ConfigureUpdates(u, n, p),
+        ["configure-updates"] = (u, n, p, ov) =>
+        {
+            var d = Merge(new() { ["repo_url"] = "https://repo.ops.xenserver.com/xs9",
+                                   ["source_url"] = "https://repo-src.ops.xenserver.com/xs9" }, ov);
+            ConfigureUpdates(u, n, p, d["repo_url"], d["source_url"]);
+        },
         ["clone-vm"] = (u, n, p, ov) =>
         {
             var d = Merge(new() { ["vm_name"] = "db-01", ["clone_name"] = "sdk-example-clone" }, ov);
@@ -3793,7 +4047,12 @@ internal static class Program
             var d = Merge(new() { ["source_vm"] = "web-01", ["new_vm_name"] = "sdk-example-storagemigrate" }, ov);
             StorageMigrate(u, n, p, d["source_vm"], d["new_vm_name"]);
         },
-        ["apply-update"] = (u, n, p, ov) => ApplyUpdate(u, n, p),
+        ["apply-update"] = (u, n, p, ov) =>
+        {
+            var d = Merge(new() { ["repo_url"] = "https://repo.ops.xenserver.com/xs9",
+                                   ["source_url"] = "https://repo-src.ops.xenserver.com/xs9" }, ov);
+            ApplyUpdate(u, n, p, d["repo_url"], d["source_url"]);
+        },
         ["checkpoint-vm"] = (u, n, p, ov) =>
         {
             var d = Merge(new() { ["source_vm"] = "web-01", ["new_vm_name"] = "sdk-example-checkpoint" }, ov);
@@ -3855,12 +4114,25 @@ internal static class Program
             var d = Merge(new() { ["vm_name"] = "web-01" }, ov);
             FindByUuid(u, n, p, d["vm_name"]);
         },
-        ["rolling-pool-update"] = (u, n, p, ov) => RollingPoolUpdate(u, n, p),
+        ["rolling-pool-update"] = (u, n, p, ov) =>
+        {
+            var d = Merge(new() { ["repo_url"] = "https://repo.ops.xenserver.com/xs9",
+                                   ["source_url"] = "https://repo-src.ops.xenserver.com/xs9" }, ov);
+            RollingPoolUpdate(u, n, p, d["repo_url"], d["source_url"]);
+        },
         ["pvs-accelerator"] = (u, n, p, ov) => PvsAccelerator(u, n, p),
-        ["configure-pvs-accelerator"] = (u, n, p, ov) => ConfigurePvsAccelerator(u, n, p),
+        ["configure-pvs-accelerator"] = (u, n, p, ov) =>
+        {
+            var d = Merge(new() { ["vm_name"] = "db-01" }, ov);
+            ConfigurePvsAccelerator(u, n, p, d["vm_name"]);
+        },
         ["manage-ssh-access"] = (u, n, p, ov) => ManageSshAccess(u, n, p),
         ["manage-vtpm"] = (u, n, p, ov) => ManageVtpm(u, n, p),
-        ["export-import-vm"] = (u, n, p, ov) => ExportImportVm(u, n, p),
+        ["export-import-vm"] = (u, n, p, ov) =>
+        {
+            var d = Merge(new() { ["vm_name"] = "db-01" }, ov);
+            ExportImportVm(u, n, p, d["vm_name"]);
+        },
         ["configure-dynamic-memory"] = (u, n, p, ov) => ConfigureDynamicMemory(u, n, p),
         ["manage-vm-media"] = (u, n, p, ov) => ManageVmMedia(u, n, p),
         ["backup-host-config"] = (u, n, p, ov) => BackupHostConfig(u, n, p),
@@ -3898,8 +4170,8 @@ internal static class Program
         ["manage-ad-users"] = (u, n, p, ov) =>
         {
             var d = Merge(new() { ["domain"] = "", ["admin_user"] = "alice", ["admin_password"] = "Password1",
-                                   ["new_user"] = "alice" }, ov);
-            ManageAdUsers(u, n, p, d["domain"], d["admin_user"], d["admin_password"], d["new_user"]);
+                                   ["new_user"] = "alice", ["ldaps"] = "false" }, ov);
+            ManageAdUsers(u, n, p, d["domain"], d["admin_user"], d["admin_password"], d["new_user"], d["ldaps"]);
         },
         ["create-iscsi-sr"] = (u, n, p, ov) =>
         {
@@ -3919,10 +4191,14 @@ internal static class Program
         },
         ["create-hba-sr"] = (u, n, p, ov) =>
         {
-            var d = Merge(new() { ["sr_name"] = "sdk-example-hba" }, ov);
-            CreateHbaSr(u, n, p, d["sr_name"]);
+            var d = Merge(new() { ["scsi_id"] = "", ["sr_name"] = "sdk-example-hba" }, ov);
+            CreateHbaSr(u, n, p, d["scsi_id"], d["sr_name"]);
         },
-        ["create-iso-sr"] = (u, n, p, ov) => CreateIsoSr(u, n, p),
+        ["create-iso-sr"] = (u, n, p, ov) =>
+        {
+            var d = Merge(new() { ["location"] = "192.0.2.10:/isos" }, ov);
+            CreateIsoSr(u, n, p, d["location"]);
+        },
         ["configure-nrpe"] = (u, n, p, ov) => ConfigureNrpe(u, n, p),
         ["configure-snmp"] = (u, n, p, ov) =>
         {
@@ -3945,8 +4221,10 @@ internal static class Program
         ["wlb-recommendations"] = (u, n, p, ov) =>
         {
             var d = Merge(new() { ["vm_name"] = "web-01", ["wlb_host_port"] = "wlb.example:8012",
-                                   ["wlb_username"] = "wlbuser", ["wlb_password"] = "wlbpass" }, ov);
-            WlbRecommendations(u, n, p, d["vm_name"], d["wlb_host_port"], d["wlb_username"], d["wlb_password"]);
+                                   ["wlb_username"] = "wlbuser", ["wlb_password"] = "wlbpass",
+                                   ["wlb_certificate"] = "" }, ov);
+            WlbRecommendations(u, n, p, d["vm_name"], d["wlb_host_port"], d["wlb_username"], d["wlb_password"],
+                                d["wlb_certificate"]);
         },
         ["configure-pool-options"] = (u, n, p, ov) => ConfigurePoolOptions(u, n, p),
         ["configure-console-access"] = (u, n, p, ov) => ConfigureConsoleAccess(u, n, p),
@@ -3962,16 +4240,20 @@ internal static class Program
     private static int Main(string[] args)
     {
         // cross-pool-copy-vm is the one workflow that spans two pools, so it takes an extra 5th
-        // argument: the destination pool URL. Every other workflow uses the uniform 4-arg contract.
+        // argument: the destination pool URL, then optionally that pool's credentials (if they differ
+        // from the source's) and the VM to copy. Every other workflow uses the uniform 4-arg contract.
         if (args.Length >= 1 && args[0] == "cross-pool-copy-vm")
         {
-            if (args.Length != 5)
+            if (args.Length != 5 && args.Length != 7 && args.Length != 8)
             {
                 Console.Error.WriteLine(
-                    "usage: XenSdkExamples.CSharp cross-pool-copy-vm <sourceUrl> <user> <password> <destUrl>");
+                    "usage: XenSdkExamples.CSharp cross-pool-copy-vm <sourceUrl> <user> <password> <destUrl>" +
+                    " [<destUser> <destPassword> [<vmName>]]");
                 return 2;
             }
-            CrossPoolCopyVm(args[1], args[2], args[3], args[4]);
+            CrossPoolCopyVm(args[1], args[2], args[3], args[4],
+                args.Length == 8 ? args[7] : "db-01",
+                args.Length >= 7 ? args[5] : null, args.Length >= 7 ? args[6] : null);
             return 0;
         }
 
