@@ -67,7 +67,8 @@ xe() {
     # xe reports a failure on stdout. Captured by $(...), that text would land in the variable and set -e
     # would then stop the script without saying why, so pass a failure's output on to stderr instead.
     local out rc=0
-    out=$("${XE_EXE:-xe}" -s "$host" "${xe_opts[@]}" -u "$user" -pw "$pass" "$@") || rc=$?
+    # `command`: when XE_EXE is unset, plain "xe" would be this function calling itself, without end.
+    out=$(command "${XE_EXE:-xe}" -s "$host" "${xe_opts[@]}" -u "$user" -pw "$pass" "$@") || rc=$?
     if [ $rc -ne 0 ]; then [ -z "$out" ] || printf '%s\n' "$out" >&2; return $rc; fi
     [ -z "$out" ] || printf '%s\n' "$out"
 }
@@ -2304,7 +2305,7 @@ w_disaster_recovery() {
     dr_opts=()
     if [ "$dr_hp" != "$dr_host" ] && [ "${dr_hp##*:}" != 443 ]; then dr_opts=(-p $((${dr_hp##*:} + 1))); fi
     case "${XE_EXE:-xe}" in *.exe | *.EXE) dr_opts+=(-no-warn-new-certificates -no-warn-certificates) ;; esac
-    xe_dr() { "${XE_EXE:-xe}" -s "$dr_host" "${dr_opts[@]}" -u "$user" -pw "$pass" "$@"; }
+    xe_dr() { command "${XE_EXE:-xe}" -s "$dr_host" "${dr_opts[@]}" -u "$user" -pw "$pass" "$@"; }
     # Follow HOST_IS_SLAVE on the standby pool too, the same one-time probe the main connection does.
     dr_probe=$(xe_dr pool-list --minimal 2>&1) || true
     if [[ $dr_probe =~ (Master|Coordinator)\ IP\ address:\ ([0-9A-Fa-f.:]+) ]]; then dr_host=${BASH_REMATCH[2]}; fi
