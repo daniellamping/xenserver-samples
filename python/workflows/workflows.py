@@ -2314,7 +2314,7 @@ def manage_vapp(url, username, password, vm_name):
 
 
 # Run it:
-#   manage_vapp("https://xenserver", "root", password, "web-01")
+#   manage_vapp("https://xenserver", "root", password, "db-01")
 
 
 # --- Attach a USB device to a VM -------------------------------------------------------
@@ -3850,7 +3850,7 @@ WORKFLOWS = {
     "configure-clustering": _wf(configure_clustering),
     "manage-pool-membership": _wf(manage_pool_membership),
     "create-bond": _wf(create_bond),
-    "manage-vapp": _wf(manage_vapp, vm_name="web-01"),
+    "manage-vapp": _wf(manage_vapp, vm_name="db-01"),
     "attach-usb-device": _wf(attach_usb_device, vm_name="web-01"),
     "wlb-recommendations": _wf(wlb_recommendations, vm_name="web-01", wlb_host_port="wlb.example:8012",
                                wlb_username="wlbuser", wlb_password="wlbpass"),

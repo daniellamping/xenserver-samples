@@ -1563,7 +1563,8 @@ w_configure_snmp() {
 # --- Manage a vApp ---------------------------------------------------------------------
 w_manage_vapp() {
     local vm_uuid vapp_uuid
-    vm_uuid=$(xe vm-list name-label=web-01 --minimal)
+    # A halted VM: an appliance starts only if one of its VMs is halted (OPERATION_NOT_ALLOWED otherwise).
+    vm_uuid=$(xe vm-list name-label="$(param vm_name db-01)" --minimal)
     vapp_uuid=$(xe appliance-create name-label=sdk-example-vapp \
         name-description="Created by the SDK example")
 

@@ -2572,7 +2572,7 @@ public class Workflows {
         }
     }
     // Run it:
-    //   manageVapp("https://xenserver", "root", password, "web-01");
+    //   manageVapp("https://xenserver", "root", password, "db-01");
 
     // --- Attach a USB device to a VM -------------------------------------------------
     private static void attachUsbDevice(String url, String user, String password, String vmName)
@@ -4324,7 +4324,7 @@ public class Workflows {
         d.put("configure-clustering", mapOf());
         d.put("manage-pool-membership", mapOf());
         d.put("create-bond", mapOf());
-        d.put("manage-vapp", mapOf("vm_name", "web-01"));
+        d.put("manage-vapp", mapOf("vm_name", "db-01"));
         d.put("attach-usb-device", mapOf("vm_name", "web-01"));
         d.put("wlb-recommendations", mapOf("vm_name", "web-01", "wlb_host_port", "wlb.example:8012",
                 "wlb_username", "wlbuser", "wlb_password", "wlbpass", "wlb_certificate", ""));

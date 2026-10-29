@@ -4407,7 +4407,7 @@ $WORKFLOWS = @{
     "configure-clustering"           = @{ Function = "Invoke-ConfigureClustering";          Defaults = @{} }
     "manage-pool-membership"         = @{ Function = "Invoke-ManagePoolMembership";         Defaults = @{} }
     "create-bond"                    = @{ Function = "Invoke-CreateBond";                   Defaults = @{} }
-    "manage-vapp"                    = @{ Function = "Invoke-ManageVapp";                   Defaults = @{ VmName = "web-01" } }
+    "manage-vapp"                    = @{ Function = "Invoke-ManageVapp";                   Defaults = @{ VmName = "db-01" } }
     "attach-usb-device"              = @{ Function = "Invoke-AttachUsbDevice";              Defaults = @{ VmName = "web-01" } }
     "wlb-recommendations"            = @{ Function = "Invoke-WlbRecommendations";           Defaults = @{ VmName = "web-01"; WlbHostPort = "wlb.example:8012"; WlbUsername = "wlbuser"; WlbPassword = "wlbpass"; WlbCertificate = "" } }
 }

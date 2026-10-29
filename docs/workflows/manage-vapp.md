@@ -41,7 +41,7 @@ private static void ManageVapp(string url, string user, string password, string 
     session.logout();
 }
 // Run it:
-//   ManageVapp("https://xenserver", "root", password, "web-01");
+//   ManageVapp("https://xenserver", "root", password, "db-01");
 ```
 
 <details><summary>Sample output</summary>
@@ -89,7 +89,7 @@ def manage_vapp(url, username, password, vm_name):
 
 
 # Run it:
-#   manage_vapp("https://xenserver", "root", password, "web-01")
+#   manage_vapp("https://xenserver", "root", password, "db-01")
 ```
 
 <details><summary>Sample output</summary>
@@ -140,7 +140,7 @@ private static void manageVapp(String url, String user, String password, String 
     }
 }
 // Run it:
-//   manageVapp("https://xenserver", "root", password, "web-01");
+//   manageVapp("https://xenserver", "root", password, "db-01");
 ```
 
 <details><summary>Sample output</summary>
@@ -252,7 +252,8 @@ OK: manage-vapp
 ```bash
 w_manage_vapp() {
     local vm_uuid vapp_uuid
-    vm_uuid=$(xe vm-list name-label=web-01 --minimal)
+    # A halted VM: an appliance starts only if one of its VMs is halted (OPERATION_NOT_ALLOWED otherwise).
+    vm_uuid=$(xe vm-list name-label="$(param vm_name db-01)" --minimal)
     vapp_uuid=$(xe appliance-create name-label=sdk-example-vapp \
         name-description="Created by the SDK example")
 
@@ -277,7 +278,7 @@ w_manage_vapp() {
 <details><summary>Sample output</summary>
 
 ```text
-Started:        halted
+Started:        running
 Shut down:      halted
 OK: manage-vapp
 ```

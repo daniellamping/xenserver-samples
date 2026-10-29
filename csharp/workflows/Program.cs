@@ -2486,7 +2486,7 @@ internal static class Program
         session.logout();
     }
     // Run it:
-    //   ManageVapp("https://xenserver", "root", password, "web-01");
+    //   ManageVapp("https://xenserver", "root", password, "db-01");
 
     // --- Attach a USB device to a VM ----------------------------------------------------------
     private static void AttachUsbDevice(string url, string user, string password, string vmName)
@@ -4210,7 +4210,7 @@ internal static class Program
         ["create-bond"] = (u, n, p, ov) => CreateBond(u, n, p),
         ["manage-vapp"] = (u, n, p, ov) =>
         {
-            var d = Merge(new() { ["vm_name"] = "web-01" }, ov);
+            var d = Merge(new() { ["vm_name"] = "db-01" }, ov);
             ManageVapp(u, n, p, d["vm_name"]);
         },
         ["attach-usb-device"] = (u, n, p, ov) =>

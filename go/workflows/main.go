@@ -5322,7 +5322,7 @@ var workflows = map[string]workflow{
 	"configure-clustering":   wf(nil, func(u, n, p string, m map[string]string) { configureClustering(u, n, p) }),
 	"manage-pool-membership": wf(nil, func(u, n, p string, m map[string]string) { managePoolMembership(u, n, p) }),
 	"create-bond":            wf(nil, func(u, n, p string, m map[string]string) { createBond(u, n, p) }),
-	"manage-vapp": wf(map[string]string{"vm_name": "web-01"},
+	"manage-vapp": wf(map[string]string{"vm_name": "db-01"},
 		func(u, n, p string, m map[string]string) { manageVapp(u, n, p, m["vm_name"]) }),
 	"attach-usb-device": wf(map[string]string{"vm_name": "web-01"},
 		func(u, n, p string, m map[string]string) { attachUsbDevice(u, n, p, m["vm_name"]) }),
