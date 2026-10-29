@@ -579,7 +579,8 @@ function Restore-ExampleHostConfig {
 
     $task = New-XenTask -Label 'host_restore' -Description 'restoring a configuration backup' -PassThru
     try {
-        Invoke-WebRequest -UseBasicParsing -Method Put -InFile $Path -TimeoutSec 10 `
+        # The timeout covers the whole transfer: a backup is hundreds of MB, so allow for a slow network.
+        Invoke-WebRequest -UseBasicParsing -Method Put -InFile $Path -TimeoutSec 1800 `
             -Uri ("$HostUrl/host_restore?session_id=$($Session.opaque_ref)" +
                   "&ref=$($VMHost.opaque_ref)&task_id=$($task.opaque_ref)") | Out-Null
 
@@ -598,9 +599,9 @@ function Restore-ExampleHostConfig {
 
 ```text
 Backing up sdk-host1
-  wrote 83 bytes to sdk-example-host-f7a2bb9c-7e7e-41b2-978b-7dfda06a4a9e.backup
+  wrote 83 bytes to sdk-example-host-92a6ef34-fa0b-4605-9ab9-d8bafcde67e3.backup
   restoring it to sdk-host1: accepted
-  restoring it to sdk-host2: could not connect to https://10.0.0.2:60313 directly (The request was canceled due to the configured HttpClient.Timeout of 10 seconds elapsing.)
+  restoring it to sdk-host2: could not connect to https://10.0.0.2:55299 directly (A connection attempt failed because the connected party did not properly respond after a period of time, or established connection failed because connected host has failed to respond. (10.0.0.2:55299))
 OK: backup-host-config
 ```
 

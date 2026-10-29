@@ -3557,7 +3557,8 @@ function Restore-ExampleHostConfig {
 
     $task = New-XenTask -Label 'host_restore' -Description 'restoring a configuration backup' -PassThru
     try {
-        Invoke-WebRequest -UseBasicParsing -Method Put -InFile $Path -TimeoutSec 10 `
+        # The timeout covers the whole transfer: a backup is hundreds of MB, so allow for a slow network.
+        Invoke-WebRequest -UseBasicParsing -Method Put -InFile $Path -TimeoutSec 1800 `
             -Uri ("$HostUrl/host_restore?session_id=$($Session.opaque_ref)" +
                   "&ref=$($VMHost.opaque_ref)&task_id=$($task.opaque_ref)") | Out-Null
 
