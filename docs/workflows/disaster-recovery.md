@@ -586,7 +586,7 @@ w_disaster_recovery() {
     dr_opts=()
     if [ "$dr_hp" != "$dr_host" ] && [ "${dr_hp##*:}" != 443 ]; then dr_opts=(-p $((${dr_hp##*:} + 1))); fi
     case "${XE_EXE:-xe}" in *.exe | *.EXE) dr_opts+=(-no-warn-new-certificates -no-warn-certificates) ;; esac
-    xe_dr() { "${XE_EXE:-xe}" -s "$dr_host" "${dr_opts[@]}" -u "$user" -pw "$pass" "$@"; }
+    xe_dr() { command "${XE_EXE:-xe}" -s "$dr_host" "${dr_opts[@]}" -u "$user" -pw "$pass" "$@"; }
     # Follow HOST_IS_SLAVE on the standby pool too, the same one-time probe the main connection does.
     dr_probe=$(xe_dr pool-list --minimal 2>&1) || true
     if [[ $dr_probe =~ (Master|Coordinator)\ IP\ address:\ ([0-9A-Fa-f.:]+) ]]; then dr_host=${BASH_REMATCH[2]}; fi

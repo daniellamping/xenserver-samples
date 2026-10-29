@@ -1143,7 +1143,9 @@ w_host_info() {
 
 # --- 32. List RBAC roles ---
 w_list_roles() {
-    echo "Roles: $(xe role-list params=name-label --minimal)"
+    # role-list shows the roles a user can be granted, not the permissions they are made of. Its field
+    # is `name`: a role has no name-label, and asking for one prints nothing.
+    echo "Roles: $(xe role-list params=name --minimal)"
     echo "OK: list-roles"
 }
 

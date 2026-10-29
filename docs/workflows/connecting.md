@@ -1724,7 +1724,8 @@ xe() {
     # xe reports a failure on stdout. Captured by $(...), that text would land in the variable and set -e
     # would then stop the script without saying why, so pass a failure's output on to stderr instead.
     local out rc=0
-    out=$("${XE_EXE:-xe}" -s "$host" "${xe_opts[@]}" -u "$user" -pw "$pass" "$@") || rc=$?
+    # `command`: when XE_EXE is unset, plain "xe" would be this function calling itself, without end.
+    out=$(command "${XE_EXE:-xe}" -s "$host" "${xe_opts[@]}" -u "$user" -pw "$pass" "$@") || rc=$?
     if [ $rc -ne 0 ]; then [ -z "$out" ] || printf '%s\n' "$out" >&2; return $rc; fi
     [ -z "$out" ] || printf '%s\n' "$out"
 }
