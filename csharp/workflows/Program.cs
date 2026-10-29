@@ -334,8 +334,19 @@ internal static class Program
     private static void WaitForGuestAgent(Session session, string vm, int timeoutSeconds = 300,
         int intervalSeconds = 2)
     {
+        // clean_shutdown in allowed_operations says the guest can shut down; a Linux kernel offers that early
+        // in boot, before the agent runs (hot-plug needs the agent, and suspend needs its emulated disk
+        // unplugged), so wait for the guest metrics to report the PV drivers too.
+        bool Ready()
+        {
+            if (!VM.get_allowed_operations(session, vm).Contains(vm_operations.clean_shutdown)) return false;
+            var metrics = VM.get_guest_metrics(session, vm);
+            return metrics.opaque_ref != "OpaqueRef:NULL"
+                   && VM_guest_metrics.get_PV_drivers_detected(session, metrics.opaque_ref);
+        }
+
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
-        while (!VM.get_allowed_operations(session, vm).Contains(vm_operations.clean_shutdown))
+        while (!Ready())
         {
             if (DateTime.UtcNow > deadline)
                 throw new Exception($"the guest's PV drivers did not report in within {timeoutSeconds}s; " +

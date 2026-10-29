@@ -315,8 +315,19 @@ private static string CopyOfGuest(Session session, string sourceVmName, string n
 private static void WaitForGuestAgent(Session session, string vm, int timeoutSeconds = 300,
     int intervalSeconds = 2)
 {
+    // clean_shutdown in allowed_operations says the guest can shut down; a Linux kernel offers that early
+    // in boot, before the agent runs (hot-plug needs the agent, and suspend needs its emulated disk
+    // unplugged), so wait for the guest metrics to report the PV drivers too.
+    bool Ready()
+    {
+        if (!VM.get_allowed_operations(session, vm).Contains(vm_operations.clean_shutdown)) return false;
+        var metrics = VM.get_guest_metrics(session, vm);
+        return metrics.opaque_ref != "OpaqueRef:NULL"
+               && VM_guest_metrics.get_PV_drivers_detected(session, metrics.opaque_ref);
+    }
+
     var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
-    while (!VM.get_allowed_operations(session, vm).Contains(vm_operations.clean_shutdown))
+    while (!Ready())
     {
         if (DateTime.UtcNow > deadline)
             throw new Exception($"the guest's PV drivers did not report in within {timeoutSeconds}s; " +
@@ -434,9 +445,17 @@ def wait_for_guest_agent(session, vm, timeout=300, interval=2):
 
     xapi only offers the guest-dependent operations once the guest says it can do them, and
     allowed_operations is where it says so: wait for clean_shutdown to appear there (the same
-    check that refuses it with VM_LACKS_FEATURE beforehand). A booting OS takes a while."""
+    check that refuses it with VM_LACKS_FEATURE beforehand). A Linux kernel offers that early in
+    boot, before the agent runs (hot-plug needs the agent, and suspend needs its emulated disk
+    unplugged), so wait for the guest metrics to report the PV drivers too. A booting OS takes a while."""
+    def ready():
+        if "clean_shutdown" not in session.xenapi.VM.get_allowed_operations(vm):
+            return False
+        metrics = session.xenapi.VM.get_guest_metrics(vm)
+        return metrics != "OpaqueRef:NULL" and session.xenapi.VM_guest_metrics.get_PV_drivers_detected(metrics)
+
     deadline = time.time() + timeout
-    while "clean_shutdown" not in session.xenapi.VM.get_allowed_operations(vm):
+    while not ready():
         if time.time() > deadline:
             raise RuntimeError("the guest's PV drivers did not report in within %ds; does the source "
                                "VM have a guest OS with PV drivers (XenServer VM Tools)?" % timeout)
@@ -953,6 +972,15 @@ private static VM copyOfGuest(Connection conn, String sourceVmName, String newVm
 // guest-dependent operations once the guest says it can do them, and getAllowedOperations is where
 // it says so: wait for CLEAN_SHUTDOWN to appear there (the same check that refuses it with
 // VM_LACKS_FEATURE beforehand). A booting OS takes a while.
+// clean_shutdown in allowed_operations says the guest can shut down; a Linux kernel offers that early in
+// boot, before the agent runs (hot-plug needs the agent, and suspend needs its emulated disk unplugged),
+// so wait for the guest metrics to report the PV drivers too.
+private static boolean guestAgentReady(Connection conn, VM vm) throws Exception {
+    if (!vm.getAllowedOperations(conn).contains(Types.VmOperations.CLEAN_SHUTDOWN)) return false;
+    VMGuestMetrics metrics = vm.getGuestMetrics(conn);
+    return !metrics.toWireString().equals("OpaqueRef:NULL") && metrics.getPVDriversDetected(conn);
+}
+
 private static void waitForGuestAgent(Connection conn, VM vm) throws Exception {
     waitForGuestAgent(conn, vm, 300, 2);
 }
@@ -960,7 +988,7 @@ private static void waitForGuestAgent(Connection conn, VM vm) throws Exception {
 private static void waitForGuestAgent(Connection conn, VM vm, int timeoutSeconds, int intervalSeconds)
         throws Exception {
     long deadline = System.currentTimeMillis() + timeoutSeconds * 1000L;
-    while (!vm.getAllowedOperations(conn).contains(Types.VmOperations.CLEAN_SHUTDOWN)) {
+    while (!guestAgentReady(conn, vm)) {
         if (System.currentTimeMillis() > deadline)
             throw new RuntimeException("the guest's PV drivers did not report in within " + timeoutSeconds
                     + "s; does the source VM have a guest OS with PV drivers (XenServer VM Tools)?");
@@ -1115,17 +1143,36 @@ func copyOfGuest(session *xenapi.Session, sourceVMName, newVMName string) xenapi
 // xapi only offers the guest-dependent operations once the guest says it can do them, and
 // allowed_operations is where it says so: wait for clean_shutdown to appear there (the same check
 // that refuses it with VM_LACKS_FEATURE beforehand). A booting OS takes a while.
+// guestAgentReady: clean_shutdown in allowed_operations says the guest can shut down; a Linux kernel offers
+// that early in boot, before the agent runs (hot-plug needs the agent, and suspend needs its emulated disk
+// unplugged), so the guest metrics must report the PV drivers too.
+func guestAgentReady(session *xenapi.Session, vm xenapi.VMRef) bool {
+	ops, err := xenapi.VM.GetAllowedOperations(session, vm)
+	check(err)
+	canShutDown := false
+	for _, op := range ops {
+		canShutDown = canShutDown || op == xenapi.VMOperationsCleanShutdown
+	}
+	if !canShutDown {
+		return false
+	}
+	metrics, err := xenapi.VM.GetGuestMetrics(session, vm)
+	check(err)
+	if metrics == xenapi.VMGuestMetricsRef("OpaqueRef:NULL") {
+		return false
+	}
+	detected, err := xenapi.VMGuestMetrics.GetPVDriversDetected(session, metrics)
+	check(err)
+	return detected
+}
+
 func waitForGuestAgent(session *xenapi.Session, vm xenapi.VMRef) {
 	const timeout = 300 * time.Second
 	const interval = 2 * time.Second
 	deadline := time.Now().Add(timeout)
 	for {
-		ops, err := xenapi.VM.GetAllowedOperations(session, vm)
-		check(err)
-		for _, op := range ops {
-			if op == xenapi.VMOperationsCleanShutdown {
-				return
-			}
+		if guestAgentReady(session, vm) {
+			return
 		}
 		if time.Now().After(deadline) {
 			panic(fmt.Sprintf("the guest's PV drivers did not report in within %s; does the source "+
@@ -1487,14 +1534,22 @@ function Wait-GuestAgent {
     #
     # xapi only offers the guest-dependent operations once the guest says it can do them, and
     # allowed_operations is where it says so: wait for clean_shutdown to appear there (the same check
-    # that refuses it with VM_LACKS_FEATURE beforehand). A booting OS takes a while.
+    # that refuses it with VM_LACKS_FEATURE beforehand). A Linux kernel offers that early in boot, before
+    # the agent runs (hot-plug needs the agent, and suspend needs its emulated disk unplugged), so wait for
+    # the guest metrics to report the PV drivers too. A booting OS takes a while.
     param(
         [Parameter(Mandatory = $true)][string]$Ref,
         [int]$TimeoutSeconds = 300,
         [int]$IntervalSeconds = 2
     )
+    $ready = {
+        $vm = Get-XenVM -Ref $Ref
+        $vm.allowed_operations -contains 'clean_shutdown' -and
+            $vm.guest_metrics.opaque_ref -ne 'OpaqueRef:NULL' -and
+            (Get-XenVMGuestMetrics -Ref $vm.guest_metrics.opaque_ref).PV_drivers_detected
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-XenVM -Ref $Ref).allowed_operations -notcontains 'clean_shutdown') {
+    while (-not (& $ready)) {
         if ((Get-Date) -gt $deadline) {
             throw ("the guest's PV drivers did not report in within ${TimeoutSeconds}s; does the " +
                    "source VM have a guest OS with PV drivers (XenServer VM Tools)?")
@@ -1889,13 +1944,16 @@ copy_of_guest() {
 # Wait, after vm-start, until the guest's PV drivers have reported in. xapi only offers the
 # guest-dependent operations once the guest says it can do them, and allowed-operations is where it says
 # so: wait for clean_shutdown to appear there (the same check that refuses it with VM_LACKS_FEATURE
-# beforehand). A booting OS takes a while.
+# beforehand). A Linux kernel offers that early in boot, before the agent runs (hot-plug needs the agent,
+# and suspend needs its emulated disk unplugged), so wait for PV-drivers-detected too. A booting OS takes a
+# while.
 wait_for_guest_agent() {
     local vm=$1 timeout=${2:-300} interval=${3:-2}
     local deadline=$((SECONDS + timeout))
     while true; do
         case "$(xe vm-param-get uuid=$vm param-name=allowed-operations)" in
-            *clean_shutdown*) return 0 ;;
+            *clean_shutdown*)
+                [ "$(xe vm-param-get uuid=$vm param-name=PV-drivers-detected 2>/dev/null)" = true ] && return 0 ;;
         esac
         if [ $SECONDS -gt $deadline ]; then
             echo "the guest's PV drivers did not report in within ${timeout}s; does the source VM have" \

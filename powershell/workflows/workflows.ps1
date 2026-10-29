@@ -199,14 +199,22 @@ function Wait-GuestAgent {
     #
     # xapi only offers the guest-dependent operations once the guest says it can do them, and
     # allowed_operations is where it says so: wait for clean_shutdown to appear there (the same check
-    # that refuses it with VM_LACKS_FEATURE beforehand). A booting OS takes a while.
+    # that refuses it with VM_LACKS_FEATURE beforehand). A Linux kernel offers that early in boot, before
+    # the agent runs (hot-plug needs the agent, and suspend needs its emulated disk unplugged), so wait for
+    # the guest metrics to report the PV drivers too. A booting OS takes a while.
     param(
         [Parameter(Mandatory = $true)][string]$Ref,
         [int]$TimeoutSeconds = 300,
         [int]$IntervalSeconds = 2
     )
+    $ready = {
+        $vm = Get-XenVM -Ref $Ref
+        $vm.allowed_operations -contains 'clean_shutdown' -and
+            $vm.guest_metrics.opaque_ref -ne 'OpaqueRef:NULL' -and
+            (Get-XenVMGuestMetrics -Ref $vm.guest_metrics.opaque_ref).PV_drivers_detected
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-XenVM -Ref $Ref).allowed_operations -notcontains 'clean_shutdown') {
+    while (-not (& $ready)) {
         if ((Get-Date) -gt $deadline) {
             throw ("the guest's PV drivers did not report in within ${TimeoutSeconds}s; does the " +
                    "source VM have a guest OS with PV drivers (XenServer VM Tools)?")

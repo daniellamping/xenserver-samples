@@ -144,9 +144,17 @@ def wait_for_guest_agent(session, vm, timeout=300, interval=2):
 
     xapi only offers the guest-dependent operations once the guest says it can do them, and
     allowed_operations is where it says so: wait for clean_shutdown to appear there (the same
-    check that refuses it with VM_LACKS_FEATURE beforehand). A booting OS takes a while."""
+    check that refuses it with VM_LACKS_FEATURE beforehand). A Linux kernel offers that early in
+    boot, before the agent runs (hot-plug needs the agent, and suspend needs its emulated disk
+    unplugged), so wait for the guest metrics to report the PV drivers too. A booting OS takes a while."""
+    def ready():
+        if "clean_shutdown" not in session.xenapi.VM.get_allowed_operations(vm):
+            return False
+        metrics = session.xenapi.VM.get_guest_metrics(vm)
+        return metrics != "OpaqueRef:NULL" and session.xenapi.VM_guest_metrics.get_PV_drivers_detected(metrics)
+
     deadline = time.time() + timeout
-    while "clean_shutdown" not in session.xenapi.VM.get_allowed_operations(vm):
+    while not ready():
         if time.time() > deadline:
             raise RuntimeError("the guest's PV drivers did not report in within %ds; does the source "
                                "VM have a guest OS with PV drivers (XenServer VM Tools)?" % timeout)

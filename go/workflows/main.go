@@ -189,17 +189,36 @@ func copyOfGuest(session *xenapi.Session, sourceVMName, newVMName string) xenapi
 // xapi only offers the guest-dependent operations once the guest says it can do them, and
 // allowed_operations is where it says so: wait for clean_shutdown to appear there (the same check
 // that refuses it with VM_LACKS_FEATURE beforehand). A booting OS takes a while.
+// guestAgentReady: clean_shutdown in allowed_operations says the guest can shut down; a Linux kernel offers
+// that early in boot, before the agent runs (hot-plug needs the agent, and suspend needs its emulated disk
+// unplugged), so the guest metrics must report the PV drivers too.
+func guestAgentReady(session *xenapi.Session, vm xenapi.VMRef) bool {
+	ops, err := xenapi.VM.GetAllowedOperations(session, vm)
+	check(err)
+	canShutDown := false
+	for _, op := range ops {
+		canShutDown = canShutDown || op == xenapi.VMOperationsCleanShutdown
+	}
+	if !canShutDown {
+		return false
+	}
+	metrics, err := xenapi.VM.GetGuestMetrics(session, vm)
+	check(err)
+	if metrics == xenapi.VMGuestMetricsRef("OpaqueRef:NULL") {
+		return false
+	}
+	detected, err := xenapi.VMGuestMetrics.GetPVDriversDetected(session, metrics)
+	check(err)
+	return detected
+}
+
 func waitForGuestAgent(session *xenapi.Session, vm xenapi.VMRef) {
 	const timeout = 300 * time.Second
 	const interval = 2 * time.Second
 	deadline := time.Now().Add(timeout)
 	for {
-		ops, err := xenapi.VM.GetAllowedOperations(session, vm)
-		check(err)
-		for _, op := range ops {
-			if op == xenapi.VMOperationsCleanShutdown {
-				return
-			}
+		if guestAgentReady(session, vm) {
+			return
 		}
 		if time.Now().After(deadline) {
 			panic(fmt.Sprintf("the guest's PV drivers did not report in within %s; does the source "+

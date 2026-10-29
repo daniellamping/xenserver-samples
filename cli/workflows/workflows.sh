@@ -287,13 +287,16 @@ copy_of_guest() {
 # Wait, after vm-start, until the guest's PV drivers have reported in. xapi only offers the
 # guest-dependent operations once the guest says it can do them, and allowed-operations is where it says
 # so: wait for clean_shutdown to appear there (the same check that refuses it with VM_LACKS_FEATURE
-# beforehand). A booting OS takes a while.
+# beforehand). A Linux kernel offers that early in boot, before the agent runs (hot-plug needs the agent,
+# and suspend needs its emulated disk unplugged), so wait for PV-drivers-detected too. A booting OS takes a
+# while.
 wait_for_guest_agent() {
     local vm=$1 timeout=${2:-300} interval=${3:-2}
     local deadline=$((SECONDS + timeout))
     while true; do
         case "$(xe vm-param-get uuid=$vm param-name=allowed-operations)" in
-            *clean_shutdown*) return 0 ;;
+            *clean_shutdown*)
+                [ "$(xe vm-param-get uuid=$vm param-name=PV-drivers-detected 2>/dev/null)" = true ] && return 0 ;;
         esac
         if [ $SECONDS -gt $deadline ]; then
             echo "the guest's PV drivers did not report in within ${timeout}s; does the source VM have" \
