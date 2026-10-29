@@ -28,6 +28,7 @@ for its parameters.
 
 import base64
 import json
+import uuid
 import subprocess
 import tarfile
 import tempfile
@@ -2278,17 +2279,19 @@ def configure_snmp(url, username, password, trap_destination="192.0.2.50"):
         "agent": {"v2c": "yes", "v3": "no", "community": "sdk-community", "user_name": "",
                   "authentication_password": "", "authentication_protocol": "",
                   "privacy_password": "", "privacy_protocol": ""},
-        "nmss": [{"address": trap_destination, "port": 162, "v2c": "yes", "v3": "no",
+        # Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+        "nmss": [{"uuid": str(uuid.uuid4()), "address": trap_destination, "port": 162, "v2c": "yes", "v3": "no",
                   "community": "sdk-community", "user_name": "", "authentication_password": "",
                   "authentication_protocol": "", "privacy_password": "", "privacy_protocol": ""}],
     }
     for host in session.xenapi.host.get_all():
         def snmp(fn, args=None, host=host):
             return json.loads(session.xenapi.host.call_plugin(host, "snmp", fn, args or {}))
+        # The plugin reports a refused config in its answer, not as an API error: check it.
         answer = snmp("set-config", {"config": json.dumps(config)})
+        if answer["code"] != 0:
+            raise RuntimeError("set-config refused the configuration: %s" % answer["message"])
         status = snmp("status")["result"]
-        if status["enabled"] != "enabled":
-            raise RuntimeError("SNMP is still %s after set-config, which answered %s" % (status["enabled"], answer))
         cfg = snmp("get-config")["result"]
         label = session.xenapi.host.get_name_label(host)
         print("%s: SNMP enabled: %s / %s" % (label, status["enabled"], status["active"]))

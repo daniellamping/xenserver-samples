@@ -2526,13 +2526,18 @@ public class Workflows {
                 + "\"agent\":{\"v2c\":\"yes\",\"v3\":\"no\",\"community\":\"sdk-community\",\"user_name\":\"\","
                 + "\"authentication_password\":\"\",\"authentication_protocol\":\"\","
                 + "\"privacy_password\":\"\",\"privacy_protocol\":\"\"},"
-                + "\"nmss\":[{\"address\":\"" + trapDestination + "\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\","
+                // Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+                + "\"nmss\":[{\"uuid\":\"" + java.util.UUID.randomUUID() + "\",\"address\":\"" + trapDestination
+                + "\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\","
                 + "\"community\":\"sdk-community\",\"user_name\":\"\",\"authentication_password\":\"\","
                 + "\"authentication_protocol\":\"\",\"privacy_password\":\"\",\"privacy_protocol\":\"\"}]}";
             for (Host host : Host.getAll(conn)) {
                 Map<String, String> args = new java.util.HashMap<>();
                 args.put("config", config);
-                host.callPlugin(conn, "snmp", "set-config", args);
+                // The plugin reports a refused config in its answer, not as an API error: check it.
+                String answer = host.callPlugin(conn, "snmp", "set-config", args);
+                if (!answer.replace(" ", "").contains("\"code\":0"))
+                    throw new RuntimeException("set-config refused the configuration: " + answer);
                 String status = host.callPlugin(conn, "snmp", "status", new java.util.HashMap<>());
                 String cfg = host.callPlugin(conn, "snmp", "get-config", new java.util.HashMap<>());
                 String label = host.getNameLabel(conn);

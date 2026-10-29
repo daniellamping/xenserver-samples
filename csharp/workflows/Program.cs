@@ -2443,7 +2443,8 @@ internal static class Program
             "\"agent\":{\"v2c\":\"yes\",\"v3\":\"no\",\"community\":\"sdk-community\",\"user_name\":\"\"," +
             "\"authentication_password\":\"\",\"authentication_protocol\":\"\"," +
             "\"privacy_password\":\"\",\"privacy_protocol\":\"\"}," +
-            $"\"nmss\":[{{\"address\":\"{trapDestination}\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\"," +
+            // Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+            $"\"nmss\":[{{\"uuid\":\"{Guid.NewGuid()}\",\"address\":\"{trapDestination}\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\"," +
             "\"community\":\"sdk-community\",\"user_name\":\"\",\"authentication_password\":\"\"," +
             "\"authentication_protocol\":\"\",\"privacy_password\":\"\",\"privacy_protocol\":\"\"}]}";
         // Plugin calls are per-host, so configure every host, and restore each one to disabled again
@@ -2452,7 +2453,11 @@ internal static class Program
         {
             string Snmp(string fn, Dictionary<string, string> args) =>
                 Host.call_plugin(session, host.opaque_ref, "snmp", fn, args);
-            Snmp("set-config", new() { ["config"] = config });
+            // The plugin reports a refused config in its answer, not as an API error: check it.
+            using (var answer = JsonDocument.Parse(Snmp("set-config", new() { ["config"] = config })))
+                if (answer.RootElement.GetProperty("code").GetInt32() != 0)
+                    throw new Exception("set-config refused the configuration: "
+                                        + answer.RootElement.GetProperty("message").GetString());
             using var status = JsonDocument.Parse(Snmp("status", new()));
             using var cfg = JsonDocument.Parse(Snmp("get-config", new()));
             var result = status.RootElement.GetProperty("result");

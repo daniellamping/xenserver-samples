@@ -3105,6 +3105,16 @@ func configureNrpe(url, user, password string) {
 	session.Logout()
 }
 
+// newUUID returns a random (version 4) UUID.
+func newUUID() string {
+	b := make([]byte, 16)
+	_, err := rand.Read(b)
+	check(err)
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+}
+
 // --- 53. Configure SNMP monitoring ----------------------------------------------------
 // nmss is the list of real trap destinations SNMP notifications go to - an empty list never
 // configures where traps actually go, which is the whole point of "configure SNMP monitoring".
@@ -3117,7 +3127,8 @@ func configureSnmp(url, user, password, trapDestination string) {
 	config := `{"common":{"enabled":"yes","debug_log":"no"},` +
 		`"agent":{"v2c":"yes","v3":"no","community":"sdk-community","user_name":"",` +
 		`"authentication_password":"","authentication_protocol":"",` +
-		`"privacy_password":"","privacy_protocol":""},"nmss":[{"address":"` + trapDestination + `",` +
+		// Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+		`"privacy_password":"","privacy_protocol":""},"nmss":[{"uuid":"` + newUUID() + `","address":"` + trapDestination + `",` +
 		`"port":162,"v2c":"yes","v3":"no","community":"sdk-community","user_name":"",` +
 		`"authentication_password":"","authentication_protocol":"",` +
 		`"privacy_password":"","privacy_protocol":""}]}`
@@ -3129,7 +3140,10 @@ func configureSnmp(url, user, password, trapDestination string) {
 			check(json.Unmarshal([]byte(r), &env))
 			return env
 		}
-		snmp("set-config", map[string]string{"config": config})
+		// The plugin reports a refused config in its answer, not as an API error: check it.
+		if answer := snmp("set-config", map[string]string{"config": config}); answer["code"] != float64(0) {
+			panic(fmt.Sprintf("set-config refused the configuration: %v", answer["message"]))
+		}
 		status := snmp("status", map[string]string{})["result"].(map[string]interface{})
 		cfg := snmp("get-config", map[string]string{})["result"].(map[string]interface{})
 		agent := cfg["agent"].(map[string]interface{})

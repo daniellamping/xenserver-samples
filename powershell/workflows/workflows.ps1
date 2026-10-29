@@ -2735,14 +2735,17 @@ function Invoke-ConfigureSnmp {
         agent  = @{ v2c = "yes"; v3 = "no"; community = "sdk-community"; user_name = "";
                     authentication_password = ""; authentication_protocol = "";
                     privacy_password = ""; privacy_protocol = "" }
-        nmss   = @(@{ address = $TrapDestination; port = 162; v2c = "yes"; v3 = "no";
+        # Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+        nmss   = @(@{ uuid = [guid]::NewGuid().ToString(); address = $TrapDestination; port = 162; v2c = "yes"; v3 = "no";
                       community = "sdk-community"; user_name = ""; authentication_password = "";
                       authentication_protocol = ""; privacy_password = ""; privacy_protocol = "" })
     }
     $configJson = [string]($config | ConvertTo-Json -Compress -Depth 5)
     foreach ($xenHost in Get-XenHost) {
-        $xenHost | Invoke-XenHost -XenAction CallPlugin -Plugin snmp -Fn set-config `
-            -Args @{ config = $configJson } -PassThru | Out-Null
+        # The plugin reports a refused config in its answer, not as an API error: check it.
+        $answer = ($xenHost | Invoke-XenHost -XenAction CallPlugin -Plugin snmp -Fn set-config `
+            -Args @{ config = $configJson } -PassThru) | ConvertFrom-Json
+        if ($answer.code -ne 0) { throw "set-config refused the configuration: $($answer.message)" }
         $status = ($xenHost | Invoke-XenHost -XenAction CallPlugin -Plugin snmp -Fn status -Args @{} -PassThru) | ConvertFrom-Json
         $cfg = ($xenHost | Invoke-XenHost -XenAction CallPlugin -Plugin snmp -Fn get-config -Args @{} -PassThru) | ConvertFrom-Json
         Write-Host "$($xenHost.name_label): SNMP enabled: $($status.result.enabled) / $($status.result.active)"

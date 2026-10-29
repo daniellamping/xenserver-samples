@@ -20,7 +20,8 @@ private static void ConfigureSnmp(string url, string user, string password,
         "\"agent\":{\"v2c\":\"yes\",\"v3\":\"no\",\"community\":\"sdk-community\",\"user_name\":\"\"," +
         "\"authentication_password\":\"\",\"authentication_protocol\":\"\"," +
         "\"privacy_password\":\"\",\"privacy_protocol\":\"\"}," +
-        $"\"nmss\":[{{\"address\":\"{trapDestination}\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\"," +
+        // Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+        $"\"nmss\":[{{\"uuid\":\"{Guid.NewGuid()}\",\"address\":\"{trapDestination}\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\"," +
         "\"community\":\"sdk-community\",\"user_name\":\"\",\"authentication_password\":\"\"," +
         "\"authentication_protocol\":\"\",\"privacy_password\":\"\",\"privacy_protocol\":\"\"}]}";
     // Plugin calls are per-host, so configure every host, and restore each one to disabled again
@@ -29,7 +30,11 @@ private static void ConfigureSnmp(string url, string user, string password,
     {
         string Snmp(string fn, Dictionary<string, string> args) =>
             Host.call_plugin(session, host.opaque_ref, "snmp", fn, args);
-        Snmp("set-config", new() { ["config"] = config });
+        // The plugin reports a refused config in its answer, not as an API error: check it.
+        using (var answer = JsonDocument.Parse(Snmp("set-config", new() { ["config"] = config })))
+            if (answer.RootElement.GetProperty("code").GetInt32() != 0)
+                throw new Exception("set-config refused the configuration: "
+                                    + answer.RootElement.GetProperty("message").GetString());
         using var status = JsonDocument.Parse(Snmp("status", new()));
         using var cfg = JsonDocument.Parse(Snmp("get-config", new()));
         var result = status.RootElement.GetProperty("result");
@@ -78,14 +83,18 @@ def configure_snmp(url, username, password, trap_destination="192.0.2.50"):
         "agent": {"v2c": "yes", "v3": "no", "community": "sdk-community", "user_name": "",
                   "authentication_password": "", "authentication_protocol": "",
                   "privacy_password": "", "privacy_protocol": ""},
-        "nmss": [{"address": trap_destination, "port": 162, "v2c": "yes", "v3": "no",
+        # Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+        "nmss": [{"uuid": str(uuid.uuid4()), "address": trap_destination, "port": 162, "v2c": "yes", "v3": "no",
                   "community": "sdk-community", "user_name": "", "authentication_password": "",
                   "authentication_protocol": "", "privacy_password": "", "privacy_protocol": ""}],
     }
     for host in session.xenapi.host.get_all():
         def snmp(fn, args=None, host=host):
             return json.loads(session.xenapi.host.call_plugin(host, "snmp", fn, args or {}))
-        snmp("set-config", {"config": json.dumps(config)})
+        # The plugin reports a refused config in its answer, not as an API error: check it.
+        answer = snmp("set-config", {"config": json.dumps(config)})
+        if answer["code"] != 0:
+            raise RuntimeError("set-config refused the configuration: %s" % answer["message"])
         status = snmp("status")["result"]
         cfg = snmp("get-config")["result"]
         label = session.xenapi.host.get_name_label(host)
@@ -125,13 +134,18 @@ private static void configureSnmp(String url, String user, String password, Stri
             + "\"agent\":{\"v2c\":\"yes\",\"v3\":\"no\",\"community\":\"sdk-community\",\"user_name\":\"\","
             + "\"authentication_password\":\"\",\"authentication_protocol\":\"\","
             + "\"privacy_password\":\"\",\"privacy_protocol\":\"\"},"
-            + "\"nmss\":[{\"address\":\"" + trapDestination + "\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\","
+            // Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+            + "\"nmss\":[{\"uuid\":\"" + java.util.UUID.randomUUID() + "\",\"address\":\"" + trapDestination
+            + "\",\"port\":162,\"v2c\":\"yes\",\"v3\":\"no\","
             + "\"community\":\"sdk-community\",\"user_name\":\"\",\"authentication_password\":\"\","
             + "\"authentication_protocol\":\"\",\"privacy_password\":\"\",\"privacy_protocol\":\"\"}]}";
         for (Host host : Host.getAll(conn)) {
             Map<String, String> args = new java.util.HashMap<>();
             args.put("config", config);
-            host.callPlugin(conn, "snmp", "set-config", args);
+            // The plugin reports a refused config in its answer, not as an API error: check it.
+            String answer = host.callPlugin(conn, "snmp", "set-config", args);
+            if (!answer.replace(" ", "").contains("\"code\":0"))
+                throw new RuntimeException("set-config refused the configuration: " + answer);
             String status = host.callPlugin(conn, "snmp", "status", new java.util.HashMap<>());
             String cfg = host.callPlugin(conn, "snmp", "get-config", new java.util.HashMap<>());
             String label = host.getNameLabel(conn);
@@ -178,7 +192,8 @@ func configureSnmp(url, user, password, trapDestination string) {
 	config := `{"common":{"enabled":"yes","debug_log":"no"},` +
 		`"agent":{"v2c":"yes","v3":"no","community":"sdk-community","user_name":"",` +
 		`"authentication_password":"","authentication_protocol":"",` +
-		`"privacy_password":"","privacy_protocol":""},"nmss":[{"address":"` + trapDestination + `",` +
+		// Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+		`"privacy_password":"","privacy_protocol":""},"nmss":[{"uuid":"` + newUUID() + `","address":"` + trapDestination + `",` +
 		`"port":162,"v2c":"yes","v3":"no","community":"sdk-community","user_name":"",` +
 		`"authentication_password":"","authentication_protocol":"",` +
 		`"privacy_password":"","privacy_protocol":""}]}`
@@ -190,7 +205,10 @@ func configureSnmp(url, user, password, trapDestination string) {
 			check(json.Unmarshal([]byte(r), &env))
 			return env
 		}
-		snmp("set-config", map[string]string{"config": config})
+		// The plugin reports a refused config in its answer, not as an API error: check it.
+		if answer := snmp("set-config", map[string]string{"config": config}); answer["code"] != float64(0) {
+			panic(fmt.Sprintf("set-config refused the configuration: %v", answer["message"]))
+		}
 		status := snmp("status", map[string]string{})["result"].(map[string]interface{})
 		cfg := snmp("get-config", map[string]string{})["result"].(map[string]interface{})
 		agent := cfg["agent"].(map[string]interface{})
@@ -246,14 +264,17 @@ function Invoke-ConfigureSnmp {
         agent  = @{ v2c = "yes"; v3 = "no"; community = "sdk-community"; user_name = "";
                     authentication_password = ""; authentication_protocol = "";
                     privacy_password = ""; privacy_protocol = "" }
-        nmss   = @(@{ address = $TrapDestination; port = 162; v2c = "yes"; v3 = "no";
+        # Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+        nmss   = @(@{ uuid = [guid]::NewGuid().ToString(); address = $TrapDestination; port = 162; v2c = "yes"; v3 = "no";
                       community = "sdk-community"; user_name = ""; authentication_password = "";
                       authentication_protocol = ""; privacy_password = ""; privacy_protocol = "" })
     }
     $configJson = [string]($config | ConvertTo-Json -Compress -Depth 5)
     foreach ($xenHost in Get-XenHost) {
-        $xenHost | Invoke-XenHost -XenAction CallPlugin -Plugin snmp -Fn set-config `
-            -Args @{ config = $configJson } -PassThru | Out-Null
+        # The plugin reports a refused config in its answer, not as an API error: check it.
+        $answer = ($xenHost | Invoke-XenHost -XenAction CallPlugin -Plugin snmp -Fn set-config `
+            -Args @{ config = $configJson } -PassThru) | ConvertFrom-Json
+        if ($answer.code -ne 0) { throw "set-config refused the configuration: $($answer.message)" }
         $status = ($xenHost | Invoke-XenHost -XenAction CallPlugin -Plugin snmp -Fn status -Args @{} -PassThru) | ConvertFrom-Json
         $cfg = ($xenHost | Invoke-XenHost -XenAction CallPlugin -Plugin snmp -Fn get-config -Args @{} -PassThru) | ConvertFrom-Json
         Write-Host "$($xenHost.name_label): SNMP enabled: $($status.result.enabled) / $($status.result.active)"
@@ -291,11 +312,16 @@ OK: configure-snmp
 # configure every host, and restore each one to disabled again afterwards, the way XenRT's own
 # SNMPServer.disable() does.
 w_configure_snmp() {
-    local trap_destination config
+    local trap_destination config nms_uuid answer
     trap_destination=$(param trap_destination "192.0.2.50")
-    config='{"common":{"enabled":"yes","debug_log":"no"},"agent":{"v2c":"yes","v3":"no","community":"sdk-community","user_name":"","authentication_password":"","authentication_protocol":"","privacy_password":"","privacy_protocol":""},"nmss":[{"address":"'"$trap_destination"'","port":162,"v2c":"yes","v3":"no","community":"sdk-community","user_name":"","authentication_password":"","authentication_protocol":"","privacy_password":"","privacy_protocol":""}]}'
+    # Each trap destination needs a uuid of its own: the plugin refuses the whole config without one.
+    nms_uuid=$(printf '%04x%04x-%04x-4%03x-%04x-%04x%04x%04x' $RANDOM $RANDOM $RANDOM $((RANDOM & 0xfff)) \
+        $(( (RANDOM & 0x3fff) | 0x8000 )) $RANDOM $RANDOM $RANDOM)
+    config='{"common":{"enabled":"yes","debug_log":"no"},"agent":{"v2c":"yes","v3":"no","community":"sdk-community","user_name":"","authentication_password":"","authentication_protocol":"","privacy_password":"","privacy_protocol":""},"nmss":[{"uuid":"'"$nms_uuid"'","address":"'"$trap_destination"'","port":162,"v2c":"yes","v3":"no","community":"sdk-community","user_name":"","authentication_password":"","authentication_protocol":"","privacy_password":"","privacy_protocol":""}]}'
     for h in $(each_csv "$(xe host-list --minimal)"); do
-        xe host-call-plugin host-uuid=$h plugin=snmp fn=set-config "args:config=$config" >/dev/null
+        # The plugin reports a refused config in its answer, not as an xe error: check it.
+        answer=$(xe host-call-plugin host-uuid=$h plugin=snmp fn=set-config "args:config=$config")
+        case "$answer" in *'"code": 0'*|*'"code":0'*) ;; *) echo "set-config refused the configuration: $answer" >&2; exit 1 ;; esac
         echo "$(xe host-param-get uuid=$h param-name=name-label): SNMP status: $(xe host-call-plugin host-uuid=$h plugin=snmp fn=status)"
         xe host-call-plugin host-uuid=$h plugin=snmp fn=set-config 'args:config={"common":{"enabled":"no"}}' >/dev/null  # restore
     done
