@@ -948,12 +948,21 @@ func snapshotRevert(url, user, password, vmName, snapshotName string) {
 
 	// A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the VM's
 	// console at that moment. It is an HTTP transfer alongside the API, not an API call, so the session id
-	// travels in the query string. Only a running VM has a console to capture: the server answers HTTP 500
-	// for a halted VM, and for the snapshot record itself. The Go binding keeps its own session private,
-	// so obtain one of our own the same way the RRD/export examples do.
+	// travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real host answers
+	// 404 to a VM). Only a running VM has a console to capture. The Go binding keeps its own session
+	// private, so obtain one of our own the same way the RRD/export examples do.
 	if state, _ := xenapi.VM.GetPowerState(session, vmRef); state == xenapi.VMPowerStateRunning {
+		consoles, err := xenapi.VM.GetConsoles(session, vmRef)
+		check(err)
+		var console xenapi.ConsoleRef
+		for _, c := range consoles {
+			if p, err := xenapi.Console.GetProtocol(session, c); err == nil && p == xenapi.ConsoleProtocolRfb {
+				console = c
+				break
+			}
+		}
 		sid := rawLogin(url, user, password)
-		resp, err := insecureClient().Get(fmt.Sprintf("%s/vncsnapshot?session_id=%s&ref=%s", url, sid, vmRef))
+		resp, err := insecureClient().Get(fmt.Sprintf("%s/vncsnapshot?session_id=%s&ref=%s", url, sid, console))
 		check(err)
 		thumb, err := io.ReadAll(resp.Body)
 		check(err)

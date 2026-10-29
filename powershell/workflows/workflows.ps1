@@ -845,12 +845,15 @@ function Invoke-SnapshotRevert {
 
     # A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
     # VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-    # session id travels in the query string. Only a running VM has a console to capture: the server
-    # answers HTTP 500 for a halted VM, and for the snapshot record itself. Still pure PowerShell:
+    # session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
+    # host answers 404 to a VM). Only a running VM has a console to capture. Still pure PowerShell:
     # Connect-Example has already trusted the server's certificate.
     if ((Get-XenVM -Ref $vm.opaque_ref).power_state -eq 'Running') {
+        $console = (Get-XenVM -Ref $vm.opaque_ref).consoles |
+            ForEach-Object { Get-XenConsole -Ref $_.opaque_ref } | Where-Object { $_.protocol -eq 'rfb' } |
+            Select-Object -First 1
         $thumb = Invoke-WebRequest -UseBasicParsing `
-            -Uri "$Url/vncsnapshot?session_id=$($session.opaque_ref)&ref=$($vm.opaque_ref)"
+            -Uri "$Url/vncsnapshot?session_id=$($session.opaque_ref)&ref=$($console.opaque_ref)"
         Write-Host "Thumbnail:      $($thumb.Content.Length) bytes of PNG"
     }
     else {

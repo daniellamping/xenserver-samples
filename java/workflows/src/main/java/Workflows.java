@@ -859,11 +859,15 @@ public class Workflows {
 
         // A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
         // VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-        // session id travels in the query string. Only a running VM has a console to capture: the server
-        // answers HTTP 500 for a halted VM, and for the snapshot record itself.
+        // session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
+        // host answers 404 to a VM). Only a running VM has a console to capture.
         if (vm.getPowerState(conn) == Types.VmPowerState.RUNNING) {
+            com.xensource.xenapi.Console console = null;
+            for (com.xensource.xenapi.Console c : vm.getConsoles(conn)) {
+                if (c.getProtocol(conn) == Types.ConsoleProtocol.RFB) { console = c; break; }
+            }
             HttpGet thumbGet = new HttpGet(url + "/vncsnapshot?session_id=" + conn.getSessionReference()
-                    + "&ref=" + vm.toWireString());
+                    + "&ref=" + console.toWireString());
             try (CloseableHttpClient http = trustingHttpClient()) {
                 byte[] png = http.execute(thumbGet, resp -> {
                     if (resp.getCode() != 200) throw new java.io.IOException("vncsnapshot: HTTP " + resp.getCode());

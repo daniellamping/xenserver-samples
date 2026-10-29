@@ -746,11 +746,13 @@ def snapshot_revert(url, username, password, vm_name, snapshot_name="sdk-example
 
     # A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
     # VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-    # session id travels in the query string. Only a running VM has a console to capture: the server
-    # answers HTTP 500 for a halted VM, and for the snapshot record itself.
+    # session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
+    # host answers 404 to a VM). Only a running VM has a console to capture.
     if session.xenapi.VM.get_power_state(vm_ref) == "Running":
+        console = next(c for c in session.xenapi.VM.get_consoles(vm_ref)
+                       if session.xenapi.console.get_protocol(c) == "rfb")
         with urllib.request.urlopen(
-                "%s/vncsnapshot?session_id=%s&ref=%s" % (url, session._session, vm_ref),
+                "%s/vncsnapshot?session_id=%s&ref=%s" % (url, session._session, console),
                 context=ssl._create_unverified_context()) as response:
             print("Thumbnail:      %d bytes of PNG" % len(response.read()))
     else:

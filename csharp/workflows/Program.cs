@@ -787,13 +787,15 @@ internal static class Program
 
         // A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
         // VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-        // session id travels in the query string. Only a running VM has a console to capture: the server
-        // answers HTTP 500 for a halted VM, and for the snapshot record itself.
+        // session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
+        // host answers 404 to a VM). Only a running VM has a console to capture.
         if (VM.get_power_state(session, vmRef) == vm_power_state.Running)
         {
+            var console = VM.get_consoles(session, vmRef)
+                .First(c => XenAPI.Console.get_protocol(session, c.opaque_ref) == console_protocol.rfb);
             using var client = InsecureHttpClient();
             var bytes = client.GetByteArrayAsync(
-                $"{url}/vncsnapshot?session_id={session.opaque_ref}&ref={vmRef}").Result;
+                $"{url}/vncsnapshot?session_id={session.opaque_ref}&ref={console.opaque_ref}").Result;
             Console.WriteLine($"Thumbnail:      {bytes.Length} bytes of PNG");
         }
         else
