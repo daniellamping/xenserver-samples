@@ -1367,15 +1367,6 @@ func configureHa(url, user, password, heartbeatSRName string) {
 	fmt.Printf("Heartbeat SR:  %s\n", srName)
 	check(xenapi.SR.AssertCanHostHaStatefile(session, srRef))
 
-	// How many host failures can the pool tolerate? Set that as the target and enable HA.
-	ntol, err := xenapi.Pool.HaComputeHypotheticalMaxHostFailuresToTolerate(session, map[xenapi.VMRef]string{})
-	check(err)
-	fmt.Printf("Max failures:  %d\n", ntol)
-	check(xenapi.Pool.SetHaHostFailuresToTolerate(session, poolRef, ntol))
-	check(xenapi.Pool.EnableHa(session, []xenapi.SRRef{srRef}, map[string]string{}))
-	enabled, _ := xenapi.Pool.GetHaEnabled(session, poolRef)
-	fmt.Printf("HA enabled:    %v\n", enabled)
-
 	// What HA does per VM. The restart priority decides which guests come back first after a host
 	// failure, and whether a VM is protected at all; "restart" is protected, an empty string is not.
 	vms, err := xenapi.VM.GetAllRecords(session)
@@ -1388,6 +1379,27 @@ func configureHa(url, user, password, heartbeatSRName string) {
 			break
 		}
 	}
+
+	// How many host failures can the pool tolerate WITH the VMs you mean to protect? Plan for those
+	// (as XenCenter's HA wizard does): a target computed with none protected can be too high, and
+	// protecting a VM afterwards then fails HA_OPERATION_WOULD_BREAK_FAILOVER_PLAN.
+	ntol, err := xenapi.Pool.HaComputeHypotheticalMaxHostFailuresToTolerate(session,
+		map[xenapi.VMRef]string{guest: "restart"})
+	check(err)
+	fmt.Printf("Max failures:  %d\n", ntol)
+	check(xenapi.Pool.SetHaHostFailuresToTolerate(session, poolRef, ntol))
+	check(xenapi.Pool.EnableHa(session, []xenapi.SRRef{srRef}, map[string]string{}))
+	// Turn HA back off however the rest goes (check panics, and deferred calls still run): left on, it
+	// blocks host reboots, coordinator changes and more (HA_IS_ENABLED, HA_OPERATION_WOULD_BREAK_FAILOVER_PLAN).
+	haOn := true
+	defer func() {
+		if haOn {
+			_ = xenapi.Pool.DisableHa(session)
+		}
+	}()
+	enabled, _ := xenapi.Pool.GetHaEnabled(session, poolRef)
+	fmt.Printf("HA enabled:    %v\n", enabled)
+
 	was, err := xenapi.VM.GetHaRestartPriority(session, guest)
 	check(err)
 	check(xenapi.VM.SetHaRestartPriority(session, guest, "restart"))
@@ -1402,6 +1414,7 @@ func configureHa(url, user, password, heartbeatSRName string) {
 
 	// Turn HA back off so the example is repeatable.
 	check(xenapi.Pool.DisableHa(session))
+	haOn = false
 	enabled, _ = xenapi.Pool.GetHaEnabled(session, poolRef)
 	fmt.Printf("HA enabled:    %v\n", enabled)
 	fmt.Println("OK: configure-ha")
