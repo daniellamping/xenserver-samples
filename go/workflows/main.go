@@ -3362,11 +3362,24 @@ func isWlbStillDiscovering(err error) bool {
 func configureClustering(url, user, password string) {
 	session := connect(url, user, password)
 
-	// Clustering is what shared block storage needs before GFS2 thin provisioning. Pick a network every
-	// host can reach: corosync is latency-sensitive, and a cluster that loses quorum takes its GFS2
-	// storage offline with it.
-	networks, err := xenapi.Network.GetAll(session)
+	// Clustering is what shared block storage needs before GFS2 thin provisioning. Run it over a network
+	// every host is on - the management network - since corosync is latency-sensitive and a cluster that
+	// loses quorum takes its GFS2 storage offline with it.
+	pifs, err := xenapi.PIF.GetAllRecords(session)
 	check(err)
+	var network xenapi.NetworkRef
+	for _, p := range pifs {
+		if p.Management {
+			network = p.Network
+			break
+		}
+	}
+	was := map[xenapi.PIFRef]bool{}
+	for ref, p := range pifs {
+		if p.Network == network {
+			was[ref] = p.DisallowUnplug
+		}
+	}
 
 	existing, err := xenapi.Cluster.GetAll(session)
 	check(err)
@@ -3374,7 +3387,12 @@ func configureClustering(url, user, password string) {
 	if len(existing) > 0 {
 		cluster = existing[0]
 	} else {
-		cluster, err = xenapi.Cluster.PoolCreate(session, networks[0], "corosync", 20000, 1000)
+		// Corosync must not lose its network, so each host's PIF on it has to refuse unplugging first:
+		// Cluster.PoolCreate fails PIF_ALLOWS_UNPLUG otherwise. was remembers the settings to restore.
+		for ref := range was {
+			check(xenapi.PIF.SetDisallowUnplug(session, ref, true))
+		}
+		cluster, err = xenapi.Cluster.PoolCreate(session, network, "corosync", 20000, 1000)
 		check(err)
 	}
 
@@ -3396,6 +3414,15 @@ func configureClustering(url, user, password string) {
 	check(xenapi.Cluster.PoolResync(session, cluster))
 	quorate, _ = xenapi.Cluster.GetIsQuorate(session, cluster)
 	fmt.Printf("Resynced,   quorate: %t\n", quorate)
+
+	// Tidy up a cluster this example created (one that was already there stays), and the PIF settings.
+	if len(existing) == 0 {
+		check(xenapi.Cluster.PoolDestroy(session, cluster))
+		for ref, v := range was {
+			check(xenapi.PIF.SetDisallowUnplug(session, ref, v))
+		}
+		fmt.Println("Cluster removed again.")
+	}
 
 	fmt.Println("OK: configure-clustering")
 	session.Logout()
@@ -4476,18 +4503,21 @@ func disasterRecovery(url, user, password, drURL string) {
 	drSession := connect(drURL, user, password)
 	defer drSession.Logout()
 
-	// Replication needs storage every host can reach and that can hold data. The server checks rather
-	// than taking your word for it, so ask before enabling.
+	// Replication needs shared storage the standby pool can attach too, and only block storage (iSCSI,
+	// HBA) supports it - an NFS SR fails SR_OPERATION_NOT_SUPPORTED. The server checks rather than taking
+	// your word for it, so ask each candidate, as XenCenter's DR wizard does.
 	srs, err := xenapi.SR.GetAllRecords(session)
 	check(err)
 	var sr xenapi.SRRef
 	for ref, r := range srs {
-		if r.Shared && r.ContentType != "iso" && r.Type != "iso" && r.Type != "udev" {
+		if r.Shared && r.ContentType != "iso" && xenapi.SR.AssertSupportsDatabaseReplication(session, ref) == nil {
 			sr = ref
 			break
 		}
 	}
-	check(xenapi.SR.AssertSupportsDatabaseReplication(session, sr))
+	if sr == "" {
+		panic("no shared SR here supports database replication (it needs iSCSI or HBA storage)")
+	}
 	srName, _ := xenapi.SR.GetNameLabel(session, sr)
 	fmt.Printf("Replicating pool metadata to %s\n", srName)
 	check(xenapi.SR.EnableDatabaseReplication(session, sr))
@@ -4533,14 +4563,24 @@ func disasterRecovery(url, user, password, drURL string) {
 	sort.Slice(targets, func(i, j int) bool {
 		return recoverable[targets[i]].NameLabel < recoverable[targets[j]].NameLabel
 	})
-	target := targets[0]
+	// Only a VM whose disks are all on storage the standby pool can see can be recovered there - the
+	// check runs on the METADATA session, and session_to says where the VM should land: the STANDBY
+	// pool's session, not this one. Take the first (by name) that passes, as the DR wizard lists them.
+	target := ""
+	for _, t := range targets {
+		if _, failure := rawRPCCall(url, "VM.assert_can_be_recovered", string(metadataSession), t, drSessionID); failure == nil {
+			target = t
+			break
+		}
+	}
+	if target == "" {
+		panic("no VM in the replicated database has all its disks on storage the standby pool can see")
+	}
 	targetUUID := recoverable[target].UUID
 	name := recoverable[target].NameLabel
 	fmt.Printf("  recovering %s\n", name)
 
-	// Both calls run on the METADATA session; session_to says where the VM should land - the
-	// STANDBY pool's session, not this one. Never force=true: see the doc comment above.
-	rawRPC(url, "VM.assert_can_be_recovered", string(metadataSession), target, drSessionID)
+	// Never force=true: see the doc comment above.
 	rawRPC(url, "VM.recover", string(metadataSession), target, drSessionID, false)
 
 	// It is a real VM on the standby pool now, not merely a call that returned - look it up by the
@@ -4562,6 +4602,15 @@ func disasterRecovery(url, user, password, drURL string) {
 // rawRPC makes a JSON-RPC call with an explicit session id — for the one thing the Go binding cannot
 // express, a session it did not create itself.
 func rawRPC(url, method string, params ...any) json.RawMessage {
+	result, failure := rawRPCCall(url, method, params...)
+	if failure != nil {
+		panic(fmt.Sprintf("%s failed: %s", method, failure))
+	}
+	return result
+}
+
+// rawRPCCall is rawRPC that returns a XenAPI failure (the JSON-RPC error) instead of panicking on it.
+func rawRPCCall(url, method string, params ...any) (json.RawMessage, json.RawMessage) {
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": method, "params": params,
 	})
@@ -4575,9 +4624,9 @@ func rawRPC(url, method string, params ...any) json.RawMessage {
 	}
 	check(json.NewDecoder(resp.Body).Decode(&r))
 	if len(r.Error) > 0 && string(r.Error) != "null" {
-		panic(fmt.Sprintf("%s failed: %s", method, r.Error))
+		return nil, r.Error
 	}
-	return r.Result
+	return r.Result, nil
 }
 
 // Run it:

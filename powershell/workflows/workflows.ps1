@@ -194,6 +194,17 @@ function Copy-OfGuest {
     return Get-XenVM -Ref $vm.opaque_ref
 }
 
+# Evacuate a host over its management network. Name the network: before CA-431418 (SDK 26.21) the
+# cmdlet always calls the newest host.evacuate, and with no -Network it sends an empty network, which a
+# real host refuses (PIF_NOT_PRESENT) as soon as there is a VM to move.
+function Invoke-Evacuate {
+    param([Parameter(Mandatory = $true)]$XenHost)
+    $network = (Get-XenPIF | Where-Object {
+        $_.management -and $_.host.opaque_ref -eq $XenHost.opaque_ref
+    } | Select-Object -First 1).network.opaque_ref
+    $XenHost | Invoke-XenHost -XenAction Evacuate -Network $network
+}
+
 function Wait-GuestAgent {
     # Wait, after Start, until the guest's PV drivers have reported in.
     #
@@ -1159,7 +1170,7 @@ function Invoke-HostMaintenance {
     # Enter maintenance mode: disable the host, then evacuate its guests.
     $xenHost | Invoke-XenHost -XenAction Disable
     Write-Host "After disable:    host.enabled = $((Get-XenHost -Ref $xenHost.opaque_ref).enabled)"
-    $xenHost | Invoke-XenHost -XenAction Evacuate
+    Invoke-Evacuate -XenHost $xenHost
     Write-Host "After evacuate:   guest now on $((Get-XenHost -Ref (Get-XenVM -Ref $ref).resident_on).name_label)"
 
     # Exit maintenance mode.
@@ -1588,7 +1599,7 @@ function Invoke-ApplyUpdate {
                 }
                 Write-Host "  $($xenHost.name_label): needs evacuating first; evacuating and retrying"
                 $xenHost | Invoke-XenHost -XenAction Disable
-                $xenHost | Invoke-XenHost -XenAction Evacuate
+                Invoke-Evacuate -XenHost $xenHost
                 $xenHost | Invoke-XenHost -XenAction ApplyUpdates -Hash $hash
                 $xenHost | Invoke-XenHost -XenAction Enable
             }
@@ -2220,7 +2231,7 @@ function Invoke-RollingPoolUpdate {
         foreach ($xenHost in Get-XenHost) {
             Write-Host "Updating $($xenHost.name_label):"
             $xenHost | Invoke-XenHost -XenAction Disable    # stop new VMs landing here
-            $xenHost | Invoke-XenHost -XenAction Evacuate   # move running guests to the rest of the pool
+            Invoke-Evacuate -XenHost $xenHost   # move running guests to the rest of the pool
             $xenHost | Invoke-XenHost -XenAction ApplyUpdates -Hash $hash  # apply the synced updates
             $guidance = @((Get-XenHost -Ref $xenHost.opaque_ref).pending_guidances)
             Write-Host "  applied; pending guidance = [$($guidance -join ', ')]"
@@ -2936,13 +2947,19 @@ function Invoke-ConfigureClustering {
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
 
-    # Clustering is what shared block storage needs before GFS2 thin provisioning. Pick a network every
-    # host can reach: corosync is latency-sensitive, and a cluster that loses quorum takes its GFS2
-    # storage offline with it.
-    $network = Get-XenNetwork | Select-Object -First 1
+    # Clustering is what shared block storage needs before GFS2 thin provisioning. Run it over a network
+    # every host is on - the management network - since corosync is latency-sensitive and a cluster that
+    # loses quorum takes its GFS2 storage offline with it.
+    $pifs = @(Get-XenPIF)
+    $network = Get-XenNetwork -Ref ($pifs | Where-Object { $_.management } | Select-Object -First 1).network.opaque_ref
+    $networkPifs = @($pifs | Where-Object { $_.network.opaque_ref -eq $network.opaque_ref })
 
     $cluster = Get-XenCluster | Select-Object -First 1
-    if (-not $cluster) {
+    $created = -not $cluster
+    if ($created) {
+        # Corosync must not lose its network, so each host's PIF on it has to refuse unplugging first:
+        # Cluster.pool_create fails PIF_ALLOWS_UNPLUG otherwise. $networkPifs keeps the old settings.
+        $networkPifs | ForEach-Object { Set-XenPIF -Ref $_.opaque_ref -DisallowUnplug $true }
         # Invoke-XenCluster's parameter sets are XenObject / Ref / Uuid -- every one of them identifies an
         # EXISTING cluster -- so the module cannot express pool_create, which is a constructor. Same
         # situation as the event API: call it over JSON-RPC (see Invoke-XenMethod above).
@@ -2962,6 +2979,13 @@ function Invoke-ConfigureClustering {
     Invoke-XenClusterHost -Ref $member.opaque_ref -XenAction Enable
     Invoke-XenCluster -Ref $cluster.opaque_ref -XenAction PoolResync
     Write-Host "Resynced,   quorate: $((Get-XenCluster | Select-Object -First 1).is_quorate)"
+
+    # Tidy up a cluster this example created (one that was already there stays), and the PIF settings.
+    if ($created) {
+        Invoke-XenCluster -Ref $cluster.opaque_ref -XenAction PoolDestroy
+        $networkPifs | ForEach-Object { Set-XenPIF -Ref $_.opaque_ref -DisallowUnplug $_.disallow_unplug }
+        Write-Host "Cluster removed again."
+    }
 
     Write-Host "OK: configure-clustering"
     $session | Disconnect-XenServer
@@ -3791,12 +3815,19 @@ function Invoke-DisasterRecovery {
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $drSession = Connect-Example -Url $DrUrl -UserName $UserName -Password $Password
 
-    # Replication needs storage every host can reach and that can hold data. The server checks rather than
-    # taking your word for it, so ask before enabling.
+    # Replication needs shared storage the standby pool can attach too, and only block storage (iSCSI,
+    # HBA) supports it - an NFS SR fails SR_OPERATION_NOT_SUPPORTED. The server checks rather than taking
+    # your word for it, so ask each candidate, as XenCenter's DR wizard does.
     $sr = Get-XenSR -SessionOpaqueRef $session.opaque_ref | Where-Object {
-        $_.shared -and $_.content_type -ne 'iso' -and $_.type -notin @('iso', 'udev')
+        $_.shared -and $_.content_type -ne 'iso'
+    } | Where-Object {
+        try {
+            $_ | Invoke-XenSR -SessionOpaqueRef $session.opaque_ref -XenAction AssertSupportsDatabaseReplication
+            $true
+        }
+        catch { $false }
     } | Select-Object -First 1
-    $sr | Invoke-XenSR -SessionOpaqueRef $session.opaque_ref -XenAction AssertSupportsDatabaseReplication
+    if (-not $sr) { throw "no shared SR here supports database replication (it needs iSCSI or HBA storage)" }
     Write-Host "Replicating pool metadata to $($sr.name_label)"
     $sr | Invoke-XenSR -SessionOpaqueRef $session.opaque_ref -XenAction EnableDatabaseReplication
 
@@ -3818,16 +3849,24 @@ function Invoke-DisasterRecovery {
         } | Sort-Object { $_.Value.name_label })
     Write-Host "  the replicated database describes $($recoverable.Count) recoverable VM(s)"
 
-    $target = $recoverable[0]
+    # Only a VM whose disks are all on storage the standby pool can see can be recovered there - the check
+    # runs on the METADATA session, and session_to says where the VM should land: the STANDBY pool's
+    # session, not this one. Take the first (by name) that passes, as the DR wizard lists them.
+    $target = $recoverable | Where-Object {
+        try {
+            Invoke-XenMethod -Session $metadata -Method 'VM.assert_can_be_recovered' `
+                -Params @($_.Name, $drSession.opaque_ref) | Out-Null
+            $true
+        }
+        catch { $false }
+    } | Select-Object -First 1
+    if (-not $target) { throw "no VM in the replicated database has all its disks on storage the standby pool can see" }
     $targetUuid = $target.Value.uuid
     $name = $target.Value.name_label
     Write-Host "  recovering $name"
 
-    # Both calls run on the METADATA session; session_to says where the VM should land - the STANDBY
-    # pool's session, not this one. force stays false - never true (see above: that's the one-line "fix"
-    # that would actually destroy a live VM if ever pointed at the source pool).
-    Invoke-XenMethod -Session $metadata -Method 'VM.assert_can_be_recovered' `
-        -Params @($target.Name, $drSession.opaque_ref) | Out-Null
+    # force stays false - never true (see above: that's the one-line "fix" that would actually destroy a
+    # live VM if ever pointed at the source pool).
     Invoke-XenMethod -Session $metadata -Method 'VM.recover' `
         -Params @($target.Name, $drSession.opaque_ref, $false) | Out-Null
 
@@ -3929,7 +3968,7 @@ function Invoke-RestartHost {
 
     # Evacuate moves the guests elsewhere in the pool. Afterwards only the control domain - the host's own
     # management VM, which cannot move - is left.
-    $xenHost | Invoke-XenHost -XenAction Evacuate
+    Invoke-Evacuate -XenHost $xenHost
     Write-Host "  evacuated:  guests=$(Measure-HostGuest $xenHost)"
 
     $xenHost | Invoke-XenHost -XenAction Reboot

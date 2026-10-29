@@ -2459,13 +2459,23 @@ def configure_clustering(url, username, password):
     session = connect(url, username, password)
     x = session.xenapi
 
-    # Clustering is what shared block storage needs before it can be thin-provisioned with GFS2. Pick a
-    # network every host can reach: corosync is latency-sensitive, and a cluster that loses quorum takes
-    # its GFS2 storage offline with it.
-    network = x.network.get_all()[0]
+    # Clustering is what shared block storage needs before it can be thin-provisioned with GFS2. Run it
+    # over a network every host is on - the management network - since corosync is latency-sensitive and
+    # a cluster that loses quorum takes its GFS2 storage offline with it.
+    pifs = x.PIF.get_all_records()
+    network = next(r["network"] for r in pifs.values() if r["management"])
+    network_pifs = [ref for ref, r in pifs.items() if r["network"] == network]
 
     existing = x.Cluster.get_all()
-    cluster = existing[0] if existing else x.Cluster.pool_create(network, "corosync", "20000", "1000")
+    if existing:
+        cluster = existing[0]
+    else:
+        # Corosync must not lose its network, so each host's PIF on it has to refuse unplugging first:
+        # Cluster.pool_create fails PIF_ALLOWS_UNPLUG otherwise. Remember the settings to restore them.
+        was = {ref: pifs[ref]["disallow_unplug"] for ref in network_pifs}
+        for ref in network_pifs:
+            x.PIF.set_disallow_unplug(ref, True)
+        cluster = x.Cluster.pool_create(network, "corosync", "20000", "1000")
 
     record = x.Cluster.get_record(cluster)
     print(f"Stack:      {record['cluster_stack']}")
@@ -2480,6 +2490,13 @@ def configure_clustering(url, username, password):
     x.Cluster_host.enable(member)
     x.Cluster.pool_resync(cluster)
     print(f"Resynced,   quorate: {x.Cluster.get_is_quorate(cluster)}")
+
+    # Tidy up a cluster this example created (one that was already there stays), and the PIF settings.
+    if not existing:
+        x.Cluster.pool_destroy(cluster)
+        for ref, value in was.items():
+            x.PIF.set_disallow_unplug(ref, value)
+        print("Cluster removed again.")
 
     print("OK: configure-clustering")
     x.session.logout()
@@ -3283,11 +3300,19 @@ def disaster_recovery(url, username, password, dr_url=None):
     dr_session = connect(dr_url, username, password)
     x = session.xenapi
 
-    # Replication needs storage every host can reach and that can hold data. The server
-    # checks rather than taking your word for it, so ask before enabling.
-    sr = next(ref for ref, r in x.SR.get_all_records().items()
-              if r["shared"] and r["content_type"] != "iso" and r["type"] not in ("iso", "udev"))
-    x.SR.assert_supports_database_replication(sr)
+    # Replication needs shared storage the standby pool can attach too, and only block storage (iSCSI,
+    # HBA) supports it - an NFS SR fails SR_OPERATION_NOT_SUPPORTED. The server checks rather than taking
+    # your word for it, so ask each candidate, as XenCenter's DR wizard does.
+    def supports_replication(sr):
+        try:
+            x.SR.assert_supports_database_replication(sr)
+            return True
+        except XenAPI.Failure:
+            return False
+    sr = next((ref for ref, r in x.SR.get_all_records().items()
+               if r["shared"] and r["content_type"] != "iso" and supports_replication(ref)), None)
+    if sr is None:
+        raise RuntimeError("no shared SR here supports database replication (it needs iSCSI or HBA storage)")
     print("Replicating pool metadata to %s" % x.SR.get_name_label(sr))
     x.SR.enable_database_replication(sr)
 
@@ -3304,15 +3329,24 @@ def disaster_recovery(url, username, password, dr_url=None):
                    if not r["is_a_template"] and not r["is_control_domain"] and not r["is_a_snapshot"]}
     print("  the replicated database describes %d recoverable VM(s)" % len(recoverable))
 
-    target = sorted(recoverable, key=lambda ref: recoverable[ref]["name_label"])[0]
+    # Only a VM whose disks are all on storage the standby pool can see can be recovered there - the
+    # check runs on the METADATA session, and session_to says where the VM should land: the STANDBY
+    # pool's session, not this one. Take the first (by name) that passes, as the DR wizard lists them.
+    dr_session_id = dr_session._session
+    def can_be_recovered(ref):
+        try:
+            metadata.xenapi.VM.assert_can_be_recovered(ref, dr_session_id)
+            return True
+        except XenAPI.Failure:
+            return False
+    target = next((ref for ref in sorted(recoverable, key=lambda ref: recoverable[ref]["name_label"])
+                   if can_be_recovered(ref)), None)
+    if target is None:
+        raise RuntimeError("no VM in the replicated database has all its disks on storage the standby "
+                           "pool can see")
     target_uuid = recoverable[target]["uuid"]
     name = recoverable[target]["name_label"]
     print("  recovering %s" % name)
-
-    # Both calls run on the METADATA session; session_to says where the VM should land - the
-    # STANDBY pool's session, not this one.
-    dr_session_id = dr_session._session
-    metadata.xenapi.VM.assert_can_be_recovered(target, dr_session_id)
     metadata.xenapi.VM.recover(target, dr_session_id, False)
 
     # It is a real VM on the standby pool now, not merely a call that returned - look it up by the

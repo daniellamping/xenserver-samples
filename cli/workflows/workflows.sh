@@ -1298,9 +1298,23 @@ w_rolling_pool_update() {
 w_cross_pool_copy_vm() {
     # Copy a VM to another pool (Storage XenMotion copy). Real xe does the whole cross-pool dance
     # itself given the destination master's address + credentials; copy=true leaves the source intact.
-    dest_host=${desturl#*://}; dest_host=${dest_host%%/*}; dest_host=${dest_host%%:*}
+    local dest_hp dest_master dest_net v
+    local -a dest_opts vif_map
+    dest_hp=${desturl#*://}; dest_hp=${dest_hp%%/*}
+    dest_host=${dest_hp%%:*}
+    dest_opts=()
+    if [ "$dest_hp" != "$dest_host" ] && [ "${dest_hp##*:}" != 443 ]; then dest_opts=(-p $((${dest_hp##*:} + 1))); fi
+    case "${XE_EXE:-xe}" in *.exe | *.EXE) dest_opts+=(-no-warn-new-certificates -no-warn-certificates) ;; esac
+    xe_dest() { command "${XE_EXE:-xe}" -s "$dest_host" "${dest_opts[@]}" -u "$destuser" -pw "$destpass" "$@"; }
     vm=$(vm_uuid "$copy_vm")
-    xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$destuser remote-password=$destpass copy=true
+    # Map every NIC to the destination coordinator's management network, one both pools can certainly
+    # reach. Left unmapped, a real pool refuses the VIF ("not mapped to a destination Network") unless it
+    # happens to find a same-named network there.
+    dest_master=$(xe_dest pool-param-get uuid=$(xe_dest pool-list --minimal) param-name=master)
+    dest_net=$(xe_dest pif-list host-uuid=$dest_master management=true params=network-uuid --minimal)
+    vif_map=()
+    for v in $(each_csv "$(xe vif-list vm-uuid=$vm --minimal)"); do vif_map+=("vif:$v=$dest_net"); done
+    xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$destuser remote-password=$destpass copy=true         "${vif_map[@]}"
     still=$([ -n "$(vm_uuid "$copy_vm")" ] && echo True || echo False)
     echo "Sent '$copy_vm' to $dest_host (copy); source still present: $still"
     echo "OK: cross-pool-copy-vm"
@@ -1697,10 +1711,20 @@ w_wlb_recommendations() {
 
 # --- Configure clustering (GFS2) ---------------------------------------------------------
 w_configure_clustering() {
-    local cluster member
+    local cluster member network created=false pif
+    local -A was=()
+    # Run corosync over a network every host is on - the management network.
+    network=$(first_csv "$(xe pif-list management=true params=network-uuid --minimal)")
     cluster=$(first_csv "$(xe cluster-list --minimal)")
     if [ -z "$cluster" ]; then
-        cluster=$(xe cluster-pool-create network-uuid="$(first_csv "$(xe network-list --minimal)")")
+        # Corosync must not lose its network, so each host's PIF on it has to refuse unplugging first:
+        # cluster-pool-create fails PIF_ALLOWS_UNPLUG otherwise. Remember the settings to restore them.
+        for pif in $(each_csv "$(xe pif-list network-uuid="$network" --minimal)"); do
+            was[$pif]=$(xe pif-param-get uuid="$pif" param-name=disallow-unplug)
+            xe pif-param-set uuid="$pif" disallow-unplug=true
+        done
+        cluster=$(xe cluster-pool-create network-uuid="$network")
+        created=true
     fi
 
     echo "Stack:      $(xe cluster-list uuid="$cluster" params=cluster-stack --minimal)"
@@ -1714,6 +1738,13 @@ w_configure_clustering() {
     xe cluster-host-enable uuid="$member"
     xe cluster-pool-resync
     echo "Resynced,   quorate: $(xe cluster-list uuid="$cluster" params=is-quorate --minimal)"
+
+    # Tidy up a cluster this example created (one that was already there stays), and the PIF settings.
+    if [ "$created" = true ]; then
+        xe cluster-pool-destroy cluster-uuid="$cluster"
+        for pif in "${!was[@]}"; do xe pif-param-set uuid="$pif" disallow-unplug="${was[$pif]}"; done
+        echo "Cluster removed again."
+    fi
     echo "OK: configure-clustering"
 }
 
@@ -2318,10 +2349,18 @@ w_disaster_recovery() {
     dr_probe=$(xe_dr pool-list --minimal 2>&1) || true
     if [[ $dr_probe =~ (Master|Coordinator)\ IP\ address:\ ([0-9A-Fa-f.:]+) ]]; then dr_host=${BASH_REMATCH[2]}; fi
 
-    # Replication needs shared storage that can hold data.
-    sr=$(shared_sr)
+    # Replication needs shared storage the standby pool can attach too, and only block storage (iSCSI,
+    # HBA) supports it - an NFS SR fails SR_OPERATION_NOT_SUPPORTED. xe has no assert for it, so try each
+    # shared SR in turn until one takes it.
+    sr=""
+    for candidate in $(each_csv "$(xe sr-list shared=true content-type=user --minimal)"); do
+        if xe sr-enable-database-replication uuid=$candidate 2>/dev/null; then sr=$candidate; break; fi
+    done
+    if [ -z "$sr" ]; then
+        echo "no shared SR here supports database replication (it needs iSCSI or HBA storage)" >&2
+        exit 1
+    fi
     echo "Replicating pool metadata to $(xe sr-param-get uuid=$sr param-name=name-label)"
-    xe sr-enable-database-replication uuid=$sr
 
     vdi=$(first_csv "$(xe vdi-list type=metadata sr-uuid=$sr --minimal)")
     echo "  metadata disk: $vdi"
@@ -2333,11 +2372,20 @@ w_disaster_recovery() {
         is-a-snapshot=false --minimal)
     echo "  the replicated database describes $(count_csv "$recoverable") recoverable VM(s)"
 
-    md=$(first_csv "$recoverable")
+    # Only a VM whose disks are all on storage the standby pool can see can be recovered there. Take the
+    # first that passes the check, as the DR wizard lists them.
+    md=""
+    for candidate in $(each_csv "$recoverable"); do
+        if xe_dr vm-assert-can-be-recovered uuid=$candidate database:vdi-uuid=$vdi 2>/dev/null; then
+            md=$candidate; break
+        fi
+    done
+    if [ -z "$md" ]; then
+        echo "no VM in the replicated database has all its disks on storage the standby pool can see" >&2
+        exit 1
+    fi
     name=$(xe vm-list uuid=$md database:vdi-uuid=$vdi params=name-label --minimal)
     echo "  recovering $name"
-
-    xe_dr vm-assert-can-be-recovered uuid=$md database:vdi-uuid=$vdi
     xe_dr vm-recover uuid=$md database:vdi-uuid=$vdi force=false
 
     # It is a real VM on the standby pool now, not merely a command that returned - look it up there, by

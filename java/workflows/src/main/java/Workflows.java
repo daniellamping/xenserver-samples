@@ -95,8 +95,18 @@ public class Workflows {
             return login(http, url, user, password);
         } catch (Types.HostIsSlave e) {
             // A pool member names the coordinator's address; reconnect there (assuming the coordinator
-            // is up), exactly as XenCenter does when you add a member server.
+            // is up), exactly as XenCenter does when you add a member server. SDKs before CA-432633 read
+            // that address as "" under JSON-RPC: say so rather than connecting to "https://".
+            if (e.masterIPAddress == null || e.masterIPAddress.isEmpty())
+                throw new CoordinatorUnknown(url);
             return login(http, "https://" + e.masterIPAddress, user, password);
+        }
+    }
+
+    // HOST_IS_SLAVE from a pool member, without the coordinator's address (see connect).
+    private static class CoordinatorUnknown extends Exception {
+        CoordinatorUnknown(String url) {
+            super(url + " is a pool member, and this SDK did not report the coordinator's address");
         }
     }
 
@@ -281,13 +291,18 @@ public class Workflows {
     // enough - keep reconnecting until the pool names the new coordinator (by uuid; connect() follows
     // HOST_IS_SLAVE to wherever the coordinator now is). XenRT's own helper likewise waits minutes before
     // trusting the pool again.
-    private static Connection reconnectAfterMasterChange(String url, String user, String password,
-            String newMasterUuid) throws Exception {
+    private static Connection reconnectAfterMasterChange(String url, String newMasterUrl, String user,
+            String password, String newMasterUuid) throws Exception {
         long deadline = System.currentTimeMillis() + 600_000;
         Object lastError = null;
         while (System.currentTimeMillis() < deadline) {
             try {
-                Connection conn = connect(url, user, password);
+                Connection conn;
+                try {
+                    conn = connect(url, user, password);
+                } catch (CoordinatorUnknown e) {
+                    conn = connect(newMasterUrl, user, password);
+                }
                 Host master = Pool.getAll(conn).iterator().next().getMaster(conn);
                 // The new coordinator answers before the pool has settled - calls made too soon fail
                 // (HANDLE_INVALID on the operation's own task) - so also wait for every host to be back,
@@ -329,6 +344,14 @@ public class Workflows {
         }
     }
 
+    // Is e the XenAPI error `code`? Check the text as well as the type: SDKs before CA-432633 throw an
+    // error that has no parameters (HOST_STILL_BOOTING, HA_IS_ENABLED...) as BadServerResponse, whose
+    // text is the JSON-RPC error, rather than as its typed exception.
+    private static boolean isError(Types.XenAPIException e, String code) {
+        return String.valueOf(e).contains(code)
+                || (e.errorDescription != null && e.errorDescription.length > 0 && code.equals(e.errorDescription[0]));
+    }
+
     // Re-enable a host that has just come back. It reports itself live before xapi on it has finished
     // starting, and until then host.enable fails HOST_STILL_BOOTING - so retry that.
     private static void enableWhenBooted(Connection conn, Host host) throws Exception {
@@ -337,8 +360,9 @@ public class Workflows {
             try {
                 host.enable(conn);
                 return;
-            } catch (Types.HostStillBooting e) {
-                if (System.currentTimeMillis() > deadline) throw e;
+            } catch (Types.XenAPIException e) {
+                boolean booting = e instanceof Types.HostStillBooting || isError(e, "HOST_STILL_BOOTING");
+                if (!booting || System.currentTimeMillis() > deadline) throw e;
                 Thread.sleep(10_000);
             }
         }
@@ -2735,15 +2759,29 @@ public class Workflows {
     private static void configureClustering(String url, String user, String password) throws Exception {
         Connection conn = connect(url, user, password);
         try {
-            // Clustering is what shared block storage needs before GFS2 thin provisioning. Pick a
-            // network every host can reach: corosync is latency-sensitive, and a cluster that loses
-            // quorum takes its GFS2 storage offline with it.
-            Network network = Network.getAll(conn).iterator().next();
+            // Clustering is what shared block storage needs before GFS2 thin provisioning. Run it over a
+            // network every host is on - the management network - since corosync is latency-sensitive
+            // and a cluster that loses quorum takes its GFS2 storage offline with it.
+            Map<PIF, PIF.Record> pifs = PIF.getAllRecords(conn);
+            Network network = null;
+            for (PIF.Record r : pifs.values()) {
+                if (r.management) { network = r.network; break; }
+            }
+            Map<PIF, Boolean> was = new HashMap<>();
+            for (Map.Entry<PIF, PIF.Record> e : pifs.entrySet()) {
+                if (e.getValue().network.equals(network)) was.put(e.getKey(), e.getValue().disallowUnplug);
+            }
 
             Set<Cluster> existing = Cluster.getAll(conn);
-            Cluster cluster = existing.isEmpty()
-                    ? Cluster.poolCreate(conn, network, "corosync", 20000.0, 1000.0)
-                    : existing.iterator().next();
+            Cluster cluster;
+            if (!existing.isEmpty()) {
+                cluster = existing.iterator().next();
+            } else {
+                // Corosync must not lose its network, so each host's PIF on it has to refuse unplugging
+                // first: Cluster.poolCreate fails PIF_ALLOWS_UNPLUG otherwise. was remembers the settings.
+                for (PIF pif : was.keySet()) pif.setDisallowUnplug(conn, true);
+                cluster = Cluster.poolCreate(conn, network, "corosync", 20000.0, 1000.0);
+            }
 
             System.out.println("Stack:      " + cluster.getClusterStack(conn));
             System.out.println("Quorate:    " + cluster.getIsQuorate(conn)
@@ -2757,6 +2795,14 @@ public class Workflows {
             member.enable(conn);
             cluster.poolResync(conn);
             System.out.println("Resynced,   quorate: " + cluster.getIsQuorate(conn));
+
+            // Tidy up a cluster this example created (one that was already there stays), and the PIF
+            // settings.
+            if (existing.isEmpty()) {
+                cluster.poolDestroy(conn);
+                for (Map.Entry<PIF, Boolean> e : was.entrySet()) e.getKey().setDisallowUnplug(conn, e.getValue());
+                System.out.println("Cluster removed again.");
+            }
 
             System.out.println("OK: configure-clustering");
         } finally {
@@ -2789,13 +2835,17 @@ public class Workflows {
         }
         Host other = hostByName(conn, otherName);
         String otherUuid = other.getUuid(conn);
+        // Each new coordinator's own address, to reconnect to if following HOST_IS_SLAVE from the old one
+        // fails: SDKs before CA-432633 read HostIsSlave.masterIPAddress as "" under JSON-RPC.
+        String otherUrl = hostUrl(url, other.getAddress(conn));
+        String originalUrl = hostUrl(url, original.getAddress(conn));
 
         // Promote another member. The pool database moves with the role and clients are redirected, so
         // this briefly interrupts management traffic - it does not move any VM.
         Pool.designateNewMaster(conn, other);
         System.out.println("Promoting:   " + otherName + " (xapi restarts pool-wide; reconnecting)");
 
-        conn = reconnectAfterMasterChange(url, user, password, otherUuid);
+        conn = reconnectAfterMasterChange(url, otherUrl, user, password, otherUuid);
         pool = Pool.getAll(conn).iterator().next();
         System.out.println("Promoted:    " + pool.getMaster(conn).getNameLabel(conn));
 
@@ -2806,7 +2856,7 @@ public class Workflows {
         Pool.designateNewMaster(conn, originalAgain);
         System.out.println("Restoring:   " + originalName + " (reconnecting again)");
 
-        conn = reconnectAfterMasterChange(url, user, password, originalUuid);
+        conn = reconnectAfterMasterChange(url, originalUrl, user, password, originalUuid);
         pool = Pool.getAll(conn).iterator().next();
         System.out.println("Restored:    " + pool.getMaster(conn).getNameLabel(conn));
 
@@ -3687,18 +3737,23 @@ public class Workflows {
         Connection conn = connect(url, user, password);
         Connection drConn = connect(drUrl, user, password);
         try {
-            // Replication needs storage every host can reach and that can hold data. The server checks
-            // rather than taking your word for it, so ask before enabling.
+            // Replication needs shared storage the standby pool can attach too, and only block storage
+            // (iSCSI, HBA) supports it - an NFS SR fails SR_OPERATION_NOT_SUPPORTED. The server checks
+            // rather than taking your word for it, so ask each candidate, as XenCenter's DR wizard does.
             SR sr = null;
             for (Map.Entry<SR, SR.Record> e : SR.getAllRecords(conn).entrySet()) {
                 SR.Record r = e.getValue();
-                if (r.shared && !"iso".equals(r.contentType)
-                        && r.type != null && !r.type.equals("iso") && !r.type.equals("udev")) {
-                    sr = e.getKey(); break;
+                if (!r.shared || "iso".equals(r.contentType)) continue;
+                try {
+                    e.getKey().assertSupportsDatabaseReplication(conn);
+                    sr = e.getKey();
+                    break;
+                } catch (Types.XenAPIException notThisOne) {
+                    // try the next one
                 }
             }
-            if (sr == null) throw new RuntimeException("no shared data SR to replicate to");
-            sr.assertSupportsDatabaseReplication(conn);
+            if (sr == null)
+                throw new RuntimeException("no shared SR here supports database replication (it needs iSCSI or HBA storage)");
             System.out.println("Replicating pool metadata to " + sr.getNameLabel(conn));
             sr.enableDatabaseReplication(conn);
 
@@ -3726,20 +3781,29 @@ public class Workflows {
             }
             System.out.printf("  the replicated database describes %d recoverable VM(s)%n", recoverable.size());
 
+            // Only a VM whose disks are all on storage the standby pool can see can be recovered there -
+            // the check runs on the METADATA session, and session_to says where the VM should land: the
+            // STANDBY pool's session, not this one. Take the first (by name) that passes, as the DR
+            // wizard lists them.
+            String drSessionId = drConn.getSessionReference();
+            List<Map.Entry<VM, VM.Record>> byName = new ArrayList<>(recoverable.entrySet());
+            byName.sort(Map.Entry.comparingByValue((a, b) -> a.nameLabel.compareTo(b.nameLabel)));
             VM target = null;
             String name = null;
             String targetUuid = null;
-            for (Map.Entry<VM, VM.Record> e : recoverable.entrySet())
-                if (name == null || e.getValue().nameLabel.compareTo(name) < 0) {
-                    target = e.getKey(); name = e.getValue().nameLabel; targetUuid = e.getValue().uuid;
+            for (Map.Entry<VM, VM.Record> e : byName) {
+                try {
+                    conn.<Object>dispatch("VM.assert_can_be_recovered",
+                        new Object[]{metadata.toWireString(), e.getKey().toWireString(), drSessionId});
+                } catch (Types.XenAPIException notThisOne) {
+                    continue;
                 }
+                target = e.getKey(); name = e.getValue().nameLabel; targetUuid = e.getValue().uuid;
+                break;
+            }
+            if (target == null)
+                throw new RuntimeException("no VM in the replicated database has all its disks on storage the standby pool can see");
             System.out.println("  recovering " + name);
-
-            // Both calls run on the METADATA session; session_to says where the VM should land - the
-            // STANDBY pool's session, not this one.
-            String drSessionId = drConn.getSessionReference();
-            conn.<Object>dispatch("VM.assert_can_be_recovered",
-                new Object[]{metadata.toWireString(), target.toWireString(), drSessionId});
             conn.<Object>dispatch("VM.recover",
                 new Object[]{metadata.toWireString(), target.toWireString(), drSessionId, false});
 

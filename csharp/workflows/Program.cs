@@ -2640,15 +2640,26 @@ internal static class Program
     {
         var session = Connect(url, user, password);
 
-        // Clustering is what shared block storage needs before it can be thin-provisioned with GFS2.
-        // Pick a network every host can reach: corosync is latency-sensitive, and a cluster that loses
-        // quorum takes its GFS2 storage offline with it.
-        var network = Network.get_all(session)[0].opaque_ref;
+        // Clustering is what shared block storage needs before it can be thin-provisioned with GFS2. Run
+        // it over a network every host is on - the management network - since corosync is
+        // latency-sensitive and a cluster that loses quorum takes its GFS2 storage offline with it.
+        var pifs = PIF.get_all_records(session);
+        var network = pifs.First(kv => kv.Value.management).Value.network.opaque_ref;
+        var was = pifs.Where(kv => kv.Value.network.opaque_ref == network)
+            .ToDictionary(kv => kv.Key.opaque_ref, kv => kv.Value.disallow_unplug);
 
         var existing = Cluster.get_all(session);
-        var cluster = existing.Count > 0
-            ? existing[0].opaque_ref
-            : Cluster.pool_create(session, network, "corosync", 20000, 1000).opaque_ref;
+        string cluster;
+        if (existing.Count > 0)
+            cluster = existing[0].opaque_ref;
+        else
+        {
+            // Corosync must not lose its network, so each host's PIF on it has to refuse unplugging
+            // first: Cluster.pool_create fails PIF_ALLOWS_UNPLUG otherwise. was remembers the settings.
+            foreach (var pif in was.Keys)
+                PIF.set_disallow_unplug(session, pif, true);
+            cluster = Cluster.pool_create(session, network, "corosync", 20000, 1000).opaque_ref;
+        }
 
         var record = Cluster.get_record(session, cluster);
         Console.WriteLine($"Stack:      {record.cluster_stack}");
@@ -2663,6 +2674,15 @@ internal static class Program
         Cluster_host.enable(session, member);
         Cluster.pool_resync(session, cluster);
         Console.WriteLine($"Resynced,   quorate: {Cluster.get_is_quorate(session, cluster)}");
+
+        // Tidy up a cluster this example created (one that was already there stays), and the PIF settings.
+        if (existing.Count == 0)
+        {
+            Cluster.pool_destroy(session, cluster);
+            foreach (var (pif, value) in was)
+                PIF.set_disallow_unplug(session, pif, value);
+            Console.WriteLine("Cluster removed again.");
+        }
 
         Console.WriteLine("OK: configure-clustering");
         session.logout();
@@ -3464,12 +3484,18 @@ internal static class Program
         var session = Connect(url, user, password);
         var drSession = Connect(drUrl, user, password);
 
-        // Replication needs storage every host can reach and that can hold data. The server checks rather
-        // than taking your word for it, so ask before enabling.
-        var sr = SR.get_all_records(session).First(kv =>
+        // Replication needs shared storage the standby pool can attach too, and only block storage (iSCSI,
+        // HBA) supports it - an NFS SR fails SR_OPERATION_NOT_SUPPORTED. The server checks rather than
+        // taking your word for it, so ask each candidate, as XenCenter's DR wizard does.
+        static bool Succeeds(Action call)
+        {
+            try { call(); return true; }
+            catch (Failure) { return false; }
+        }
+        var sr = SR.get_all_records(session).FirstOrDefault(kv =>
             kv.Value.shared && kv.Value.content_type != "iso"
-            && kv.Value.type != "iso" && kv.Value.type != "udev").Key.opaque_ref;
-        SR.assert_supports_database_replication(session, sr);
+            && Succeeds(() => SR.assert_supports_database_replication(session, kv.Key.opaque_ref))).Key?.opaque_ref
+            ?? throw new Exception("no shared SR here supports database replication (it needs iSCSI or HBA storage)");
         Console.WriteLine($"Replicating pool metadata to {SR.get_name_label(session, sr)}");
         SR.enable_database_replication(session, sr);
 
@@ -3489,14 +3515,18 @@ internal static class Program
             !kv.Value.is_a_template && !kv.Value.is_control_domain && !kv.Value.is_a_snapshot).ToList();
         Console.WriteLine($"  the replicated database describes {recoverable.Count} recoverable VM(s)");
 
-        var target = recoverable.OrderBy(kv => kv.Value.name_label).First();
+        // Only a VM whose disks are all on storage the standby pool can see can be recovered there - the
+        // check runs on the METADATA session, and session_to says where the VM should land: the STANDBY
+        // pool's session, not this one. Take the first (by name) that passes, as the DR wizard lists them.
+        var candidates = recoverable.OrderBy(kv => kv.Value.name_label)
+            .Where(kv => Succeeds(() => VM.assert_can_be_recovered(metadata, kv.Key.opaque_ref, drSession.opaque_ref)))
+            .ToList();
+        if (candidates.Count == 0)
+            throw new Exception("no VM in the replicated database has all its disks on storage the standby pool can see");
+        var target = candidates[0];
         var targetUuid = target.Value.uuid;
         var name = target.Value.name_label;
         Console.WriteLine($"  recovering {name}");
-
-        // Both calls run on the METADATA session; session_to says where the VM should land - the
-        // STANDBY pool's session, not this one.
-        VM.assert_can_be_recovered(metadata, target.Key.opaque_ref, drSession.opaque_ref);
         VM.recover(metadata, target.Key.opaque_ref, drSession.opaque_ref, false);
 
         // It is a real VM on the standby pool now, not merely a call that returned - look it up by the
