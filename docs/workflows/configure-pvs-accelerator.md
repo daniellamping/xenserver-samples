@@ -501,6 +501,7 @@ w_configure_pvs_accelerator() {
             sr=$(xe pbd-param-get uuid=$pbd param-name=sr-uuid)
             [ "$(xe sr-param-get uuid=$sr param-name=shared)" = "false" ] || continue
             [ "$(xe sr-param-get uuid=$sr param-name=content-type)" = "iso" ] && continue
+            [ "$(xe sr-param-get uuid=$sr param-name=type)" = "udev" ] && continue   # removable storage
             xe pvs-cache-storage-create uuid=$h sr-uuid=$sr pvs-site-uuid="$site" size=10737418240 >/dev/null
             break
         done
