@@ -859,8 +859,9 @@ public class Workflows {
 
         // A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
         // VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-        // session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
-        // host answers 404 to a VM). Only a running VM has a console to capture.
+        // session id travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does
+        // (the VM itself works too). Only a running VM has a console to capture, and a host that can't reach
+        // it answers 404 or 500 instead of an image: the picture is incidental, so carry on.
         if (vm.getPowerState(conn) == Types.VmPowerState.RUNNING) {
             com.xensource.xenapi.Console console = null;
             for (com.xensource.xenapi.Console c : vm.getConsoles(conn)) {
@@ -869,11 +870,10 @@ public class Workflows {
             HttpGet thumbGet = new HttpGet(url + "/vncsnapshot?session_id=" + conn.getSessionReference()
                     + "&ref=" + console.toWireString());
             try (CloseableHttpClient http = trustingHttpClient()) {
-                byte[] png = http.execute(thumbGet, resp -> {
-                    if (resp.getCode() != 200) throw new java.io.IOException("vncsnapshot: HTTP " + resp.getCode());
-                    return EntityUtils.toByteArray(resp.getEntity());
-                });
-                System.out.println("Thumbnail:      " + png.length + " bytes of PNG");
+                String thumb = http.execute(thumbGet, resp -> resp.getCode() == 200
+                        ? EntityUtils.toByteArray(resp.getEntity()).length + " bytes of PNG"
+                        : "none (the host answered HTTP " + resp.getCode() + ")");
+                System.out.println("Thumbnail:      " + thumb);
             }
         } else {
             System.out.println("Thumbnail:      none (the VM is not running, so it has no console)");

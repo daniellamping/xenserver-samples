@@ -948,8 +948,9 @@ func snapshotRevert(url, user, password, vmName, snapshotName string) {
 
 	// A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the VM's
 	// console at that moment. It is an HTTP transfer alongside the API, not an API call, so the session id
-	// travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real host answers
-	// 404 to a VM). Only a running VM has a console to capture. The Go binding keeps its own session
+	// travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does (the VM itself
+	// works too). Only a running VM has a console to capture, and a host that can't reach it answers 404 or
+	// 500 instead of an image: the picture is incidental, so carry on. The Go binding keeps its own session
 	// private, so obtain one of our own the same way the RRD/export examples do.
 	if state, _ := xenapi.VM.GetPowerState(session, vmRef); state == xenapi.VMPowerStateRunning {
 		consoles, err := xenapi.VM.GetConsoles(session, vmRef)
@@ -967,10 +968,11 @@ func snapshotRevert(url, user, password, vmName, snapshotName string) {
 		thumb, err := io.ReadAll(resp.Body)
 		check(err)
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			panic(fmt.Sprintf("vncsnapshot: %s", resp.Status))
+		if resp.StatusCode == http.StatusOK {
+			fmt.Printf("Thumbnail:      %d bytes of PNG\n", len(thumb))
+		} else {
+			fmt.Printf("Thumbnail:      none (the host answered HTTP %d)\n", resp.StatusCode)
 		}
-		fmt.Printf("Thumbnail:      %d bytes of PNG\n", len(thumb))
 	} else {
 		fmt.Println("Thumbnail:      none (the VM is not running, so it has no console)")
 	}

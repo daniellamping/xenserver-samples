@@ -37,6 +37,7 @@ import shutil
 import ssl
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -746,15 +747,19 @@ def snapshot_revert(url, username, password, vm_name, snapshot_name="sdk-example
 
     # A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
     # VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-    # session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
-    # host answers 404 to a VM). Only a running VM has a console to capture.
+    # session id travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does
+    # (the VM itself works too). Only a running VM has a console to capture, and a host that can't
+    # reach it answers 404 or 500 instead of an image: the picture is incidental, so carry on.
     if session.xenapi.VM.get_power_state(vm_ref) == "Running":
         console = next(c for c in session.xenapi.VM.get_consoles(vm_ref)
                        if session.xenapi.console.get_protocol(c) == "rfb")
-        with urllib.request.urlopen(
-                "%s/vncsnapshot?session_id=%s&ref=%s" % (url, session._session, console),
-                context=ssl._create_unverified_context()) as response:
-            print("Thumbnail:      %d bytes of PNG" % len(response.read()))
+        try:
+            with urllib.request.urlopen(
+                    "%s/vncsnapshot?session_id=%s&ref=%s" % (url, session._session, console),
+                    context=ssl._create_unverified_context()) as response:
+                print("Thumbnail:      %d bytes of PNG" % len(response.read()))
+        except urllib.error.HTTPError as e:
+            print("Thumbnail:      none (the host answered HTTP %d)" % e.code)
     else:
         print("Thumbnail:      none (the VM is not running, so it has no console)")
 

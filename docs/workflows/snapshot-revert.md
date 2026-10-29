@@ -22,16 +22,19 @@ private static void SnapshotRevert(string url, string user, string password,
 
     // A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
     // VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-    // session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
-    // host answers 404 to a VM). Only a running VM has a console to capture.
+    // session id travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does
+    // (the VM itself works too). Only a running VM has a console to capture, and a host that can't reach
+    // it answers 404 or 500 instead of an image: the picture is incidental, so carry on.
     if (VM.get_power_state(session, vmRef) == vm_power_state.Running)
     {
         var console = VM.get_consoles(session, vmRef)
             .First(c => XenAPI.Console.get_protocol(session, c.opaque_ref) == console_protocol.rfb);
         using var client = InsecureHttpClient();
-        var bytes = client.GetByteArrayAsync(
+        var response = client.GetAsync(
             $"{url}/vncsnapshot?session_id={session.opaque_ref}&ref={console.opaque_ref}").Result;
-        Console.WriteLine($"Thumbnail:      {bytes.Length} bytes of PNG");
+        Console.WriteLine(response.IsSuccessStatusCode
+            ? $"Thumbnail:      {response.Content.ReadAsByteArrayAsync().Result.Length} bytes of PNG"
+            : $"Thumbnail:      none (the host answered HTTP {(int)response.StatusCode})");
     }
     else
     {
@@ -90,15 +93,19 @@ def snapshot_revert(url, username, password, vm_name, snapshot_name="sdk-example
 
     # A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
     # VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-    # session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
-    # host answers 404 to a VM). Only a running VM has a console to capture.
+    # session id travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does
+    # (the VM itself works too). Only a running VM has a console to capture, and a host that can't
+    # reach it answers 404 or 500 instead of an image: the picture is incidental, so carry on.
     if session.xenapi.VM.get_power_state(vm_ref) == "Running":
         console = next(c for c in session.xenapi.VM.get_consoles(vm_ref)
                        if session.xenapi.console.get_protocol(c) == "rfb")
-        with urllib.request.urlopen(
-                "%s/vncsnapshot?session_id=%s&ref=%s" % (url, session._session, console),
-                context=ssl._create_unverified_context()) as response:
-            print("Thumbnail:      %d bytes of PNG" % len(response.read()))
+        try:
+            with urllib.request.urlopen(
+                    "%s/vncsnapshot?session_id=%s&ref=%s" % (url, session._session, console),
+                    context=ssl._create_unverified_context()) as response:
+                print("Thumbnail:      %d bytes of PNG" % len(response.read()))
+        except urllib.error.HTTPError as e:
+            print("Thumbnail:      none (the host answered HTTP %d)" % e.code)
     else:
         print("Thumbnail:      none (the VM is not running, so it has no console)")
 
@@ -146,8 +153,9 @@ private static void snapshotRevert(String url, String user, String password,
 
     // A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
     // VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-    // session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
-    // host answers 404 to a VM). Only a running VM has a console to capture.
+    // session id travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does
+    // (the VM itself works too). Only a running VM has a console to capture, and a host that can't reach
+    // it answers 404 or 500 instead of an image: the picture is incidental, so carry on.
     if (vm.getPowerState(conn) == Types.VmPowerState.RUNNING) {
         com.xensource.xenapi.Console console = null;
         for (com.xensource.xenapi.Console c : vm.getConsoles(conn)) {
@@ -156,11 +164,10 @@ private static void snapshotRevert(String url, String user, String password,
         HttpGet thumbGet = new HttpGet(url + "/vncsnapshot?session_id=" + conn.getSessionReference()
                 + "&ref=" + console.toWireString());
         try (CloseableHttpClient http = trustingHttpClient()) {
-            byte[] png = http.execute(thumbGet, resp -> {
-                if (resp.getCode() != 200) throw new java.io.IOException("vncsnapshot: HTTP " + resp.getCode());
-                return EntityUtils.toByteArray(resp.getEntity());
-            });
-            System.out.println("Thumbnail:      " + png.length + " bytes of PNG");
+            String thumb = http.execute(thumbGet, resp -> resp.getCode() == 200
+                    ? EntityUtils.toByteArray(resp.getEntity()).length + " bytes of PNG"
+                    : "none (the host answered HTTP " + resp.getCode() + ")");
+            System.out.println("Thumbnail:      " + thumb);
         }
     } else {
         System.out.println("Thumbnail:      none (the VM is not running, so it has no console)");
@@ -220,8 +227,9 @@ func snapshotRevert(url, user, password, vmName, snapshotName string) {
 
 	// A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the VM's
 	// console at that moment. It is an HTTP transfer alongside the API, not an API call, so the session id
-	// travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real host answers
-	// 404 to a VM). Only a running VM has a console to capture. The Go binding keeps its own session
+	// travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does (the VM itself
+	// works too). Only a running VM has a console to capture, and a host that can't reach it answers 404 or
+	// 500 instead of an image: the picture is incidental, so carry on. The Go binding keeps its own session
 	// private, so obtain one of our own the same way the RRD/export examples do.
 	if state, _ := xenapi.VM.GetPowerState(session, vmRef); state == xenapi.VMPowerStateRunning {
 		consoles, err := xenapi.VM.GetConsoles(session, vmRef)
@@ -239,10 +247,11 @@ func snapshotRevert(url, user, password, vmName, snapshotName string) {
 		thumb, err := io.ReadAll(resp.Body)
 		check(err)
 		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			panic(fmt.Sprintf("vncsnapshot: %s", resp.Status))
+		if resp.StatusCode == http.StatusOK {
+			fmt.Printf("Thumbnail:      %d bytes of PNG\n", len(thumb))
+		} else {
+			fmt.Printf("Thumbnail:      none (the host answered HTTP %d)\n", resp.StatusCode)
 		}
-		fmt.Printf("Thumbnail:      %d bytes of PNG\n", len(thumb))
 	} else {
 		fmt.Println("Thumbnail:      none (the VM is not running, so it has no console)")
 	}
@@ -306,16 +315,18 @@ function Invoke-SnapshotRevert {
 
     # A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
     # VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-    # session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
-    # host answers 404 to a VM). Only a running VM has a console to capture. Still pure PowerShell:
-    # Connect-Example has already trusted the server's certificate.
+    # session id travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does
+    # (the VM itself works too). Only a running VM has a console to capture, and a host that can't reach
+    # it answers 404 or 500 instead of an image: the picture is incidental, so carry on. Still pure
+    # PowerShell: Connect-Example has already trusted the server's certificate.
     if ((Get-XenVM -Ref $vm.opaque_ref).power_state -eq 'Running') {
         $console = (Get-XenVM -Ref $vm.opaque_ref).consoles |
             ForEach-Object { Get-XenConsole -Ref $_.opaque_ref } | Where-Object { $_.protocol -eq 'rfb' } |
             Select-Object -First 1
-        $thumb = Invoke-WebRequest -UseBasicParsing `
+        $thumb = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck `
             -Uri "$Url/vncsnapshot?session_id=$($session.opaque_ref)&ref=$($console.opaque_ref)"
-        Write-Host "Thumbnail:      $($thumb.Content.Length) bytes of PNG"
+        if ($thumb.StatusCode -eq 200) { Write-Host "Thumbnail:      $($thumb.Content.Length) bytes of PNG" }
+        else { Write-Host "Thumbnail:      none (the host answered HTTP $($thumb.StatusCode))" }
     }
     else {
         Write-Host "Thumbnail:      none (the VM is not running, so it has no console)"

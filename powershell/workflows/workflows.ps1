@@ -845,16 +845,18 @@ function Invoke-SnapshotRevert {
 
     # A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
     # VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-    # session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
-    # host answers 404 to a VM). Only a running VM has a console to capture. Still pure PowerShell:
-    # Connect-Example has already trusted the server's certificate.
+    # session id travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does
+    # (the VM itself works too). Only a running VM has a console to capture, and a host that can't reach
+    # it answers 404 or 500 instead of an image: the picture is incidental, so carry on. Still pure
+    # PowerShell: Connect-Example has already trusted the server's certificate.
     if ((Get-XenVM -Ref $vm.opaque_ref).power_state -eq 'Running') {
         $console = (Get-XenVM -Ref $vm.opaque_ref).consoles |
             ForEach-Object { Get-XenConsole -Ref $_.opaque_ref } | Where-Object { $_.protocol -eq 'rfb' } |
             Select-Object -First 1
-        $thumb = Invoke-WebRequest -UseBasicParsing `
+        $thumb = Invoke-WebRequest -UseBasicParsing -SkipHttpErrorCheck `
             -Uri "$Url/vncsnapshot?session_id=$($session.opaque_ref)&ref=$($console.opaque_ref)"
-        Write-Host "Thumbnail:      $($thumb.Content.Length) bytes of PNG"
+        if ($thumb.StatusCode -eq 200) { Write-Host "Thumbnail:      $($thumb.Content.Length) bytes of PNG" }
+        else { Write-Host "Thumbnail:      none (the host answered HTTP $($thumb.StatusCode))" }
     }
     else {
         Write-Host "Thumbnail:      none (the VM is not running, so it has no console)"

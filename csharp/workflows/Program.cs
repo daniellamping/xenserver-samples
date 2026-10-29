@@ -787,16 +787,19 @@ internal static class Program
 
         // A client shows a thumbnail of what was on screen when the snapshot was taken, captured from the
         // VM's console at that moment. It is an HTTP transfer alongside the API, not an API call, so the
-        // session id travels in the query string, and ref is the VM's VNC (rfb) console, not the VM (a real
-        // host answers 404 to a VM). Only a running VM has a console to capture.
+        // session id travels in the query string. ref names the VM's VNC (rfb) console, as XenCenter does
+        // (the VM itself works too). Only a running VM has a console to capture, and a host that can't reach
+        // it answers 404 or 500 instead of an image: the picture is incidental, so carry on.
         if (VM.get_power_state(session, vmRef) == vm_power_state.Running)
         {
             var console = VM.get_consoles(session, vmRef)
                 .First(c => XenAPI.Console.get_protocol(session, c.opaque_ref) == console_protocol.rfb);
             using var client = InsecureHttpClient();
-            var bytes = client.GetByteArrayAsync(
+            var response = client.GetAsync(
                 $"{url}/vncsnapshot?session_id={session.opaque_ref}&ref={console.opaque_ref}").Result;
-            Console.WriteLine($"Thumbnail:      {bytes.Length} bytes of PNG");
+            Console.WriteLine(response.IsSuccessStatusCode
+                ? $"Thumbnail:      {response.Content.ReadAsByteArrayAsync().Result.Length} bytes of PNG"
+                : $"Thumbnail:      none (the host answered HTTP {(int)response.StatusCode})");
         }
         else
         {
