@@ -13,6 +13,9 @@ private static void ManageSshAccess(string url, string user, string password)
 {
     var session = Connect(url, user, password);
     var pool = Pool.get_all(session)[0];
+    // Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+    var before = Host.get_all_records(session)
+        .ToDictionary(kv => kv.Key.opaque_ref, kv => (kv.Value.ssh_enabled, kv.Value.ssh_enabled_timeout));
 
     // Timed access is the point: set the timeout first and the server stamps an ssh_expiry when SSH
     // is enabled, so a window opened for troubleshooting closes itself. set_ssh_enabled_timeout is
@@ -28,6 +31,12 @@ private static void ManageSshAccess(string url, string user, string password)
     Pool.disable_ssh(session, pool.opaque_ref);
     Console.WriteLine("After disable: " + string.Join(", ",
         Host.get_all_records(session).Values.Select(h => $"{h.name_label}={h.ssh_enabled}")));
+
+    foreach (var (host, (enabled, timeout)) in before)
+    {
+        Host.set_ssh_enabled_timeout(session, host, timeout);   // first: enabling stamps the expiry from it
+        if (enabled) Host.enable_ssh(session, host);
+    }
     Console.WriteLine("OK: manage-ssh-access");
     session.logout();
 }
@@ -59,6 +68,8 @@ def manage_ssh_access(url, username, password):
     session = connect(url, username, password)
     x = session.xenapi
     pool = list(x.pool.get_all())[0]
+    # Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+    before = {h: (r["ssh_enabled"], r["ssh_enabled_timeout"]) for h, r in x.host.get_all_records().items()}
 
     x.pool.set_ssh_enabled_timeout(pool, str(3600))   # one hour
 
@@ -73,6 +84,11 @@ def manage_ssh_access(url, username, password):
     print("After disable: %s"
           % ", ".join("%s=%s" % (h["name_label"], h["ssh_enabled"])
                       for h in x.host.get_all_records().values()))
+
+    for host, (enabled, timeout) in before.items():
+        x.host.set_ssh_enabled_timeout(host, timeout)   # first: enabling stamps the expiry from it
+        if enabled:
+            x.host.enable_ssh(host)
     print("OK: manage-ssh-access")
     session.logout()
 
@@ -99,6 +115,8 @@ private static void manageSshAccess(String url, String user, String password) th
     Connection conn = connect(url, user, password);
     try {
         Pool pool = Pool.getAll(conn).iterator().next();
+        // Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+        Map<Host, Host.Record> before = Host.getAllRecords(conn);
 
         // Timed access is the point: set the timeout first and the server stamps an expiry when SSH
         // is enabled, so a window opened for troubleshooting closes itself. set_ssh_enabled_timeout is
@@ -118,6 +136,12 @@ private static void manageSshAccess(String url, String user, String password) th
             after.append(record.nameLabel).append("=").append(record.sshEnabled);
         }
         System.out.println("After disable: " + after);
+
+        for (Map.Entry<Host, Host.Record> e : before.entrySet()) {
+            // first: enabling stamps the expiry from it
+            e.getKey().setSshEnabledTimeout(conn, e.getValue().sshEnabledTimeout);
+            if (e.getValue().sshEnabled) e.getKey().enableSsh(conn);
+        }
         System.out.println("OK: manage-ssh-access");
     } finally {
         Session.logout(conn);
@@ -149,6 +173,9 @@ func manageSSHAccess(url, user, password string) {
 	check(err)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
+	// Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+	before, err := xenapi.Host.GetAllRecords(session)
+	check(err)
 
 	// Timed access is the point: set the timeout first and the server stamps an expiry when SSH is
 	// enabled, so a window opened for troubleshooting closes itself. This is itself a pool-wide
@@ -172,6 +199,14 @@ func manageSSHAccess(url, user, password string) {
 		states = append(states, fmt.Sprintf("%s=%t", record.NameLabel, record.SSHEnabled))
 	}
 	fmt.Printf("After disable: %s\n", strings.Join(states, ", "))
+
+	for host, record := range before {
+		// first: enabling stamps the expiry from it
+		check(xenapi.Host.SetSSHEnabledTimeout(session, host, record.SSHEnabledTimeout))
+		if record.SSHEnabled {
+			check(xenapi.Host.EnableSSH(session, host))
+		}
+	}
 	fmt.Println("OK: manage-ssh-access")
 }
 ```
@@ -198,6 +233,9 @@ function Invoke-ManageSshAccess {
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $pool = Get-XenPool
+    # Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+    $before = @(Get-XenHost | ForEach-Object {
+        [pscustomobject]@{ Ref = $_.opaque_ref; Enabled = $_.ssh_enabled; Timeout = $_.ssh_enabled_timeout } })
 
     # Timed access is the point: set the timeout first and the server stamps an expiry when SSH is
     # enabled, so a window opened for troubleshooting closes itself. set_ssh_enabled_timeout is itself a
@@ -212,6 +250,12 @@ function Invoke-ManageSshAccess {
 
     Invoke-XenPool -Pool $pool -XenAction DisableSsh
     Write-Host ("After disable: " + ((Get-XenHost | ForEach-Object { "$($_.name_label)=$($_.ssh_enabled)" }) -join ', '))
+
+    foreach ($h in $before) {
+        # first: enabling stamps the expiry from it
+        Get-XenHost -Ref $h.Ref | Set-XenHost -SshEnabledTimeout $h.Timeout
+        if ($h.Enabled) { Invoke-XenHost -Ref $h.Ref -XenAction EnableSsh }
+    }
     Write-Host "OK: manage-ssh-access"
     $session | Disconnect-XenServer
 }
@@ -239,7 +283,10 @@ w_manage_ssh_access() {
     # itself a pool-wide fan-out call (exactly like enable_ssh/disable_ssh below), but unlike those two,
     # xe has no CLI command for it at all - only the per-host field is reachable from the CLI - so the
     # host loop here is the only way to do this through xe, not a simplification the SDK languages need.
+    # Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+    local before=""
     for h in $(each_csv "$(xe host-list --minimal)"); do
+        before="$before $h:$(xe host-param-get uuid=$h param-name=ssh-enabled):$(xe host-param-get uuid=$h param-name=ssh-enabled-timeout)"
         xe host-param-set uuid=$h ssh-enabled-timeout=3600
     done
 
@@ -256,6 +303,13 @@ w_manage_ssh_access() {
         states="$states$(xe host-param-get uuid=$h param-name=name-label)=$(xe host-param-get uuid=$h param-name=ssh-enabled)"
     done
     echo "After disable: $states"
+
+    local entry h enabled timeout
+    for entry in $before; do
+        IFS=: read -r h enabled timeout <<< "$entry"
+        xe host-param-set uuid=$h ssh-enabled-timeout=$timeout   # first: enabling stamps the expiry from it
+        [ "$enabled" = true ] && xe host-enable-ssh uuid=$h
+    done
     echo "OK: manage-ssh-access"
 }
 ```

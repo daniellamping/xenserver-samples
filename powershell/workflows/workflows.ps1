@@ -3116,6 +3116,9 @@ function Invoke-ManageSshAccess {
     )
     $session = Connect-Example -Url $Url -UserName $UserName -Password $Password
     $pool = Get-XenPool
+    # Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+    $before = @(Get-XenHost | ForEach-Object {
+        [pscustomobject]@{ Ref = $_.opaque_ref; Enabled = $_.ssh_enabled; Timeout = $_.ssh_enabled_timeout } })
 
     # Timed access is the point: set the timeout first and the server stamps an expiry when SSH is
     # enabled, so a window opened for troubleshooting closes itself. set_ssh_enabled_timeout is itself a
@@ -3130,6 +3133,12 @@ function Invoke-ManageSshAccess {
 
     Invoke-XenPool -Pool $pool -XenAction DisableSsh
     Write-Host ("After disable: " + ((Get-XenHost | ForEach-Object { "$($_.name_label)=$($_.ssh_enabled)" }) -join ', '))
+
+    foreach ($h in $before) {
+        # first: enabling stamps the expiry from it
+        Get-XenHost -Ref $h.Ref | Set-XenHost -SshEnabledTimeout $h.Timeout
+        if ($h.Enabled) { Invoke-XenHost -Ref $h.Ref -XenAction EnableSsh }
+    }
     Write-Host "OK: manage-ssh-access"
     $session | Disconnect-XenServer
 }

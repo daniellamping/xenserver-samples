@@ -2941,6 +2941,8 @@ public class Workflows {
         Connection conn = connect(url, user, password);
         try {
             Pool pool = Pool.getAll(conn).iterator().next();
+            // Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+            Map<Host, Host.Record> before = Host.getAllRecords(conn);
 
             // Timed access is the point: set the timeout first and the server stamps an expiry when SSH
             // is enabled, so a window opened for troubleshooting closes itself. set_ssh_enabled_timeout is
@@ -2960,6 +2962,12 @@ public class Workflows {
                 after.append(record.nameLabel).append("=").append(record.sshEnabled);
             }
             System.out.println("After disable: " + after);
+
+            for (Map.Entry<Host, Host.Record> e : before.entrySet()) {
+                // first: enabling stamps the expiry from it
+                e.getKey().setSshEnabledTimeout(conn, e.getValue().sshEnabledTimeout);
+                if (e.getValue().sshEnabled) e.getKey().enableSsh(conn);
+            }
             System.out.println("OK: manage-ssh-access");
         } finally {
             Session.logout(conn);

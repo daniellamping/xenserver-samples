@@ -1859,7 +1859,10 @@ w_manage_ssh_access() {
     # itself a pool-wide fan-out call (exactly like enable_ssh/disable_ssh below), but unlike those two,
     # xe has no CLI command for it at all - only the per-host field is reachable from the CLI - so the
     # host loop here is the only way to do this through xe, not a simplification the SDK languages need.
+    # Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+    local before=""
     for h in $(each_csv "$(xe host-list --minimal)"); do
+        before="$before $h:$(xe host-param-get uuid=$h param-name=ssh-enabled):$(xe host-param-get uuid=$h param-name=ssh-enabled-timeout)"
         xe host-param-set uuid=$h ssh-enabled-timeout=3600
     done
 
@@ -1876,6 +1879,13 @@ w_manage_ssh_access() {
         states="$states$(xe host-param-get uuid=$h param-name=name-label)=$(xe host-param-get uuid=$h param-name=ssh-enabled)"
     done
     echo "After disable: $states"
+
+    local entry h enabled timeout
+    for entry in $before; do
+        IFS=: read -r h enabled timeout <<< "$entry"
+        xe host-param-set uuid=$h ssh-enabled-timeout=$timeout   # first: enabling stamps the expiry from it
+        [ "$enabled" = true ] && xe host-enable-ssh uuid=$h
+    done
     echo "OK: manage-ssh-access"
 }
 

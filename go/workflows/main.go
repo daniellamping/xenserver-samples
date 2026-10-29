@@ -3595,6 +3595,9 @@ func manageSSHAccess(url, user, password string) {
 	check(err)
 	hosts, err := xenapi.Host.GetAll(session)
 	check(err)
+	// Each host's SSH as we found it, to put back at the end: disabling it is not the example's to keep.
+	before, err := xenapi.Host.GetAllRecords(session)
+	check(err)
 
 	// Timed access is the point: set the timeout first and the server stamps an expiry when SSH is
 	// enabled, so a window opened for troubleshooting closes itself. This is itself a pool-wide
@@ -3618,6 +3621,14 @@ func manageSSHAccess(url, user, password string) {
 		states = append(states, fmt.Sprintf("%s=%t", record.NameLabel, record.SSHEnabled))
 	}
 	fmt.Printf("After disable: %s\n", strings.Join(states, ", "))
+
+	for host, record := range before {
+		// first: enabling stamps the expiry from it
+		check(xenapi.Host.SetSSHEnabledTimeout(session, host, record.SSHEnabledTimeout))
+		if record.SSHEnabled {
+			check(xenapi.Host.EnableSSH(session, host))
+		}
+	}
 	fmt.Println("OK: manage-ssh-access")
 }
 
