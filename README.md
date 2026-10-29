@@ -56,7 +56,6 @@ argument after the password. See each language's README for how to set up and ru
 - [Python](python)
 - [Go](go)
 - [xe CLI](cli)
-- [C](c)
 
 The older samples alongside the `workflows` folder in each language predate the workflow
 examples and are not the same across languages.
