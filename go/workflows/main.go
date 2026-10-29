@@ -4538,8 +4538,9 @@ func disasterRecovery(url, user, password, drURL string) {
 	fmt.Printf("  %s is %s on the standby pool\n", name, ps)
 
 	// Tidy up on the standby pool only, by uuid - never touch the source pool's VMs, and never guess
-	// by name (a coincidentally-same-named VM must not be destroyed).
-	destroyVMAndDisks(drSession, recovered)
+	// by name (a coincidentally-same-named VM must not be destroyed). Destroy the VM record but NOT its
+	// disks: they are the protected pool's own disks on the shared SR, not copies.
+	check(xenapi.VM.Destroy(drSession, recovered))
 
 	check(xenapi.SR.DisableDatabaseReplication(session, sr))
 	fmt.Println("OK: disaster-recovery")

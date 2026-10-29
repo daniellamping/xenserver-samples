@@ -3316,8 +3316,9 @@ def disaster_recovery(url, username, password, dr_url=None):
     print("  %s is %s on the standby pool" % (name, dr_session.xenapi.VM.get_power_state(recovered)))
 
     # Tidy up on the standby pool only, by uuid - never touch the source pool's VMs, and never
-    # guess by name (a coincidentally-same-named VM must not be destroyed).
-    destroy_vm_and_disks(dr_session, recovered)
+    # guess by name (a coincidentally-same-named VM must not be destroyed). Destroy the VM record but
+    # NOT its disks: they are the protected pool's own disks on the shared SR, not copies.
+    dr_session.xenapi.VM.destroy(recovered)
     x.SR.disable_database_replication(sr)
     print("OK: disaster-recovery")
     session.xenapi.session.logout()

@@ -3832,12 +3832,9 @@ function Invoke-DisasterRecovery {
     Write-Host "  $name is $($recovered.power_state) on the standby pool"
 
     # Tidy up on the standby pool only, by uuid - never guess by name, and never touch the source pool.
-    $vdis = @((Get-XenVM -SessionOpaqueRef $drSession.opaque_ref -Ref $recovered.opaque_ref).VBDs |
-        ForEach-Object { Get-XenVBD -SessionOpaqueRef $drSession.opaque_ref -Ref $_.opaque_ref } |
-        Where-Object { $_.type -eq 'Disk' -and $_.VDI.opaque_ref -ne 'OpaqueRef:NULL' } |
-        ForEach-Object { $_.VDI.opaque_ref })
+    # Destroy the VM record but NOT its disks: they are the protected pool's own disks on the shared SR,
+    # not copies.
     Remove-XenVM -SessionOpaqueRef $drSession.opaque_ref -Ref $recovered.opaque_ref
-    $vdis | ForEach-Object { Remove-XenVDI -SessionOpaqueRef $drSession.opaque_ref -Ref $_ }
 
     $sr | Invoke-XenSR -SessionOpaqueRef $session.opaque_ref -XenAction DisableDatabaseReplication
     Write-Host "OK: disaster-recovery"

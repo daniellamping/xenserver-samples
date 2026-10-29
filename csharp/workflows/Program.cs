@@ -3499,8 +3499,9 @@ internal static class Program
         Console.WriteLine($"  {name} is {VM.get_power_state(drSession, recovered)} on the standby pool");
 
         // Tidy up on the standby pool only, by uuid - never touch the source pool's VMs, and never
-        // guess by name.
-        DestroyVmAndDisks(drSession, recovered);
+        // guess by name. Destroy the VM record but NOT its disks: they are the protected pool's own
+        // disks on the shared SR, not copies.
+        VM.destroy(drSession, recovered);
         SR.disable_database_replication(session, sr);
         Console.WriteLine("OK: disaster-recovery");
         session.logout();

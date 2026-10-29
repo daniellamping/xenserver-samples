@@ -3741,8 +3741,9 @@ public class Workflows {
             System.out.println("  " + name + " is " + recovered.getPowerState(drConn) + " on the standby pool");
 
             // Tidy up on the standby pool only, by uuid - never touch the source pool's VMs, and never
-            // guess by name (a coincidentally-same-named VM must not be destroyed).
-            destroyVmAndDisks(drConn, recovered);
+            // guess by name (a coincidentally-same-named VM must not be destroyed). Destroy the VM record
+            // but NOT its disks: they are the protected pool's own disks on the shared SR, not copies.
+            recovered.destroy(drConn);
             sr.disableDatabaseReplication(conn);
             System.out.println("OK: disaster-recovery");
         } finally {

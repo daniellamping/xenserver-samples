@@ -2345,8 +2345,9 @@ w_disaster_recovery() {
     # already on the destination pool).
     echo "  $name is $(xe_dr vm-param-get uuid=$md param-name=power-state) on the standby pool"
 
-    # Tidy up on the standby pool only, by uuid - never touch the source pool's VMs.
-    xe_dr vm-uninstall uuid=$md force=true
+    # Tidy up on the standby pool only, by uuid - never touch the source pool's VMs. vm-destroy, not
+    # vm-uninstall: the disks are the protected pool's own disks on the shared SR, not copies.
+    xe_dr vm-destroy uuid=$md
     xe sr-disable-database-replication uuid=$sr
     echo "OK: disaster-recovery"
 }
