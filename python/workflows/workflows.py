@@ -2285,8 +2285,10 @@ def configure_snmp(url, username, password, trap_destination="192.0.2.50"):
     for host in session.xenapi.host.get_all():
         def snmp(fn, args=None, host=host):
             return json.loads(session.xenapi.host.call_plugin(host, "snmp", fn, args or {}))
-        snmp("set-config", {"config": json.dumps(config)})
+        answer = snmp("set-config", {"config": json.dumps(config)})
         status = snmp("status")["result"]
+        if status["enabled"] != "enabled":
+            raise RuntimeError("SNMP is still %s after set-config, which answered %s" % (status["enabled"], answer))
         cfg = snmp("get-config")["result"]
         label = session.xenapi.host.get_name_label(host)
         print("%s: SNMP enabled: %s / %s" % (label, status["enabled"], status["active"]))
