@@ -261,7 +261,7 @@ private static void backupHostConfig(String url, String user, String password) t
         // session before making another API call.
         conn = dropIdleConnection(conn, url);
 
-        Map.Entry<String, Connection> restored = restoreHostConfig(conn, hostUrl, session, host, file);
+        Map.Entry<String, Connection> restored = restoreHostConfig(conn, url, hostUrl, session, host, file);
         conn = restored.getValue();
         System.out.println("  restoring it to " + host.getNameLabel(conn) + ": " + restored.getKey());
         if (hosts.size() > 1) {
@@ -269,7 +269,7 @@ private static void backupHostConfig(String url, String user, String password) t
             String result;
             try {
                 String otherUrl = hostUrl(url, other.getAddress(conn));
-                Map.Entry<String, Connection> r = restoreHostConfig(conn, otherUrl, session, other, file);
+                Map.Entry<String, Connection> r = restoreHostConfig(conn, url, otherUrl, session, other, file);
                 conn = r.getValue();
                 result = r.getKey();
             } catch (Exception e) {
@@ -313,8 +313,8 @@ private static Connection dropIdleConnection(Connection conn, String url) throws
  * that before it starts sending the file. The outcome therefore cannot be in the status line: it
  * arrives on a task you create first, name in the URL, and poll once the upload has finished.
  */
-private static Map.Entry<String, Connection> restoreHostConfig(Connection conn, String hostUrl,
-        String session, Host host, java.io.File file) throws Exception {
+private static Map.Entry<String, Connection> restoreHostConfig(Connection conn, String apiUrl,
+        String hostUrl, String session, Host host, java.io.File file) throws Exception {
     Task task = Task.create(conn, "host_restore", "restoring a configuration backup");
     try {
         HttpPut put = new HttpPut(hostUrl + "/host_restore?session_id=" + session
@@ -326,8 +326,9 @@ private static Map.Entry<String, Connection> restoreHostConfig(Connection conn, 
         try (CloseableHttpClient http = trustingHttpClient()) {
             http.execute(put, resp -> EntityUtils.toString(resp.getEntity()));
         }
-        // As above: the connection sat idle for as long as the upload took.
-        conn = dropIdleConnection(conn, hostUrl);
+        // As above: the connection sat idle for as long as the upload took. Reconnect to the
+        // coordinator: the upload went to the host itself, but a pool member refuses API calls.
+        conn = dropIdleConnection(conn, apiUrl);
 
         while (task.getStatus(conn) == Types.TaskStatusType.PENDING) Thread.sleep(500);
         String result;
@@ -351,9 +352,9 @@ private static Map.Entry<String, Connection> restoreHostConfig(Connection conn, 
 
 ```text
 Backing up sdk-host1
-  wrote 83 bytes to sdk-example-host2003074249991085424.backup
+  wrote 83 bytes to sdk-example-host9968255776180272201.backup
   restoring it to sdk-host1: accepted
-  restoring it to sdk-host2: could not connect directly (org.apache.hc.client5.http.HttpHostConnectException: Connect to https://10.0.0.2:63995 [/10.0.0.2] failed: Connection timed out: getsockopt)
+  restoring it to sdk-host2: could not connect directly (org.apache.hc.client5.http.HttpHostConnectException: Connect to https://10.0.0.2:63691 [/10.0.0.2] failed: Connection timed out: getsockopt)
 OK: backup-host-config
 ```
 

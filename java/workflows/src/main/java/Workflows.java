@@ -3360,7 +3360,7 @@ public class Workflows {
             // session before making another API call.
             conn = dropIdleConnection(conn, url);
 
-            Map.Entry<String, Connection> restored = restoreHostConfig(conn, hostUrl, session, host, file);
+            Map.Entry<String, Connection> restored = restoreHostConfig(conn, url, hostUrl, session, host, file);
             conn = restored.getValue();
             System.out.println("  restoring it to " + host.getNameLabel(conn) + ": " + restored.getKey());
             if (hosts.size() > 1) {
@@ -3368,7 +3368,7 @@ public class Workflows {
                 String result;
                 try {
                     String otherUrl = hostUrl(url, other.getAddress(conn));
-                    Map.Entry<String, Connection> r = restoreHostConfig(conn, otherUrl, session, other, file);
+                    Map.Entry<String, Connection> r = restoreHostConfig(conn, url, otherUrl, session, other, file);
                     conn = r.getValue();
                     result = r.getKey();
                 } catch (Exception e) {
@@ -3412,8 +3412,8 @@ public class Workflows {
      * that before it starts sending the file. The outcome therefore cannot be in the status line: it
      * arrives on a task you create first, name in the URL, and poll once the upload has finished.
      */
-    private static Map.Entry<String, Connection> restoreHostConfig(Connection conn, String hostUrl,
-            String session, Host host, java.io.File file) throws Exception {
+    private static Map.Entry<String, Connection> restoreHostConfig(Connection conn, String apiUrl,
+            String hostUrl, String session, Host host, java.io.File file) throws Exception {
         Task task = Task.create(conn, "host_restore", "restoring a configuration backup");
         try {
             HttpPut put = new HttpPut(hostUrl + "/host_restore?session_id=" + session
@@ -3425,8 +3425,9 @@ public class Workflows {
             try (CloseableHttpClient http = trustingHttpClient()) {
                 http.execute(put, resp -> EntityUtils.toString(resp.getEntity()));
             }
-            // As above: the connection sat idle for as long as the upload took.
-            conn = dropIdleConnection(conn, hostUrl);
+            // As above: the connection sat idle for as long as the upload took. Reconnect to the
+            // coordinator: the upload went to the host itself, but a pool member refuses API calls.
+            conn = dropIdleConnection(conn, apiUrl);
 
             while (task.getStatus(conn) == Types.TaskStatusType.PENDING) Thread.sleep(500);
             String result;
