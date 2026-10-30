@@ -1,77 +1,113 @@
-# XenServer SDK usage examples
+# XenServer SDK samples
 
-This repository contains sample code for interacting with [XenServer](https://www.xenserver.com/)
-using the XenServer SDK. The examples are provided as complete applications
-or scripts that you can run on your server.
+Ready-to-run code for managing [XenServer](https://www.xenserver.com/) pools with the XenServer SDK.
 
-Apart from the ready-to-run code, this repository contains also a number of tips
-or walk-throughs that you may find useful when developing products for XenServer.
+Whether you want to list your VMs, automate a rolling update or wire XenServer into your own tooling,
+there's an example here to start from. Each one is written in **C#, Python, Java, Go and PowerShell, and
+for the `xe` command line**, so you can read it in the language you know and use it in the language you
+need.
 
-The content of this repository can be used as a companion to the
-[XenServer SDK Guide](https://docs.xenserver.com/en-us/xenserver/8/developer/sdk-guide).
+The samples are a companion to the
+[XenServer SDK Guide](https://docs.xenserver.com/en-us/xenserver/8/developer/sdk-guide), which has the
+full API reference and the SDK downloads.
 
-## Workflow examples
+## What's inside
 
-The `workflows` folder in each language holds the same **90 real-world
-workflows**, each implemented in every language: the five SDK bindings (C#, Java, PowerShell, Python
-and Go) plus the `xe` command line interface. Pick the language you work in and you will find every
-task there, written the same way.
+- **90 workflow examples:** common pool-management tasks, from logging in to disaster recovery. Each
+  is implemented in all six languages.
+- **[Browsable docs](docs/workflows/README.md):** one page per workflow, with the code in every language
+  side by side and the output of running it.
+- **[A short guide to the API](docs/README.md):** sessions, records, tasks, events and errors, enough
+  to get you oriented.
 
-**[Browse them in the docs](docs/workflows/README.md)**: a page per workflow with its code in every
-language and the output of running it, grouped by area. New to the API? Start with the
-[short guide](docs/README.md).
+## Quick start
 
-Each workflow is a self-contained function that takes the connection details (and any object it acts
-on, looked up by name) as parameters, opens its own session, cleans up after itself, and prints
-`OK: <workflow>` on success. Copy one out and run it as-is; each carries a `Run it:` line showing the
-call. The shared connect helper accepts a host's self-signed certificate and follows the pool-member to
-coordinator redirect (`HOST_IS_SLAVE`), the way XenCenter does when you add a member server.
+1. **Pick a language** and set it up as its README describes. Mostly that means getting the SDK binding
+   for your language from the
+   [XenServer SDK Guide](https://docs.xenserver.com/en-us/xenserver/8/developer/sdk-guide).
+2. **Run your first workflow**, `connect-inventory`, against your pool's coordinator. It logs in and
+   lists the pool's hosts and VMs:
 
-Every language's file can also run any workflow from the command line:
+   | Language | From its `workflows` folder |
+   |---|---|
+   | [Python](python) | `python workflows.py connect-inventory https://<coordinator> root <password>` |
+   | [C#](csharp) | `dotnet run -- connect-inventory https://<coordinator> root <password>` |
+   | [Java](java) | `mvn compile exec:java -Dxenapi.version=<version> -Dexec.args="connect-inventory https://<coordinator> root <password>"` |
+   | [Go](go) | `go run . connect-inventory https://<coordinator> root <password>` |
+   | [PowerShell](powershell) | `pwsh -File workflows.ps1 connect-inventory https://<coordinator> root <password>` |
+   | [xe CLI](cli) | `./workflows.sh connect-inventory https://<coordinator> root <password>` |
 
-```
-<program> <workflow> <url> <username> <password> [key=value ...]
-```
+3. **Explore.** Browse the [workflow examples](docs/workflows/README.md) and run any of them the same
+   way.
 
-The `key=value` arguments override the objects and addresses a workflow uses (for example
-`source_vm=my-vm`, `sr_name=my-shared-sr`, `nfs_server=… nfs_path=…`); each workflow's defaults are in
-its language's dispatcher. `cross-pool-copy-vm` instead takes the destination pool's URL as an extra
-argument after the password. See each language's README for how to set up and run it, and
-[workflows.json](workflows.json) for the full list.
+> **Use a test pool, not production.** Several workflows change pool-wide state: they restart hosts,
+> rotate the pool secret, enable HA, apply updates and more. See [Before you run them](#before-you-run-them).
 
-> **Run these against a test pool, not production.** Several workflows change pool-wide state
-> (for example `restart-host`, `rotate-pool-secret`, `manage-pool-membership`, `disaster-recovery`,
-> `configure-ha`, `apply-update`). By default the workflows act on some named objects: a VM `web-01`
-> that has a guest OS and the XenServer VM Tools (the guest-cooperative workflows, such as suspend,
-> checkpoint and live migration, work on a copy of it: `source_vm`), a halted VM `db-01`, a shared SR
-> named `Shared NFS` and the `Rocky Linux 8` template. The storage workflows point at placeholder servers
-> in the `192.0.2.0/24` documentation range, and the ones that create an SR on a LUN format it. Override
-> these to match your pool.
+## The workflows
 
-## Available languages
+| Area | Workflows | For example |
+|---|---|---|
+| [Getting started](docs/workflows/README.md#getting-started) | 5 | Connect and take inventory, run a task, handle errors, follow events |
+| [Virtual machines](docs/workflows/README.md#virtual-machines) | 26 | Create, clone, snapshot, add disks, vTPM, vGPU, USB passthrough |
+| [Migration](docs/workflows/README.md#migration) | 2 | Live-migrate a VM, move its disks to another SR |
+| [Storage](docs/workflows/README.md#storage) | 13 | NFS, SMB, iSCSI, Fibre Channel and ISO SRs; changed block tracking |
+| [Networking](docs/workflows/README.md#networking) | 4 | Networks, NIC bonds, virtual network interfaces |
+| [Hosts & pools](docs/workflows/README.md#hosts--pools) | 30 | Maintenance mode, HA, certificates, SSH access, pool membership |
+| [Updates](docs/workflows/README.md#updates) | 3 | Configure update repositories, apply updates, rolling pool update |
+| [Organization & metadata](docs/workflows/README.md#organization--metadata) | 3 | Tags, folders, custom fields |
+| [Security & access](docs/workflows/README.md#security--access) | 3 | Active Directory users, roles, Secure Boot certificates |
+| [Disaster recovery](docs/workflows/README.md#disaster-recovery) | 1 | Replicate pool metadata and recover VMs on a standby pool |
 
-- [C#](csharp)
-- [Java](java)
-- [PowerShell](powershell)
-- [Python](python)
-- [Go](go)
-- [xe CLI](cli)
+The full list, with a one-line description of each, is in [workflows.json](workflows.json).
 
-The older samples alongside the `workflows` folder in each language predate the workflow
-examples and are not the same across languages.
+## How the examples work
 
-## Development tips
+Every workflow follows the same pattern, so once you've read one you can read them all:
 
-- An example of how to retrieve and use [XenServer Operational Metrics](misc/using_rrd.md)
+- **It's self-contained.** Each workflow is a single function. It opens its own session, does one job,
+  cleans up after itself and prints `OK: <workflow>` when it succeeds. Copy it into your own code as it
+  is: the `Run it:` line under each one shows the call.
+- **It connects the way XenCenter does.** The shared connect helper accepts a host's self-signed
+  certificate. If you point it at a pool member rather than the coordinator, it follows the
+  `HOST_IS_SLAVE` redirect.
+- **It runs from the command line.** Each language's `workflows` program runs any workflow:
 
-## Contributions
+  ```
+  <program> <workflow> <url> <username> <password> [key=value ...]
+  ```
 
-The preferable way to contribute patches is to fork the repository and
-then submit a pull request. Questions related to these samples can be posted on
-the repo's [issues](https://github.com/xenserver/xenserver-samples/issues) page.
-See also [CONTRIBUTING](CONTRIBUTING.md).
+  `key=value` arguments point a workflow at your own objects and servers, for example
+  `source_vm=my-vm`, `sr_name=my-shared-sr` or `nfs_server=… nfs_path=…`. Each language's dispatcher
+  lists the defaults. The one exception is `cross-pool-copy-vm`, which takes the destination pool's URL
+  as an extra argument after the password.
+
+## Before you run them
+
+The workflows are written for a **test pool**. By default they look for these objects by name, so
+create them or override the names with `key=value` arguments:
+
+- a running VM **`web-01`** with a guest OS and the XenServer VM Tools. Workflows that need guest
+  cooperation, such as suspend, checkpoint and live migration, work on a copy of it (`source_vm`).
+- a halted VM **`db-01`**
+- a shared SR named **`Shared NFS`**
+- the **`Rocky Linux 8`** template
+
+The storage workflows point at placeholder servers in the `192.0.2.0/24` documentation range, so
+override them with your own. Workflows that create an SR on a LUN format that LUN.
+
+## More in this repository
+
+- **Older samples:** each language folder also has some earlier, standalone samples alongside its
+  `workflows` folder. They predate the workflow examples and differ from language to language.
+- **[Working with performance metrics](misc/using_rrd.md):** how to retrieve and use XenServer's
+  operational metrics (RRDs).
+
+## Contributing
+
+Contributions are welcome! Fork the repository and open a pull request; see [CONTRIBUTING](CONTRIBUTING.md)
+for the details. Questions about the samples are welcome too, on the
+[issues](https://github.com/xenserver/xenserver-samples/issues) page.
 
 ## License
 
-This code is licensed under the BSD 2-Clause license. Please see the
-[LICENSE](LICENSE) file for more information.
+BSD 2-Clause. See [LICENSE](LICENSE).
