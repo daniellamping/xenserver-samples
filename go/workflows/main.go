@@ -2578,6 +2578,9 @@ func crossPoolCopyVM(url, user, password, destURL, vmName, destUser, destPasswor
 	copyUUID, err := xenapi.VM.GetUUID(dest, copied)
 	check(err)
 	fmt.Printf("  the copy on the destination: %s (%s)\n", copyName, copyUUID)
+
+	// Tidy up so the example is repeatable: the copy and its disks, on the destination pool.
+	destroyVMAndDisks(dest, copied)
 	fmt.Println("OK: cross-pool-copy-vm")
 	dest.Logout()
 	source.Logout()
@@ -3392,7 +3395,9 @@ func configureClustering(url, user, password string) {
 		for ref := range was {
 			check(xenapi.PIF.SetDisallowUnplug(session, ref, true))
 		}
-		cluster, err = xenapi.Cluster.PoolCreate(session, network, "corosync", 20000, 1000)
+		// token_timeout is in seconds (XenCenter's default 20.0, coefficient 1.0): XS9 refuses 20000 as
+		// "too large" - it is not milliseconds.
+		cluster, err = xenapi.Cluster.PoolCreate(session, network, "corosync", 20.0, 1.0)
 		check(err)
 	}
 
@@ -4522,19 +4527,30 @@ func disasterRecovery(url, user, password, drURL string) {
 	fmt.Printf("Replicating pool metadata to %s\n", srName)
 	check(xenapi.SR.EnableDatabaseReplication(session, sr))
 
-	vdis, err := xenapi.SR.GetVDIs(session, sr)
+	// Everything from here happens on the STANDBY pool, the way XenCenter's DR wizard works from the pool
+	// you fail over to: it has the same SR attached, rescans it to see the metadata disk just written,
+	// opens the database there, and recovers into itself - VM.recover's session_to has to be a session of
+	// the server running the call (HANDLE_INVALID otherwise).
+	srUUID, err := xenapi.SR.GetUUID(session, sr)
+	check(err)
+	drSR, err := xenapi.SR.GetByUUID(drSession, srUUID)
+	if err != nil {
+		panic(fmt.Sprintf("the standby pool has not attached %s: attach the same storage there first", srName))
+	}
+	check(xenapi.SR.Scan(drSession, drSR))
+	vdis, err := xenapi.SR.GetVDIs(drSession, drSR)
 	check(err)
 	var metadataVdi xenapi.VDIRef
 	for _, v := range vdis {
-		if t, _ := xenapi.VDI.GetType(session, v); t == xenapi.VdiTypeMetadata {
+		if t, _ := xenapi.VDI.GetType(drSession, v); t == xenapi.VdiTypeMetadata {
 			metadataVdi = v
 			break
 		}
 	}
-	uuid, _ := xenapi.VDI.GetUUID(session, metadataVdi)
+	uuid, _ := xenapi.VDI.GetUUID(drSession, metadataVdi)
 	fmt.Printf("  metadata disk: %s\n", uuid)
 
-	metadataSession, err := xenapi.VDI.OpenDatabase(session, metadataVdi)
+	metadataSession, err := xenapi.VDI.OpenDatabase(drSession, metadataVdi)
 	check(err)
 
 	// The Go binding keeps its session private and offers no way to build one from a session id it did
@@ -4549,7 +4565,7 @@ func disasterRecovery(url, user, password, drURL string) {
 		IsControlDomain bool   `json:"is_control_domain"`
 		IsASnapshot     bool   `json:"is_a_snapshot"`
 	}
-	check(json.Unmarshal(rawRPC(url, "VM.get_all_records", string(metadataSession)), &recoverable))
+	check(json.Unmarshal(rawRPC(drURL, "VM.get_all_records", string(metadataSession)), &recoverable))
 
 	// Only real guest VMs are recoverable - exclude templates, control domains and snapshots.
 	targets := make([]string, 0, len(recoverable))
@@ -4568,7 +4584,7 @@ func disasterRecovery(url, user, password, drURL string) {
 	// pool's session, not this one. Take the first (by name) that passes, as the DR wizard lists them.
 	target := ""
 	for _, t := range targets {
-		if _, failure := rawRPCCall(url, "VM.assert_can_be_recovered", string(metadataSession), t, drSessionID); failure == nil {
+		if _, failure := rawRPCCall(drURL, "VM.assert_can_be_recovered", string(metadataSession), t, drSessionID); failure == nil {
 			target = t
 			break
 		}
@@ -4581,7 +4597,7 @@ func disasterRecovery(url, user, password, drURL string) {
 	fmt.Printf("  recovering %s\n", name)
 
 	// Never force=true: see the doc comment above.
-	rawRPC(url, "VM.recover", string(metadataSession), target, drSessionID, false)
+	rawRPC(drURL, "VM.recover", string(metadataSession), target, drSessionID, false)
 
 	// It is a real VM on the standby pool now, not merely a call that returned - look it up by the
 	// uuid full_restore preserved, never by name.

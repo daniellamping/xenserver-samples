@@ -1944,6 +1944,9 @@ def cross_pool_copy_vm(url, username, password, dest_url, vm_name="db-01",
     # The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
     print("  the copy on the destination: %s (%s)"
           % (dest.xenapi.VM.get_name_label(copy), dest.xenapi.VM.get_uuid(copy)))
+
+    # Tidy up so the example is repeatable: the copy and its disks, on the destination pool.
+    destroy_vm_and_disks(dest, copy)
     print("OK: cross-pool-copy-vm")
     source.xenapi.session.logout()
     dest.xenapi.session.logout()
@@ -2475,7 +2478,9 @@ def configure_clustering(url, username, password):
         was = {ref: pifs[ref]["disallow_unplug"] for ref in network_pifs}
         for ref in network_pifs:
             x.PIF.set_disallow_unplug(ref, True)
-        cluster = x.Cluster.pool_create(network, "corosync", "20000", "1000")
+        # token_timeout is in seconds (XenCenter's default 20.0, coefficient 1.0): XS9 refuses 20000 as
+        # "too large" - it is not milliseconds.
+        cluster = x.Cluster.pool_create(network, "corosync", 20.0, 1.0)
 
     record = x.Cluster.get_record(cluster)
     print(f"Stack:      {record['cluster_stack']}")
@@ -3316,13 +3321,27 @@ def disaster_recovery(url, username, password, dr_url=None):
     print("Replicating pool metadata to %s" % x.SR.get_name_label(sr))
     x.SR.enable_database_replication(sr)
 
-    vdi = next(v for v in x.SR.get_VDIs(sr) if x.VDI.get_type(v) == "metadata")
-    print("  metadata disk: %s" % x.VDI.get_uuid(vdi))
+    # Everything from here happens on the STANDBY pool, the way XenCenter's DR wizard works from the
+    # pool you fail over to: it has the same SR attached, rescans it to see the metadata disk just
+    # written, opens the database there, and recovers into itself - VM.recover's session_to has to be a
+    # session of the server running the call (HANDLE_INVALID otherwise).
+    d = dr_session.xenapi
+    try:
+        dr_sr = d.SR.get_by_uuid(x.SR.get_uuid(sr))
+    except XenAPI.Failure:
+        raise RuntimeError("the standby pool has not attached %s: attach the same storage there first"
+                           % x.SR.get_name_label(sr))
+    d.SR.scan(dr_sr)
+    vdi = next((v for v in d.SR.get_VDIs(dr_sr) if d.VDI.get_type(v) == "metadata"), None)
+    if vdi is None:
+        raise RuntimeError("the standby pool sees no metadata disk on %s after rescanning it"
+                           % d.SR.get_name_label(dr_sr))
+    print("  metadata disk: %s" % d.VDI.get_uuid(vdi))
 
     # A session onto the replicated database rather than the live pool. The binding keeps the
     # session id in _session, so a second Session can be pointed at the one we were handed.
-    metadata = XenAPI.Session(url, ignore_ssl=True)
-    metadata._session = x.VDI.open_database(vdi)
+    metadata = XenAPI.Session(dr_url, ignore_ssl=True)
+    metadata._session = d.VDI.open_database(vdi)
 
     # Only real guest VMs are recoverable - exclude templates, control domains and snapshots.
     recoverable = {ref: r for ref, r in metadata.xenapi.VM.get_all_records().items()
@@ -3330,8 +3349,8 @@ def disaster_recovery(url, username, password, dr_url=None):
     print("  the replicated database describes %d recoverable VM(s)" % len(recoverable))
 
     # Only a VM whose disks are all on storage the standby pool can see can be recovered there - the
-    # check runs on the METADATA session, and session_to says where the VM should land: the STANDBY
-    # pool's session, not this one. Take the first (by name) that passes, as the DR wizard lists them.
+    # check runs on the METADATA session, and session_to says where the VM should land: the standby
+    # pool's own session. Take the first (by name) that passes, as the DR wizard lists them.
     dr_session_id = dr_session._session
     def can_be_recovered(ref):
         try:

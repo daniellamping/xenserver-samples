@@ -2048,6 +2048,9 @@ internal static class Program
                           $"{VmByName(source, vmName) == vm}");
         // The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
         Console.WriteLine($"  the copy on the destination: {VM.get_name_label(dest, copy)} ({VM.get_uuid(dest, copy)})");
+
+        // Tidy up so the example is repeatable: the copy and its disks, on the destination pool.
+        DestroyVmAndDisks(dest, copy.opaque_ref);
         Console.WriteLine("OK: cross-pool-copy-vm");
         source.logout();
         dest.logout();
@@ -2658,7 +2661,9 @@ internal static class Program
             // first: Cluster.pool_create fails PIF_ALLOWS_UNPLUG otherwise. was remembers the settings.
             foreach (var pif in was.Keys)
                 PIF.set_disallow_unplug(session, pif, true);
-            cluster = Cluster.pool_create(session, network, "corosync", 20000, 1000).opaque_ref;
+            // token_timeout is in seconds (XenCenter's default 20.0, coefficient 1.0): XS9 refuses 20000
+            // as "too large" - it is not milliseconds.
+            cluster = Cluster.pool_create(session, network, "corosync", 20.0, 1.0).opaque_ref;
         }
 
         var record = Cluster.get_record(session, cluster);
@@ -3499,15 +3504,27 @@ internal static class Program
         Console.WriteLine($"Replicating pool metadata to {SR.get_name_label(session, sr)}");
         SR.enable_database_replication(session, sr);
 
-        var vdi = SR.get_VDIs(session, sr)
-            .First(v => VDI.get_type(session, v.opaque_ref) == vdi_type.metadata).opaque_ref;
-        Console.WriteLine($"  metadata disk: {VDI.get_uuid(session, vdi)}");
+        // Everything from here happens on the STANDBY pool, the way XenCenter's DR wizard works from the
+        // pool you fail over to: it has the same SR attached, rescans it to see the metadata disk just
+        // written, opens the database there, and recovers into itself - VM.recover's session_to has to be
+        // a session of the server running the call (HANDLE_INVALID otherwise).
+        string drSr;
+        try { drSr = SR.get_by_uuid(drSession, SR.get_uuid(session, sr)).opaque_ref; }
+        catch (Failure)
+        {
+            throw new Exception($"the standby pool has not attached {SR.get_name_label(session, sr)}: " +
+                                "attach the same storage there first");
+        }
+        SR.scan(drSession, drSr);
+        var vdi = SR.get_VDIs(drSession, drSr)
+            .First(v => VDI.get_type(drSession, v.opaque_ref) == vdi_type.metadata).opaque_ref;
+        Console.WriteLine($"  metadata disk: {VDI.get_uuid(drSession, vdi)}");
 
         // A session onto the replicated database rather than the live pool. Assembled from the URL and the
         // session id we were handed rather than with Session(url, opaqueRef): that constructor queries the
         // pool immediately to work out the API version, which happens before there is any chance to accept
         // the host's self-signed certificate.
-        var metadata = new Session(url) { opaque_ref = VDI.open_database(session, vdi).opaque_ref };
+        var metadata = new Session(drUrl) { opaque_ref = VDI.open_database(drSession, vdi).opaque_ref };
         metadata.JsonRpcClient.ServerCertificateValidationCallback = (req, cert, chain, errors) => true;
 
         // Only real guest VMs are recoverable - exclude templates, control domains and snapshots.

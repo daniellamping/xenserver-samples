@@ -2314,12 +2314,30 @@ function Invoke-CrossPoolCopyVm {
 
     # Send with copy=true (the source VM is left intact). Dest/VdiMap/VifMap/VgpuMap are the migrate_send
     # action's parameters.
+    # The VMs the destination already has, to tell the copy apart afterwards (never by name alone).
+    $before = @(Get-XenVM -SessionOpaqueRef $dstRef | ForEach-Object { $_.opaque_ref })
     $vm | Invoke-XenVM -SessionOpaqueRef $srcRef -XenAction MigrateSend -Dest $receiver -Live $false `
         -VdiMap $vdiMap -VifMap $vifMap -Options @{ copy = "true" } -VgpuMap @{}
 
     $stillThere = [bool](Get-XenVM -SessionOpaqueRef $srcRef -Name $VmName |
         Where-Object { -not $_.is_a_template -and -not $_.is_control_domain })
     Write-Host "Sent '$VmName' to the destination pool (copy); source still present: $stillThere"
+
+    # Tidy up so the example is repeatable: the copy and its disks, on the destination pool.
+    $copy = Get-XenVM -SessionOpaqueRef $dstRef | Where-Object { $_.opaque_ref -notin $before } |
+        Select-Object -First 1
+    if ($copy) {
+        Write-Host "  the copy on the destination: $($copy.name_label) ($($copy.uuid))"
+        $copyVdis = @($copy.VBDs | ForEach-Object { Get-XenVBD -SessionOpaqueRef $dstRef -Ref $_.opaque_ref } |
+            Where-Object { $_.type -eq 'Disk' -and $_.VDI.opaque_ref -ne 'OpaqueRef:NULL' } |
+            ForEach-Object { $_.VDI.opaque_ref })
+        Remove-XenVM -SessionOpaqueRef $dstRef -Ref $copy.opaque_ref
+        $copyVdis | ForEach-Object { Remove-XenVDI -SessionOpaqueRef $dstRef -Ref $_ }
+    }
+    else {
+        # A real destination always shows the new VM; the simulator cannot create it across processes.
+        Write-Host "  the copy on the destination: not found (nothing to tidy up)"
+    }
     Write-Host "OK: cross-pool-copy-vm"
     $source | Disconnect-XenServer
     $dest | Disconnect-XenServer
@@ -2964,7 +2982,7 @@ function Invoke-ConfigureClustering {
         # EXISTING cluster -- so the module cannot express pool_create, which is a constructor. Same
         # situation as the event API: call it over JSON-RPC (see Invoke-XenMethod above).
         $ref = Invoke-XenMethod -Session $session -Method 'Cluster.pool_create' `
-            -Params @($network.opaque_ref, 'corosync', 20000, 1000)
+            -Params @($network.opaque_ref, 'corosync', 20.0, 1.0)  # seconds, not ms: XS9 refuses 20000
         $cluster = Get-XenCluster -Ref $ref
     }
 
@@ -3831,16 +3849,23 @@ function Invoke-DisasterRecovery {
     Write-Host "Replicating pool metadata to $($sr.name_label)"
     $sr | Invoke-XenSR -SessionOpaqueRef $session.opaque_ref -XenAction EnableDatabaseReplication
 
-    $vdi = Get-XenVDI -SessionOpaqueRef $session.opaque_ref | Where-Object { $_.type -eq 'metadata' } |
-        Select-Object -First 1
+    # Everything from here happens on the STANDBY pool, the way XenCenter's DR wizard works from the pool
+    # you fail over to: it has the same SR attached, rescans it to see the metadata disk just written,
+    # opens the database there, and recovers into itself - VM.recover's session_to has to be a session of
+    # the server running the call (HANDLE_INVALID otherwise).
+    $drSr = Get-XenSR -SessionOpaqueRef $drSession.opaque_ref | Where-Object { $_.uuid -eq $sr.uuid }
+    if (-not $drSr) { throw "the standby pool has not attached $($sr.name_label): attach the same storage there first" }
+    $drSr | Invoke-XenSR -SessionOpaqueRef $drSession.opaque_ref -XenAction Scan
+    $vdi = Get-XenVDI -SessionOpaqueRef $drSession.opaque_ref |
+        Where-Object { $_.type -eq 'metadata' -and $_.SR.opaque_ref -eq $drSr.opaque_ref } | Select-Object -First 1
     Write-Host "  metadata disk: $($vdi.uuid)"
 
     # Two module limits meet here, so the metadata database is driven over JSON-RPC: Invoke-XenVDI
     # -XenAction OpenDatabase does not hand back the session it opens (even with -PassThru), and
     # -SessionOpaqueRef only accepts sessions the module created itself. Same escape hatch the event API
     # needs, and still pure PowerShell.
-    $metadataRef = Invoke-XenMethod -Session $session -Method 'VDI.open_database' -Params @($vdi.opaque_ref)
-    $metadata = [pscustomobject]@{ opaque_ref = $metadataRef; Url = $session.Url }
+    $metadataRef = Invoke-XenMethod -Session $drSession -Method 'VDI.open_database' -Params @($vdi.opaque_ref)
+    $metadata = [pscustomobject]@{ opaque_ref = $metadataRef; Url = $drSession.Url }
 
     # Only real guest VMs are recoverable - exclude templates, control domains and snapshots.
     $allRecords = Invoke-XenMethod -Session $metadata -Method 'VM.get_all_records' -Params @()

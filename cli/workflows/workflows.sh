@@ -1314,9 +1314,26 @@ w_cross_pool_copy_vm() {
     dest_net=$(xe_dest pif-list host-uuid=$dest_master management=true params=network-uuid --minimal)
     vif_map=()
     for v in $(each_csv "$(xe vif-list vm-uuid=$vm --minimal)"); do vif_map+=("vif:$v=$dest_net"); done
-    xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$destuser remote-password=$destpass copy=true         "${vif_map[@]}"
+    # The VMs the destination already has, to tell the copy apart afterwards (never by name alone).
+    local before copy
+    before=",$(xe_dest vm-list is-control-domain=false --minimal),"
+    xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$destuser remote-password=$destpass copy=true \
+        "${vif_map[@]}"
     still=$([ -n "$(vm_uuid "$copy_vm")" ] && echo True || echo False)
     echo "Sent '$copy_vm' to $dest_host (copy); source still present: $still"
+
+    # Tidy up so the example is repeatable: the copy and its disks, on the destination pool.
+    copy=""
+    for v in $(each_csv "$(xe_dest vm-list is-control-domain=false --minimal)"); do
+        [[ $before == *",$v,"* ]] || { copy=$v; break; }
+    done
+    if [ -n "$copy" ]; then
+        echo "  the copy on the destination: $(xe_dest vm-param-get uuid=$copy param-name=name-label) ($copy)"
+        xe_dest vm-uninstall uuid=$copy force=true
+    else
+        # A real destination always shows the new VM; the simulator cannot create it across processes.
+        echo "  the copy on the destination: not found (nothing to tidy up)"
+    fi
     echo "OK: cross-pool-copy-vm"
 }
 
@@ -1736,7 +1753,7 @@ w_configure_clustering() {
     echo "One member out, quorate: $(xe cluster-list uuid="$cluster" params=is-quorate --minimal)"
 
     xe cluster-host-enable uuid="$member"
-    xe cluster-pool-resync
+    xe cluster-pool-resync cluster-uuid="$cluster"
     echo "Resynced,   quorate: $(xe cluster-list uuid="$cluster" params=is-quorate --minimal)"
 
     # Tidy up a cluster this example created (one that was already there stays), and the PIF settings.
@@ -2362,13 +2379,30 @@ w_disaster_recovery() {
     fi
     echo "Replicating pool metadata to $(xe sr-param-get uuid=$sr param-name=name-label)"
 
-    vdi=$(first_csv "$(xe vdi-list type=metadata sr-uuid=$sr --minimal)")
+    # Everything from here happens on the STANDBY pool, the way XenCenter's DR wizard works from the pool
+    # you fail over to: it has the same SR attached, rescans it to see the metadata disk just written,
+    # reads the database there, and recovers into itself.
+    if [ -z "$(xe_dr sr-list uuid=$sr --minimal)" ]; then
+        echo "the standby pool has not attached this SR: attach the same storage there first" >&2
+        exit 1
+    fi
+    xe_dr sr-scan uuid=$sr
+    # The type reads "Metadata" in xe's output, so compare it case-insensitively rather than filtering.
+    vdi=""
+    for v in $(each_csv "$(xe_dr vdi-list sr-uuid=$sr --minimal)"); do
+        t=$(xe_dr vdi-param-get uuid=$v param-name=type)
+        if [ "${t,,}" = metadata ]; then vdi=$v; break; fi
+    done
+    if [ -z "$vdi" ]; then
+        echo "the standby pool sees no metadata disk on this SR after rescanning it" >&2
+        exit 1
+    fi
     echo "  metadata disk: $vdi"
 
     # `database:vdi-uuid=` runs the command against the replicated database instead of the live pool, so
     # this lists the VMs as they were written out rather than the ones running now - only real guest VMs
     # are recoverable, so exclude templates, control domains and snapshots.
-    recoverable=$(xe vm-list database:vdi-uuid=$vdi is-a-template=false is-control-domain=false \
+    recoverable=$(xe_dr vm-list database:vdi-uuid=$vdi is-a-template=false is-control-domain=false \
         is-a-snapshot=false --minimal)
     echo "  the replicated database describes $(count_csv "$recoverable") recoverable VM(s)"
 
@@ -2384,7 +2418,7 @@ w_disaster_recovery() {
         echo "no VM in the replicated database has all its disks on storage the standby pool can see" >&2
         exit 1
     fi
-    name=$(xe vm-list uuid=$md database:vdi-uuid=$vdi params=name-label --minimal)
+    name=$(xe_dr vm-list uuid=$md database:vdi-uuid=$vdi params=name-label --minimal)
     echo "  recovering $name"
     xe_dr vm-recover uuid=$md database:vdi-uuid=$vdi force=false
 

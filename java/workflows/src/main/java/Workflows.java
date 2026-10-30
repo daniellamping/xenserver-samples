@@ -2136,6 +2136,9 @@ public class Workflows {
         // The result is the new VM's ref on the DESTINATION pool - use the destination session to read it.
         System.out.println("  the copy on the destination: " + copy.getNameLabel(dest) + " ("
                 + copy.getUuid(dest) + ")");
+
+        // Tidy up so the example is repeatable: the copy and its disks, on the destination pool.
+        destroyVmAndDisks(dest, copy);
         System.out.println("OK: cross-pool-copy-vm");
         Session.logout(source);
         Session.logout(dest);
@@ -2780,7 +2783,9 @@ public class Workflows {
                 // Corosync must not lose its network, so each host's PIF on it has to refuse unplugging
                 // first: Cluster.poolCreate fails PIF_ALLOWS_UNPLUG otherwise. was remembers the settings.
                 for (PIF pif : was.keySet()) pif.setDisallowUnplug(conn, true);
-                cluster = Cluster.poolCreate(conn, network, "corosync", 20000.0, 1000.0);
+                // token_timeout is in seconds (XenCenter's default 20.0, coefficient 1.0): XS9 refuses
+                // 20000 as "too large" - it is not milliseconds.
+                cluster = Cluster.poolCreate(conn, network, "corosync", 20.0, 1.0);
             }
 
             System.out.println("Stack:      " + cluster.getClusterStack(conn));
@@ -3757,19 +3762,31 @@ public class Workflows {
             System.out.println("Replicating pool metadata to " + sr.getNameLabel(conn));
             sr.enableDatabaseReplication(conn);
 
+            // Everything from here happens on the STANDBY pool, the way XenCenter's DR wizard works from
+            // the pool you fail over to: it has the same SR attached, rescans it to see the metadata disk
+            // just written, opens the database there, and recovers into itself - VM.recover's session_to
+            // has to be a session of the server running the call (HANDLE_INVALID otherwise).
+            SR drSr;
+            try {
+                drSr = SR.getByUuid(drConn, sr.getUuid(conn));
+            } catch (Types.XenAPIException e) {
+                throw new RuntimeException("the standby pool has not attached " + sr.getNameLabel(conn)
+                        + ": attach the same storage there first");
+            }
+            drSr.scan(drConn);
             VDI metadataVdi = null;
-            for (VDI v : sr.getVDIs(conn))
-                if (v.getType(conn) == Types.VdiType.METADATA) { metadataVdi = v; break; }
-            System.out.println("  metadata disk: " + metadataVdi.getUuid(conn));
+            for (VDI v : drSr.getVDIs(drConn))
+                if (v.getType(drConn) == Types.VdiType.METADATA) { metadataVdi = v; break; }
+            System.out.println("  metadata disk: " + metadataVdi.getUuid(drConn));
 
             // A session onto the replicated database rather than the live pool.
-            Session metadata = metadataVdi.openDatabase(conn);
+            Session metadata = metadataVdi.openDatabase(drConn);
 
             // The generated classes always send the Connection's own session, so reading the replicated
             // database means dispatching by hand with the metadata session in its place. Connection
             // .dispatch is the binding's own entry point, so this still goes over the trusting HTTP
             // client that connect() set up.
-            Map<VM, VM.Record> all = conn.dispatch("VM.get_all_records",
+            Map<VM, VM.Record> all = drConn.dispatch("VM.get_all_records",
                 new Object[]{metadata.toWireString()},
                 new com.fasterxml.jackson.core.type.TypeReference<Map<VM, VM.Record>>() {});
 
@@ -3793,7 +3810,7 @@ public class Workflows {
             String targetUuid = null;
             for (Map.Entry<VM, VM.Record> e : byName) {
                 try {
-                    conn.<Object>dispatch("VM.assert_can_be_recovered",
+                    drConn.<Object>dispatch("VM.assert_can_be_recovered",
                         new Object[]{metadata.toWireString(), e.getKey().toWireString(), drSessionId});
                 } catch (Types.XenAPIException notThisOne) {
                     continue;
@@ -3804,7 +3821,7 @@ public class Workflows {
             if (target == null)
                 throw new RuntimeException("no VM in the replicated database has all its disks on storage the standby pool can see");
             System.out.println("  recovering " + name);
-            conn.<Object>dispatch("VM.recover",
+            drConn.<Object>dispatch("VM.recover",
                 new Object[]{metadata.toWireString(), target.toWireString(), drSessionId, false});
 
             // It is a real VM on the standby pool now, not merely a call that returned - look it up by
