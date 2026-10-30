@@ -1314,11 +1314,19 @@ w_cross_pool_copy_vm() {
     dest_net=$(xe_dest pif-list host-uuid=$dest_master management=true params=network-uuid --minimal)
     vif_map=()
     for v in $(each_csv "$(xe vif-list vm-uuid=$vm --minimal)"); do vif_map+=("vif:$v=$dest_net"); done
+    # And every disk to the destination pool's default SR. Left unmapped, xe picks an SR itself - on a real
+    # pool a small shared one it happened to prefer, which ran out of space (SR_BACKEND_FAILURE_44).
+    local dest_sr vbd vdi_map=()
+    dest_sr=$(xe_dest pool-param-get uuid=$(xe_dest pool-list --minimal) param-name=default-SR)
+    for vbd in $(each_csv "$(xe vbd-list vm-uuid=$vm type=Disk --minimal)"); do
+        vdi=$(xe vbd-param-get uuid=$vbd param-name=vdi-uuid)
+        [[ $vdi == *-* ]] && vdi_map+=("vdi:$vdi=$dest_sr")
+    done
     # The VMs the destination already has, to tell the copy apart afterwards (never by name alone).
     local before copy
     before=",$(xe_dest vm-list is-control-domain=false --minimal),"
     xe vm-migrate uuid=$vm remote-master=$dest_host remote-username=$destuser remote-password=$destpass copy=true \
-        "${vif_map[@]}"
+        "${vif_map[@]}" "${vdi_map[@]}"
     still=$([ -n "$(vm_uuid "$copy_vm")" ] && echo True || echo False)
     echo "Sent '$copy_vm' to $dest_host (copy); source still present: $still"
 
