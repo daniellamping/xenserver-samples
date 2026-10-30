@@ -3053,7 +3053,7 @@ def backup_host_config(url, username, password):
     path = os.path.join(tempfile.gettempdir(), "sdk-example-host.backup")
     with urllib.request.urlopen(
             "%s/host_backup?session_id=%s&ref=%s" % (host_url, session._session, host),
-            context=ctx, timeout=10) as response, open(path, "wb") as out:
+            context=ctx, timeout=1800) as response, open(path, "wb") as out:   # the host packs it first
         shutil.copyfileobj(response, out)       # hundreds of MB: stream it, don't hold it in memory
     print("  wrote %d bytes to %s" % (os.path.getsize(path), os.path.basename(path)))
     _drop_idle_connection(session)
@@ -3096,7 +3096,9 @@ def restore_host_config(session, ctx, host_url, host, path):
             request = urllib.request.Request(
                 "%s/host_restore?session_id=%s&ref=%s&task_id=%s" % (host_url, session._session, host, task),
                 data=f, headers={"Content-Length": str(os.path.getsize(path))}, method="PUT")
-            urllib.request.urlopen(request, context=ctx, timeout=10).read()
+            # The timeout covers each socket operation, including waiting for the host's answer once the
+            # whole backup (hundreds of MB) has arrived - a real host takes far longer than seconds.
+            urllib.request.urlopen(request, context=ctx, timeout=1800).read()
         _drop_idle_connection(session)
 
         while x.task.get_status(task) == "pending":
