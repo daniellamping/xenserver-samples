@@ -10,7 +10,7 @@
 
 vm_boot_config() {
     local template=$(param template_name "Rocky Linux 8")
-    vm=$(xe vm-install template="$template" new-name-label=xe-example-boot sr-uuid=$(shared_sr))
+    vm=$(xe vm-install template="$template" new-name-label=xe-example-boot)
     xe vm-param-set uuid=$vm VCPUs-max=4 VCPUs-at-startup=2
     # Boot mode: firmware ("bios"/"uefi") lives in HVM-boot-params; Secure Boot in platform:secureboot.
     # "auto" (not a hard-coded "true") is the real xe/XenCenter convention: xapi resolves it against

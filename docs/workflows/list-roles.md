@@ -191,7 +191,7 @@ func listRoles(url, user, password string) {
 <details><summary>Sample output</summary>
 
 ```text
-Roles (7): read-only, pool-operator, client-cert, pool-admin, vm-operator, vm-power-admin, vm-admin
+Roles (7): vm-power-admin, pool-admin, client-cert, read-only, vm-operator, pool-operator, vm-admin
 OK: list-roles
 ```
 

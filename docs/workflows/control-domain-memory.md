@@ -176,7 +176,7 @@ public final class ControlDomainMemory {
 <details><summary>Sample output</summary>
 
 ```text
-sdk-host1 dom0: 2.0 GiB
+sdk-host2 dom0: 2.0 GiB
   now 3.0 GiB (static 2147483648-3221225472, dynamic 3221225472-3221225472)
 OK: control-domain-memory
 ```

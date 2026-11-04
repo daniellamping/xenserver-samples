@@ -45,7 +45,7 @@ public static void DeleteVm(string url, string user, string password,
 <details><summary>Sample output</summary>
 
 ```text
-Deleting VM 00000001-0000-0000-0c0a-000000000000 with 1 disk(s)
+Deleting VM 00000001-0000-0000-fe09-000000000000 with 1 disk(s)
 VM still present: False
 OK: delete-vm
 ```
@@ -163,7 +163,7 @@ public final class DeleteVm {
 <details><summary>Sample output</summary>
 
 ```text
-Deleting VM 00000001-0000-0000-000a-000000000000 with 1 disk(s)
+Deleting VM 00000001-0000-0000-0b0a-000000000000 with 1 disk(s)
 VM still present: false
 OK: delete-vm
 ```
@@ -225,7 +225,7 @@ func deleteVM(url, user, password, templateName, newVMName string) {
 <details><summary>Sample output</summary>
 
 ```text
-Deleting VM 00000001-0000-0000-ff09-000000000000 with 1 disk(s)
+Deleting VM 00000001-0000-0000-130a-000000000000 with 1 disk(s)
 VM still present: false
 OK: delete-vm
 ```
@@ -282,7 +282,7 @@ function Invoke-DeleteVm {
 <details><summary>Sample output</summary>
 
 ```text
-Deleting VM 00000001-0000-0000-0e0a-000000000000 with 1 disk(s)
+Deleting VM 00000001-0000-0000-110a-000000000000 with 1 disk(s)
 VM still present: False
 OK: delete-vm
 ```
@@ -307,7 +307,7 @@ Source: [`cli/virtual-machines/delete-vm.sh`](../../cli/virtual-machines/delete-
 
 delete_vm() {
     local template=$(param template_name "Rocky Linux 8")
-    vm=$(xe vm-install template="$template" new-name-label=xe-example-delete sr-uuid=$(shared_sr))
+    vm=$(xe vm-install template="$template" new-name-label=xe-example-delete)
     # vm-uninstall destroys the VM and the disks it owns, what XenCenter's Delete VM does; vm-destroy
     # would remove only the VM record and leave its disks behind.
     xe vm-uninstall uuid=$vm force=true

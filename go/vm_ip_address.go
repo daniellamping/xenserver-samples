@@ -13,9 +13,8 @@ import (
 // Read a running VM's IP address from its guest metrics, as reported by the in-guest agent.
 //
 // A VM that has only just started may not have reported in yet (no guest_metrics at all, or an
-// empty networks map) - retry for a while rather than giving up on the first look. The CLI version
-// of this example already does this; timeoutStr and intervalStr bring the SDK languages in line
-// with it (seconds, as decimal strings).
+// empty networks map) - retry for a while rather than giving up on the first look. timeoutStr and
+// intervalStr take seconds, as decimal strings (Go's dispatcher passes key=value arguments as strings).
 func vmIpAddress(url, user, password, timeoutStr, intervalStr string) {
 	timeout, err := strconv.Atoi(timeoutStr)
 	check(err)

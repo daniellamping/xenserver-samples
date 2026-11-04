@@ -196,10 +196,10 @@ var workflows = map[string]workflow{
 	}),
 	"create-iscsi-sr": wf(map[string]string{
 		"target": "192.0.2.30", "port": "", "chap_user": "", "chap_password": "", "target_iqn": "",
-		"sr_name": "sdk-example-iscsi",
+		"scsi_id": "360a980004265656d5f4a2d63764e5734", "sr_name": "sdk-example-iscsi",
 	}, func(u, n, p string, m map[string]string) {
 		createIscsiSr(u, n, p, m["target"], m["port"], m["chap_user"], m["chap_password"], m["target_iqn"],
-			m["sr_name"])
+			m["scsi_id"], m["sr_name"])
 	}),
 	"create-smb-sr": wf(map[string]string{
 		"server": "192.0.2.40", "share": "/vmstore", "smb_username": "Administrator",

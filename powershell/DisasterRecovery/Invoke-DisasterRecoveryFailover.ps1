@@ -47,7 +47,7 @@ function Invoke-DisasterRecoveryFailover {
     $master = (Get-XenPool).master.opaque_ref
     $probe = Invoke-XenSR -Ref "OpaqueRef:NULL" -XenAction Probe -XenHost $master -DeviceConfig $deviceConfig `
         -Type $SrType -SmConfig @{ metadata = 'true' } -PassThru
-    $srs = @(([xml]$probe).SRlist.SR)
+    $srs = @(([xml]$probe).SelectNodes('/SRlist/SR'))
     foreach ($found in $srs) {
         $withMetadata = if ("$($found.pool_metadata_detected)".Trim() -eq 'true') { ", with pool metadata" } else { "" }
         Write-Host "Found SR $("$($found.name_label)".Trim()) ($("$($found.UUID)".Trim()))$withMetadata"

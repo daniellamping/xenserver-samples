@@ -74,7 +74,7 @@ public static void SnapshotRevert(string url, string user, string password,
 
 ```text
 Snapshotting VM: web-01
-Created snapshot: 00000001-0000-0000-270a-000000000000
+Created snapshot: 00000001-0000-0000-500a-000000000000
 Thumbnail:      23379 bytes of PNG
 Reverted VM to the snapshot.
 Restarted the VM (it was running before the revert).
@@ -156,7 +156,7 @@ def snapshot_revert(url, username, password, vm_name, snapshot_name="sdk-example
 
 ```text
 Snapshotting VM: web-01
-Created snapshot: 00000001-0000-0000-430a-000000000000
+Created snapshot: 00000001-0000-0000-570a-000000000000
 Thumbnail:      23379 bytes of PNG
 Reverted VM to the snapshot.
 Restarted the VM (it was running before the revert).
@@ -258,7 +258,7 @@ public final class SnapshotRevert {
 
 ```text
 Snapshotting VM: web-01
-Created snapshot: 00000001-0000-0000-530a-000000000000
+Created snapshot: 00000001-0000-0000-2e0a-000000000000
 Thumbnail:      23379 bytes of PNG
 Reverted VM to the snapshot.
 Restarted the VM (it was running before the revert).
@@ -359,7 +359,7 @@ func snapshotRevert(url, user, password, vmName, snapshotName string) {
 
 ```text
 Snapshotting VM: web-01
-Created snapshot: 00000001-0000-0000-2e0a-000000000000
+Created snapshot: 00000001-0000-0000-3d0a-000000000000
 Thumbnail:      23379 bytes of PNG
 Reverted VM to the snapshot.
 Restarted the VM (it was running before the revert).
@@ -444,7 +444,7 @@ function Invoke-SnapshotRevert {
 
 ```text
 Snapshotting VM: web-01
-Created snapshot: 00000001-0000-0000-530a-000000000000
+Created snapshot: 00000001-0000-0000-560a-000000000000
 Thumbnail:      23379 bytes of PNG
 Reverted VM to the snapshot.
 Restarted the VM (it was running before the revert).
@@ -490,7 +490,7 @@ snapshot_revert() {
 <details><summary>Sample output</summary>
 
 ```text
-Created snapshot: 00000001-0000-0000-1d0a-000000000000
+Created snapshot: 00000001-0000-0000-570a-000000000000
 Reverted to the snapshot.
 OK: snapshot-revert
 ```

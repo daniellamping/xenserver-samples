@@ -13,11 +13,19 @@ Workflow `create-smb-sr`. [All workflows](README.md) · [Connecting](connecting.
 Source: [`csharp/Storage/CreateSmbSr.cs`](../../csharp/Storage/CreateSmbSr.cs)
 
 ```csharp
-/// <summary> Connect a shared storage repository to an SMB/CIFS file share, passing the server, share path and
-/// credentials (the password as a secret, never in plain text). </summary> <example> <code>
+/// <summary>
+/// Connect a shared storage repository to an SMB/CIFS file share, passing the server, share path and
+/// credentials (the password as a secret, never in plain text).
+/// </summary>
+/// <example>
+/// <code>
 /// Workflows.CreateSmbSr("https://xenserver", "root", password, "192.0.2.40", "/vmstore", "Administrator", "Password1");
-/// </code> </example> <remarks> Connect a shared SR to an SMB/CIFS file share (create validates + sizes from the share).
-/// The password travels as a Secret, not plaintext device-config - the way XenCenter does it. </remarks>
+/// </code>
+/// </example>
+/// <remarks>
+/// Connect a shared SR to an SMB/CIFS file share (create validates + sizes from the share). The password
+/// travels as a Secret, not plaintext device-config - the way XenCenter does it.
+/// </remarks>
 public static void CreateSmbSr(string url, string user, string password, string server, string share,
     string smbUsername, string smbPassword, string srName = "sdk-example-smb")
 {
@@ -50,7 +58,7 @@ public static void CreateSmbSr(string url, string user, string password, string 
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-820a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-c50a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -98,7 +106,7 @@ def create_smb_sr(url, username, password, server, share, smb_username, smb_pass
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-a70a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-b30a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -174,7 +182,7 @@ public final class CreateSmbSr {
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-ef0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-8e0a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -234,7 +242,7 @@ func createSmbSr(url, user, password, server, share, smbUsername, smbPassword, s
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-ab0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-c90a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -292,7 +300,7 @@ function Invoke-CreateSmbSr {
 <details><summary>Sample output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-dc0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-df0a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 
@@ -342,7 +350,7 @@ create_smb_sr() {
 <details><summary>Sample output</summary>
 
 ```text
-Created SMB SR: 00000001-0000-0000-af0a-000000000000 (512 GiB)
+Created SMB SR: 00000001-0000-0000-b70a-000000000000 (512 GiB)
 OK: create-smb-sr
 ```
 

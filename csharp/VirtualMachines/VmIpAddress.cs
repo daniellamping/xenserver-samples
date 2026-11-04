@@ -7,10 +7,18 @@ namespace XenServerWorkflows;
 
 internal static partial class Workflows
 {
-    /// <summary> Read a running VM's IP address from its guest metrics, as reported by the in-guest agent.
-    /// </summary> <example> <code> Workflows.VmIpAddress("https://xenserver", "root", password); </code>
-    /// </example> <remarks> A VM that has only just started may not have reported in yet (no guest_metrics at
-    /// all, or an empty networks map) - retry for a while rather than giving up on the first look. </remarks>
+    /// <summary>
+    /// Read a running VM's IP address from its guest metrics, as reported by the in-guest agent.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// Workflows.VmIpAddress("https://xenserver", "root", password);
+    /// </code>
+    /// </example>
+    /// <remarks>
+    /// A VM that has only just started may not have reported in yet (no guest_metrics at all, or an empty
+    /// networks map) - retry for a while rather than giving up on the first look.
+    /// </remarks>
     public static void VmIpAddress(string url, string user, string password,
         int timeoutSeconds = 60, int intervalSeconds = 2)
     {

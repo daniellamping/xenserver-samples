@@ -11,7 +11,7 @@
 
 delete_vm() {
     local template=$(param template_name "Rocky Linux 8")
-    vm=$(xe vm-install template="$template" new-name-label=xe-example-delete sr-uuid=$(shared_sr))
+    vm=$(xe vm-install template="$template" new-name-label=xe-example-delete)
     # vm-uninstall destroys the VM and the disks it owns, what XenCenter's Delete VM does; vm-destroy
     # would remove only the VM record and leave its disks behind.
     xe vm-uninstall uuid=$vm force=true

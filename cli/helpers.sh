@@ -11,7 +11,15 @@ nth_csv()    { local n=$2 IFS=,; set -- $1; shift $((n - 1)); echo "$1"; }  # Nt
 # helpers above work on both.
 set_to_csv() { echo "${1//; /,}"; }
 
-shared_sr() { first_csv "$(xe sr-list name-label="Shared NFS" --minimal)"; }
+# The pool's default SR: where xe vm-install puts a template's disks when no SR is named.
+default_sr() { xe pool-param-get uuid=$(xe pool-list --minimal) param-name=default-SR; }
+# The (first) SR with this name, or a message saying there is none.
+sr_by_name() {
+    local sr
+    sr=$(first_csv "$(xe sr-list name-label="$1" --minimal)")
+    if [ -z "$sr" ]; then echo "no SR named '$1'" >&2; return 1; fi
+    echo "$sr"
+}
 first_host() { first_csv "$(xe host-list --minimal)"; }
 vm_uuid()  { first_csv "$(xe vm-list name-label="$1" --minimal)"; }
 

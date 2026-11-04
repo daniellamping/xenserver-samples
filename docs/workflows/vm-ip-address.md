@@ -11,10 +11,18 @@ Workflow `vm-ip-address`. [All workflows](README.md) · [Connecting](connecting.
 Source: [`csharp/VirtualMachines/VmIpAddress.cs`](../../csharp/VirtualMachines/VmIpAddress.cs)
 
 ```csharp
-/// <summary> Read a running VM's IP address from its guest metrics, as reported by the in-guest agent.
-/// </summary> <example> <code> Workflows.VmIpAddress("https://xenserver", "root", password); </code>
-/// </example> <remarks> A VM that has only just started may not have reported in yet (no guest_metrics at
-/// all, or an empty networks map) - retry for a while rather than giving up on the first look. </remarks>
+/// <summary>
+/// Read a running VM's IP address from its guest metrics, as reported by the in-guest agent.
+/// </summary>
+/// <example>
+/// <code>
+/// Workflows.VmIpAddress("https://xenserver", "root", password);
+/// </code>
+/// </example>
+/// <remarks>
+/// A VM that has only just started may not have reported in yet (no guest_metrics at all, or an empty
+/// networks map) - retry for a while rather than giving up on the first look.
+/// </remarks>
 public static void VmIpAddress(string url, string user, string password,
     int timeoutSeconds = 60, int intervalSeconds = 2)
 {
@@ -201,9 +209,8 @@ import (
 // Read a running VM's IP address from its guest metrics, as reported by the in-guest agent.
 //
 // A VM that has only just started may not have reported in yet (no guest_metrics at all, or an
-// empty networks map) - retry for a while rather than giving up on the first look. The CLI version
-// of this example already does this; timeoutStr and intervalStr bring the SDK languages in line
-// with it (seconds, as decimal strings).
+// empty networks map) - retry for a while rather than giving up on the first look. timeoutStr and
+// intervalStr take seconds, as decimal strings (Go's dispatcher passes key=value arguments as strings).
 func vmIpAddress(url, user, password, timeoutStr, intervalStr string) {
 	timeout, err := strconv.Atoi(timeoutStr)
 	check(err)
@@ -324,17 +331,33 @@ Source: [`cli/virtual-machines/vm-ip-address.sh`](../../cli/virtual-machines/vm-
 #
 # Run it:
 #   ./workflows.sh vm-ip-address https://xenserver root "$password"
+#
+# Optional key=value arguments (default):
+#   timeout (60), interval (2)
 
 vm_ip_address() {
-    # A running guest's tools report its IPs in the VM's networks parameter, keyed "<vif device>/ip". Pick
-    # one that reports an address (freshly-created VMs and guests without tools report none).
-    running=$(xe vm-list power-state=running is-control-domain=false --minimal)
-    vm=""; ip=""
-    for u in $(each_csv "$running"); do
-        ip=$(xe vm-param-get uuid=$u param-name=networks param-key=0/ip 2>/dev/null) || continue
-        vm=$u; break
+    # A VM that has only just started may not have reported in yet (freshly-created VMs and guests
+    # without tools report no address) - retry for a while rather than giving up on the first look.
+    local timeout interval deadline running vm ip
+    timeout=$(param timeout 60)
+    interval=$(param interval 2)
+    deadline=$((SECONDS + timeout))
+    while true; do
+        # A running guest's tools report its IPs in the VM's networks parameter, keyed "<vif device>/ip".
+        running=$(xe vm-list power-state=running is-control-domain=false --minimal)
+        vm=""; ip=""
+        for u in $(each_csv "$running"); do
+            ip=$(xe vm-param-get uuid=$u param-name=networks param-key=0/ip 2>/dev/null) || continue
+            vm=$u; break
+        done
+        [ -n "$ip" ] && break
+        [ $SECONDS -gt $deadline ] && break
+        sleep "$interval"
     done
-    [ -n "$vm" ] || { vm=$(first_csv "$running"); ip="(no address reported)"; }
+    if [ -z "$ip" ]; then
+        echo "no running guest reported an IP address within ${timeout}s" >&2
+        exit 1
+    fi
     echo "  $(xe vm-param-get uuid=$vm param-name=name-label): $ip"
     echo "OK: vm-ip-address"
 }

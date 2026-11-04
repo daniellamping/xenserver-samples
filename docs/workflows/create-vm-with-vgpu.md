@@ -4,7 +4,7 @@
 
 Provision a VM from a template and assign it a virtual GPU: find a GPU group that offers a vGPU type, attach it, and read the assignment back.
 
-**Requires:** a GPU that supports vGPU.
+**Requires:** a GPU that supports vGPU, and a license that includes GPU virtualization (Premium Edition).
 
 Workflow `create-vm-with-vgpu`. [All workflows](README.md) · [Connecting](connecting.md)
 
@@ -73,7 +73,7 @@ private static (string, string) GpuGroupWithVgpuType(Session session)
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-850a-000000000000
+Created vGPU: 00000001-0000-0000-a70a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -147,7 +147,7 @@ def gpu_group_with_vgpu_type(session):
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-8a0a-000000000000
+Created vGPU: 00000001-0000-0000-810a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -244,7 +244,7 @@ public final class CreateVmWithVgpu {
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-390a-000000000000
+Created vGPU: 00000001-0000-0000-6e0a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -331,7 +331,7 @@ func gpuGroupWithVgpuType(session *xenapi.Session) (xenapi.GPUGroupRef, xenapi.V
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-920a-000000000000
+Created vGPU: 00000001-0000-0000-700a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -405,7 +405,7 @@ function Invoke-CreateVmWithVgpu {
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-890a-000000000000
+Created vGPU: 00000001-0000-0000-8c0a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -457,7 +457,7 @@ create_vm_with_vgpu() {
 <details><summary>Sample output</summary>
 
 ```text
-Created vGPU: 00000001-0000-0000-8d0a-000000000000 of type GRID K100
+Created vGPU: 00000001-0000-0000-890a-000000000000 of type GRID K100
 OK: create-vm-with-vgpu
 ```
 
