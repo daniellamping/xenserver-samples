@@ -41,9 +41,8 @@ def rolling_pool_update(url, username, password, repo_url, source_url):
         hash_ = session.xenapi.pool.sync_updates(pool, False, "", "")
         print("Synced updates; hash length %d" % len(hash_))
 
-        # The rolling pattern behind XenCenter's automated Install Updates: apply -> evacuate and
-        # retry only if that turns out to be needed -> reboot (only if asked) -> re-enable, one host
-        # at a time, coordinator first.
+        # The rolling pattern: apply -> evacuate and retry only if that turns out to be needed ->
+        # reboot (only if asked) -> re-enable, one host at a time, coordinator first.
         hosts = session.xenapi.host.get_all_records()
         master = session.xenapi.pool.get_master(pool)
         ordered_refs = [master] + [ref for ref in hosts if ref != master]

@@ -77,7 +77,7 @@ func createIscsiSr(url, user, password, target, port, chapUser, chapPassword, ta
 
 	// The device-config is now complete enough to create from - which means it is also complete
 	// enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-	// SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+	// SR.create would format it. Reattach that SR rather than destroying it.
 	srProbe, err := xenapi.SR.Probe(session, host, dc, "lvmoiscsi", map[string]string{})
 	check(err)
 	if existing := findXMLElements(srProbe, "SR"); len(existing) > 0 {

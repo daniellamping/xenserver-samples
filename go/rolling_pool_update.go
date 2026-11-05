@@ -51,9 +51,8 @@ func rollingPoolUpdate(url, user, password, repoURL, sourceURL string) {
 	check(err)
 	fmt.Printf("Synced updates; hash length %d\n", len(hash))
 
-	// The rolling pattern behind XenCenter's automated Install Updates: apply -> evacuate and retry
-	// only if that turns out to be needed -> reboot (only if asked) -> re-enable, one host at a
-	// time, coordinator first.
+	// The rolling pattern: apply -> evacuate and retry only if that turns out to be needed ->
+	// reboot (only if asked) -> re-enable, one host at a time, coordinator first.
 	hosts, err := xenapi.Host.GetAllRecords(session)
 	check(err)
 	master, err := xenapi.Pool.GetMaster(session, pool)

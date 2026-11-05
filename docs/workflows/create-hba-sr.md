@@ -50,12 +50,12 @@ public static void CreateHbaSr(string url, string user, string password, string 
     var path = device.Element("path")!.Value;
     Console.WriteLine($"Discovered LUN: SCSIid {scsiId} on {path}");
 
-    // SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-    // for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+    // SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+    // like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
     var dc = new Dictionary<string, string> { ["SCSIid"] = scsiId };
 
     // SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-    // there, and SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+    // there, and SR.create would format it. Reattach that SR rather than destroying it.
     var srListXml = XDocument.Parse(SR.probe(session, host, dc, "lvmohba", new Dictionary<string, string>()));
     var existing = srListXml.Descendants("SR").FirstOrDefault();
     if (existing != null)
@@ -80,7 +80,7 @@ public static void CreateHbaSr(string url, string user, string password, string 
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-cc0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-770a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -124,12 +124,12 @@ def create_hba_sr(url, username, password, scsi_id="", sr_name="sdk-example-hba"
     path = device.find("path").text
     print("Discovered LUN: SCSIid %s on %s" % (scsi_id, path))
 
-    # SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-    # for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+    # SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+    # like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
     dc = {"SCSIid": scsi_id}
 
     # SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-    # there, and SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+    # there, and SR.create would format it. Reattach that SR rather than destroying it.
     srlist_xml = ET.fromstring(session.xenapi.SR.probe(host, dc, "lvmohba", {}))
     existing = srlist_xml.find("SR")
     if existing is not None:
@@ -155,7 +155,7 @@ def create_hba_sr(url, username, password, scsi_id="", sr_name="sdk-example-hba"
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-910a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-f20a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -223,14 +223,14 @@ public final class CreateHbaSr {
             String path = firstTagText(device, "path");
             System.out.println("Discovered LUN: SCSIid " + scsiId + " on " + path);
 
-            // SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path>
-            // is for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+            // SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads like
+            // "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
             Map<String, String> dc = new java.util.HashMap<>();
             dc.put("SCSIid", scsiId);
 
             // SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is
-            // already there, and SR.create would format it. XenCenter offers to reattach that SR instead
-            // of destroying it.
+            // already there, and SR.create would format it. Reattach that SR rather than
+            // destroying it.
             org.w3c.dom.Element srListRoot =
                 parseXml(SR.probe(conn, host, dc, "lvmohba", new java.util.HashMap<>())).getDocumentElement();
             org.w3c.dom.NodeList existing = srListRoot.getElementsByTagName("SR");
@@ -261,7 +261,7 @@ public final class CreateHbaSr {
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-da0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-9d0a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -305,12 +305,12 @@ func createHbaSr(url, user, password, scsiID, srName string) {
 		"SCSIid", scsiID)
 	fmt.Printf("Discovered LUN: SCSIid %s on %s\n", device["SCSIid"], device["path"])
 
-	// SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-	// for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+	// SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+	// like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
 	dc := map[string]string{"SCSIid": device["SCSIid"]}
 
 	// SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-	// there, and SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+	// there, and SR.create would format it. Reattach that SR rather than destroying it.
 	srProbe, err := xenapi.SR.Probe(session, host, dc, "lvmohba", map[string]string{})
 	check(err)
 	if existing := findXMLElements(srProbe, "SR"); len(existing) > 0 {
@@ -344,7 +344,7 @@ func createHbaSr(url, user, password, scsiID, srName string) {
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-cf0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-f50a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -390,12 +390,12 @@ function Invoke-CreateHbaSr {
     $path = $device.path
     Write-Host "Discovered LUN: SCSIid $scsiId on $path"
 
-    # SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-    # for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+    # SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+    # like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
     $deviceConfig = @{ SCSIid = $scsiId }
 
     # SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-    # there, and SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+    # there, and SR.create would format it. Reattach that SR rather than destroying it.
     $probe = Invoke-XenSR -Ref "OpaqueRef:NULL" -XenAction Probe -XenHost $xenHost.opaque_ref `
         -DeviceConfig $deviceConfig -Type lvmohba -SmConfig @{} -PassThru
     $existing = @(([xml]$probe).SelectNodes('/SRlist/SR'))
@@ -468,11 +468,11 @@ create_hba_sr() {
     path=$(xml_tag_text "$block" path)
     echo "Discovered LUN: SCSIid $scsi_id on $path"
 
-    # SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-    # for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+    # SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+    # like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
     #
     # SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-    # there, and sr-create would format it. XenCenter offers to reattach that SR instead of destroying it.
+    # there, and sr-create would format it. Reattach that SR rather than destroying it.
     local existing_xml uuid
     existing_xml=$(xe sr-probe type=lvmohba device-config:SCSIid="$scsi_id")
     if uuid=$(xml_tag_text "$existing_xml" UUID); then
@@ -498,7 +498,7 @@ create_hba_sr() {
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created HBA SR: 00000001-0000-0000-940a-000000000000 (512 GiB)
+Created HBA SR: 00000001-0000-0000-7a0a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 

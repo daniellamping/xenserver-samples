@@ -55,7 +55,7 @@ def create_iscsi_sr(url, username, password, target, port=None, chap_user=None, 
 
         # The device-config is now complete enough to create from - which means it is also complete
         # enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-        # SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+        # SR.create would format it. Reattach that SR rather than destroying it.
         srlist_xml = ET.fromstring(session.xenapi.SR.probe(host, dc, "lvmoiscsi", {}))
         existing = srlist_xml.find("SR")
         if existing is not None:

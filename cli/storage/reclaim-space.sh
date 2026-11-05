@@ -9,8 +9,8 @@
 reclaim_space() {
     local sr candidate type pbd h name result
     # A thin-provisioned SR (local LVM here) can return space freed by deleted disks to the backend via
-    # the trim plugin - XenCenter's "Reclaim freed space". Find one via its storage manager's SR_TRIM
-    # feature, instead of hard-coding a type.
+    # the trim plugin. Find one via its storage manager's SR_TRIM feature, instead of hard-coding a
+    # type.
     sr=""
     for candidate in $(each_csv "$(xe sr-list --minimal)"); do
         type=$(xe sr-param-get uuid=$candidate param-name=type)

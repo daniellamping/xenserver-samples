@@ -31,12 +31,12 @@ func createHbaSr(url, user, password, scsiID, srName string) {
 		"SCSIid", scsiID)
 	fmt.Printf("Discovered LUN: SCSIid %s on %s\n", device["SCSIid"], device["path"])
 
-	// SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-	// for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+	// SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+	// like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
 	dc := map[string]string{"SCSIid": device["SCSIid"]}
 
 	// SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-	// there, and SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+	// there, and SR.create would format it. Reattach that SR rather than destroying it.
 	srProbe, err := xenapi.SR.Probe(session, host, dc, "lvmohba", map[string]string{})
 	check(err)
 	if existing := findXMLElements(srProbe, "SR"); len(existing) > 0 {

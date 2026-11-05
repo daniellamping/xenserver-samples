@@ -45,8 +45,7 @@ def apply_update(url, username, password, repo_url, source_url):
         print("Synced updates; hash length %d" % len(hash_))
 
         # Apply the synced updates to each host, coordinator first as the documentation requires.
-        # XenCenter then reads the reboot guidance to decide whether a Rolling Pool Upgrade reboot is
-        # needed.
+        # Then read the reboot guidance to decide whether a host needs a reboot.
         hosts = session.xenapi.host.get_all_records()
         master = session.xenapi.pool.get_master(pool)
         ordered_refs = [master] + [ref for ref in hosts if ref != master]

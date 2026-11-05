@@ -45,8 +45,8 @@ function Invoke-ApplyUpdate {
         Write-Host "Synced updates; hash length $($hash.Length)"
 
         # Apply the synced updates to each host, coordinator first as the documentation requires (the
-        # hash is the action's -Hash parameter). XenCenter then reads the reboot guidance to decide
-        # whether a Rolling Pool Upgrade reboot is needed.
+        # hash is the action's -Hash parameter). Then read the reboot guidance to decide whether a
+        # host needs a reboot.
         $orderedHosts = @($pool.master.opaque_ref) + @(Get-XenHost |
             Where-Object { $_.opaque_ref -ne $pool.master.opaque_ref } | ForEach-Object { $_.opaque_ref })
         foreach ($xenHost in $orderedHosts | ForEach-Object { Get-XenHost -Ref $_ }) {

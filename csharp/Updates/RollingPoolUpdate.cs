@@ -41,11 +41,11 @@ internal static partial class Workflows
             Console.WriteLine($"Synced updates; hash length {hash.Length}");
 
             // Apply them host-by-host, coordinator first, so the pool never goes fully offline (the
-            // rolling pattern behind XenCenter's automated Install Updates): apply -> evacuate and retry
-            // only if that turns out to be needed -> reboot (only if asked) -> re-enable. Modern xapi
-            // (>=23.18.0) doesn't reboot a host for you: it only records pending_guidances, so only
-            // reboot (or restart the toolstack) when the applied batch actually asks for it. (Guidance
-            // that targets VMs instead of hosts, for example restarting a VM, is not handled here.)
+            // rolling pattern): apply -> evacuate and retry only if that turns out to be needed ->
+            // reboot (only if asked) -> re-enable. Modern xapi (>=23.18.0) doesn't reboot a host
+            // for you: it only records pending_guidances, so only reboot (or restart the toolstack)
+            // when the applied batch actually asks for it. (Guidance that targets VMs instead of
+            // hosts, for example restarting a VM, is not handled here.)
             var hosts = Host.get_all_records(session);
             var master = Pool.get_master(session, pool);
             var orderedRefs = new[] { master }.Concat(hosts.Keys.Where(r => r.opaque_ref != master.opaque_ref));

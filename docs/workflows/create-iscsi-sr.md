@@ -83,7 +83,7 @@ public static void CreateIscsiSr(string url, string user, string password, strin
 
         // The device-config is now complete enough to create from - which means it is also complete
         // enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-        // SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+        // SR.create would format it. Reattach that SR rather than destroying it.
         var srListXml = XDocument.Parse(SR.probe(session, host, dc, "lvmoiscsi", new Dictionary<string, string>()));
         var existing = srListXml.Descendants("SR").FirstOrDefault();
         if (existing != null)
@@ -148,7 +148,7 @@ private static XElement ChooseLun(List<XElement> luns, string scsiId)
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created SR: 00000001-0000-0000-be0a-000000000000 (200 GiB)
+Created SR: 00000001-0000-0000-b30a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 
@@ -216,7 +216,7 @@ def create_iscsi_sr(url, username, password, target, port=None, chap_user=None, 
 
         # The device-config is now complete enough to create from - which means it is also complete
         # enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-        # SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+        # SR.create would format it. Reattach that SR rather than destroying it.
         srlist_xml = ET.fromstring(session.xenapi.SR.probe(host, dc, "lvmoiscsi", {}))
         existing = srlist_xml.find("SR")
         if existing is not None:
@@ -273,7 +273,7 @@ def _choose_lun(luns, scsi_id):
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created SR: 00000001-0000-0000-4e0a-000000000000 (200 GiB)
+Created SR: 00000001-0000-0000-690a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 
@@ -371,7 +371,7 @@ public final class CreateIscsiSr {
 
             // The device-config is now complete enough to create from - which means it is also complete
             // enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-            // SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+            // SR.create would format it. Reattach that SR rather than destroying it.
             org.w3c.dom.Element srListRoot =
                 parseXml(SR.probe(conn, host, dc, "lvmoiscsi", new java.util.HashMap<>())).getDocumentElement();
             org.w3c.dom.NodeList existing = srListRoot.getElementsByTagName("SR");
@@ -442,7 +442,7 @@ public final class CreateIscsiSr {
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created SR: 00000001-0000-0000-af0a-000000000000 (200 GiB)
+Created SR: 00000001-0000-0000-080b-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 
@@ -532,7 +532,7 @@ func createIscsiSr(url, user, password, target, port, chapUser, chapPassword, ta
 
 	// The device-config is now complete enough to create from - which means it is also complete
 	// enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-	// SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+	// SR.create would format it. Reattach that SR rather than destroying it.
 	srProbe, err := xenapi.SR.Probe(session, host, dc, "lvmoiscsi", map[string]string{})
 	check(err)
 	if existing := findXMLElements(srProbe, "SR"); len(existing) > 0 {
@@ -662,7 +662,7 @@ func chooseLUN(luns []map[string]string, scsiID string) map[string]string {
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created SR: 00000001-0000-0000-c10a-000000000000 (200 GiB)
+Created SR: 00000001-0000-0000-6c0a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 
@@ -737,7 +737,7 @@ function Invoke-CreateIscsiSr {
 
         # The device-config is now complete enough to create from - which means it is also complete
         # enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-        # SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+        # SR.create would format it. Reattach that SR rather than destroying it.
         $probe = Invoke-XenSR -Ref "OpaqueRef:NULL" -XenAction Probe -XenHost $xenHost.opaque_ref -DeviceConfig $dc `
             -Type lvmoiscsi -SmConfig @{} -PassThru
         $existing = @(([xml]$probe).SelectNodes('/SRlist/SR'))
@@ -893,7 +893,7 @@ create_iscsi_sr() {
 
     # The device-config is now complete enough to create from - which means it is also complete enough to
     # probe the LUN itself: an <SR> in the answer means one is already there, and sr-create would format
-    # it. XenCenter offers to reattach that SR instead of destroying it.
+    # it. Reattach that SR rather than destroying it.
     existing_xml=$(xe sr-probe type=lvmoiscsi "${dc[@]}")
     if uuid=$(xml_tag_text "$existing_xml" UUID); then
         echo "LUN $scsi_id already holds SR $uuid; creating an SR here would format it - reattach the" \
@@ -967,7 +967,7 @@ choose_lun() {
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created iSCSI SR: 00000001-0000-0000-510a-000000000000 (200 GiB)
+Created iSCSI SR: 00000001-0000-0000-b60a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 

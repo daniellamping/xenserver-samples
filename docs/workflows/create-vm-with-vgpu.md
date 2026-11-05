@@ -36,12 +36,11 @@ public static void CreateVmWithVgpu(string url, string user, string password,
     var vmRef = VM.clone(session, templateRef, newVmName).opaque_ref;
     Provision(session, vmRef);
 
-    // Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty. This is the
-    // same call XenCenter makes from the New VM wizard GPU page and the VM Properties GPU page.
+    // Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty.
     var vgpuRef = VGPU.create(session, vmRef, groupRef, "0", new Dictionary<string, string>(), typeRef).opaque_ref;
     Console.WriteLine($"Created vGPU: {VGPU.get_uuid(session, vgpuRef)}");
 
-    // Read the assignment back, as XenCenter's GPU tab does.
+    // Read the assignment back.
     var vgpus = VM.get_VGPUs(session, vmRef);
     var assigned = VGPU_type.get_model_name(session, VGPU.get_type(session, vgpus[0].opaque_ref).opaque_ref);
     Console.WriteLine($"VM now has {vgpus.Count} vGPU(s); type = {assigned}");
@@ -73,7 +72,7 @@ private static (string, string) GpuGroupWithVgpuType(Session session)
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-a70a-000000000000
+Created vGPU: 00000001-0000-0000-540a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -114,12 +113,11 @@ def create_vm_with_vgpu(url, username, password, template_name, new_vm_name="sdk
     vm_ref = session.xenapi.VM.clone(template_ref, new_vm_name)
     provision(session, vm_ref)
 
-    # Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty. This is the
-    # same call XenCenter makes from the New VM wizard's GPU page and the VM Properties GPU page.
+    # Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty.
     vgpu_ref = session.xenapi.VGPU.create(vm_ref, group_ref, "0", {}, vgpu_type_ref)
     print("Created vGPU: %s" % session.xenapi.VGPU.get_uuid(vgpu_ref))
 
-    # Read the assignment back, as XenCenter's GPU tab does.
+    # Read the assignment back.
     vgpus = session.xenapi.VM.get_VGPUs(vm_ref)
     assigned = session.xenapi.VGPU_type.get_model_name(session.xenapi.VGPU.get_type(vgpus[0]))
     print("VM now has %d vGPU(s); type = %s" % (len(vgpus), assigned))
@@ -147,7 +145,7 @@ def gpu_group_with_vgpu_type(session):
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-810a-000000000000
+Created vGPU: 00000001-0000-0000-780a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -219,12 +217,11 @@ public final class CreateVmWithVgpu {
         VM vm = templateByName(conn, templateName).createClone(conn, newVmName);
         provision(conn, vm);
 
-        // Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty. Same call
-        // as XenCenter's New VM wizard GPU page and the VM Properties GPU page.
+        // Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty.
         VGPU vgpu = VGPU.create(conn, vm, group, "0", new HashMap<String, String>(), vgpuType);
         System.out.println("Created vGPU: " + vgpu.getUuid(conn));
 
-        // Read the assignment back, as XenCenter's GPU tab does.
+        // Read the assignment back.
         Set<VGPU> vgpus = vm.getVGPUs(conn);
         String assigned = vgpus.iterator().next().getType(conn).getModelName(conn);
         System.out.println("VM now has " + vgpus.size() + " vGPU(s); type = " + assigned);
@@ -244,7 +241,7 @@ public final class CreateVmWithVgpu {
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-6e0a-000000000000
+Created vGPU: 00000001-0000-0000-520a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -286,14 +283,13 @@ func createVMWithVgpu(url, user, password, templateName, newVMName string) {
 	check(err)
 	provision(session, vmRef)
 
-	// Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty. Same call as
-	// XenCenter's New VM wizard GPU page and the VM Properties GPU page.
+	// Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty.
 	vgpuRef, err := xenapi.VGPU.Create(session, vmRef, groupRef, "0", map[string]string{}, typeRef)
 	check(err)
 	uuid, _ := xenapi.VGPU.GetUUID(session, vgpuRef)
 	fmt.Printf("Created vGPU: %s\n", uuid)
 
-	// Read the assignment back, as XenCenter's GPU tab does.
+	// Read the assignment back.
 	vgpus, _ := xenapi.VM.GetVGPUs(session, vmRef)
 	assignedType, _ := xenapi.VGPU.GetType(session, vgpus[0])
 	assigned, _ := xenapi.VGPUType.GetModelName(session, assignedType)
@@ -331,7 +327,7 @@ func gpuGroupWithVgpuType(session *xenapi.Session) (xenapi.GPUGroupRef, xenapi.V
 
 ```text
 Using vGPU type: GRID K100 (256 MB framebuffer)
-Created vGPU: 00000001-0000-0000-700a-000000000000
+Created vGPU: 00000001-0000-0000-800a-000000000000
 VM now has 1 vGPU(s); type = GRID K100
 Cleaned up the example VM and its vGPU.
 OK: create-vm-with-vgpu
@@ -381,12 +377,11 @@ function Invoke-CreateVmWithVgpu {
     $vm = $template | Invoke-XenVM -XenAction Clone -NewName $NewVmName -PassThru
     Invoke-VmProvision -Ref $vm.opaque_ref
 
-    # Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty. Same call as
-    # XenCenter's New VM wizard GPU page and the VM Properties GPU page.
+    # Assign the vGPU: device "0" is the VM's first vGPU slot, other_config is empty.
     $vgpu = New-XenVGPU -VM $vm.opaque_ref -GPUGroup $group.opaque_ref -Device "0" -OtherConfig @{} -Type $vgpuType.opaque_ref -PassThru
     Write-Host "Created vGPU: $($vgpu.uuid)"
 
-    # Read the assignment back, as XenCenter's GPU tab does.
+    # Read the assignment back.
     $assignedVm = Get-XenVM -Ref $vm.opaque_ref
     $assigned = (Get-XenVGPUType -Ref (Get-XenVGPU -Ref $assignedVm.VGPUs[0]).type).model_name
     Write-Host "VM now has $($assignedVm.VGPUs.Count) vGPU(s); type = $assigned"

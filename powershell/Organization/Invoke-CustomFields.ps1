@@ -3,9 +3,9 @@ function Invoke-CustomFields {
     .SYNOPSIS
         Custom fields.
     .DESCRIPTION
-        Attach and read a custom name/value field on a VM -- arbitrary metadata you define. XenCenter
-        only shows a field in its UI once it has been DEFINED for the pool (Custom Fields > Edit Custom
-        Fields); the value on the object is a separate step. This sample does both.
+        Attach and read a custom name/value field on a VM -- arbitrary metadata you define. A management
+        client only shows a field once it has been DEFINED for the pool; the value on the object is a
+        separate step. This sample does both.
     .EXAMPLE
         Invoke-CustomFields -Url https://xenserver -UserName root -Password $password -VmName 'web-01'
     #>
@@ -25,9 +25,9 @@ function Invoke-CustomFields {
     if (-not $vm) { throw "No VM named '$VmName' was found." }
     $pool = Get-XenPool | Select-Object -First 1
 
-    # XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a small
-    # XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in the UI without
-    # one, no matter what value an object carries under XenCenter.CustomFields.<name>.
+    # The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document in
+    # pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows no
+    # field without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
     $previousXml = $pool.gui_config[$customFieldBaseKey]
     [xml]$doc = if ($previousXml) { $previousXml } else { "<CustomFieldDefinitions />" }
     $addedDefinition = -not ($doc.CustomFieldDefinitions.CustomFieldDefinition |

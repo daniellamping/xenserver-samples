@@ -33,9 +33,9 @@ public final class CustomFields {
     /**
      * Custom fields.
      *
-     * <p>Attach and read a custom name/value field on a VM — arbitrary metadata you define. XenCenter
-     * only shows a field in its UI once it has been DEFINED for the pool (Custom Fields &gt; Edit
-     * Custom Fields); the value on the object is a separate step. This sample does both.
+     * <p>Attach and read a custom name/value field on a VM — arbitrary metadata you define. A
+     * management client only shows a field once it has been DEFINED for the pool; the value on the
+     * object is a separate step. This sample does both.
      *
      * <p>Run it:
      *
@@ -49,9 +49,9 @@ public final class CustomFields {
             VM vm = vmByName(conn, vmName);
             Pool pool = Pool.getAll(conn).iterator().next();
 
-            // XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a
-            // small XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in
-            // the UI without one, no matter what value an object carries under
+            // The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML
+            // document in pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical
+            // name); a client shows no field without one, no matter what value an object carries under
             // XenCenter.CustomFields.<name>.
             Map<String, String> guiConfig = pool.getGuiConfig(conn);
             String previousXml = guiConfig.get(CUSTOM_FIELD_BASE_KEY);

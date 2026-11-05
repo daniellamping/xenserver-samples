@@ -17,7 +17,7 @@ internal static partial class Workflows
     /// </example>
     /// <remarks>
     /// Connect a shared SR to an SMB/CIFS file share (create validates + sizes from the share). The password
-    /// travels as a Secret, not plaintext device-config - the way XenCenter does it.
+    /// travels as a Secret, not plaintext device-config.
     /// </remarks>
     public static void CreateSmbSr(string url, string user, string password, string server, string share,
         string smbUsername, string smbPassword, string srName = "sdk-example-smb")

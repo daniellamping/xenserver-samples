@@ -1,8 +1,8 @@
 # Custom fields.
 #
-# Attach and read a custom name/value field on a VM -- arbitrary metadata you define. XenCenter only
-# shows a field in its UI once it has been DEFINED for the pool (Custom Fields > Edit Custom Fields);
-# the value on the object is a separate step. This sample does both.
+# Attach and read a custom name/value field on a VM -- arbitrary metadata you define. A management client only
+# shows a field once it has been DEFINED for the pool; the value on the object is a separate step. This sample
+# does both.
 #
 # Run it:
 #   ./workflows.sh custom-fields https://xenserver root "$password"
@@ -12,9 +12,9 @@ custom_fields() {
     pool=$(first_csv "$(xe pool-list --minimal)")
     field_key="XenCenter.CustomFields.Owner"
 
-    # XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a small
-    # XML document in pool.gui-config["XenCenter.CustomFields"]; a field is invisible in the UI without
-    # one, no matter what value an object carries under XenCenter.CustomFields.<name>.
+    # The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document in
+    # pool.gui-config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows no field
+    # without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
     previous_xml=$(xe pool-param-get uuid=$pool param-name=gui-config param-key=XenCenter.CustomFields 2>/dev/null) || true
     added_definition=false
     if [[ "$previous_xml" != *'name="Owner"'* ]]; then

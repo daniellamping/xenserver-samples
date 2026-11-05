@@ -62,7 +62,7 @@ function Invoke-CreateIscsiSr {
 
         # The device-config is now complete enough to create from - which means it is also complete
         # enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-        # SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+        # SR.create would format it. Reattach that SR rather than destroying it.
         $probe = Invoke-XenSR -Ref "OpaqueRef:NULL" -XenAction Probe -XenHost $xenHost.opaque_ref -DeviceConfig $dc `
             -Type lvmoiscsi -SmConfig @{} -PassThru
         $existing = @(([xml]$probe).SelectNodes('/SRlist/SR'))

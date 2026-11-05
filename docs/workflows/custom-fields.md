@@ -16,9 +16,9 @@ private const string FieldName = "Owner";
 private const string FieldKey = CustomFieldBaseKey + "." + FieldName;
 
 /// <summary>
-/// Attach and read a custom name/value field on a VM — arbitrary metadata you define. XenCenter only
-/// shows a field in its UI once it has been DEFINED for the pool (Custom Fields &gt; Edit Custom
-/// Fields); the value on the object is a separate step. This sample does both.
+/// Attach and read a custom name/value field on a VM — arbitrary metadata you define. A management
+/// client only shows a field once it has been DEFINED for the pool; the value on the object is a
+/// separate step. This sample does both.
 /// </summary>
 /// <example>
 /// <code>
@@ -31,9 +31,9 @@ public static void CustomFields(string url, string user, string password, string
     var vm = VmByName(session, vmName);
     var pool = Pool.get_all(session).First().opaque_ref;
 
-    // XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a
-    // small XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in the
-    // UI without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
+    // The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document in
+    // pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows no
+    // field without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
     var previousXml = Pool.get_gui_config(session, pool).GetValueOrDefault(CustomFieldBaseKey);
     var doc = previousXml != null
         ? XDocument.Parse(previousXml)
@@ -85,9 +85,9 @@ Source: [`python/organization/custom_fields.py`](../../python/organization/custo
 ```python
 """Custom fields.
 
-Attach and read a custom name/value field on a VM -- arbitrary metadata you define. XenCenter only
-shows a field in its UI once it has been DEFINED for the pool (Custom Fields > Edit Custom Fields);
-the value on the object is a separate step. This sample does both.
+Attach and read a custom name/value field on a VM -- arbitrary metadata you define. A management client
+only shows a field once it has been DEFINED for the pool; the value on the object is a separate step.
+This sample does both.
 
 Run it::
 
@@ -111,9 +111,9 @@ def custom_fields(url, username, password, vm_name):
     vm = vm_by_name(session, vm_name)
     pool = session.xenapi.pool.get_all()[0]
 
-    # XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a small
-    # XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in the UI without
-    # one, no matter what value an object carries under XenCenter.CustomFields.<name>.
+    # The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document
+    # in pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows
+    # no field without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
     previous_xml = session.xenapi.pool.get_gui_config(pool).get(CUSTOM_FIELD_BASE_KEY)
     root = (ElementTree.fromstring(previous_xml) if previous_xml
             else ElementTree.Element("CustomFieldDefinitions"))
@@ -190,9 +190,9 @@ public final class CustomFields {
     /**
      * Custom fields.
      *
-     * <p>Attach and read a custom name/value field on a VM — arbitrary metadata you define. XenCenter
-     * only shows a field in its UI once it has been DEFINED for the pool (Custom Fields &gt; Edit
-     * Custom Fields); the value on the object is a separate step. This sample does both.
+     * <p>Attach and read a custom name/value field on a VM — arbitrary metadata you define. A
+     * management client only shows a field once it has been DEFINED for the pool; the value on the
+     * object is a separate step. This sample does both.
      *
      * <p>Run it:
      *
@@ -206,9 +206,9 @@ public final class CustomFields {
             VM vm = vmByName(conn, vmName);
             Pool pool = Pool.getAll(conn).iterator().next();
 
-            // XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a
-            // small XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in
-            // the UI without one, no matter what value an object carries under
+            // The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML
+            // document in pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical
+            // name); a client shows no field without one, no matter what value an object carries under
             // XenCenter.CustomFields.<name>.
             Map<String, String> guiConfig = pool.getGuiConfig(conn);
             String previousXml = guiConfig.get(CUSTOM_FIELD_BASE_KEY);
@@ -304,9 +304,9 @@ type customFieldDefinition struct {
 
 // customFields - Custom fields.
 //
-// Attach and read a custom name/value field on a VM — arbitrary metadata you define. XenCenter only
-// shows a field in its UI once it has been DEFINED for the pool (Custom Fields > Edit Custom Fields);
-// the value on the object is a separate step. This sample does both.
+// Attach and read a custom name/value field on a VM — arbitrary metadata you define. A management client
+// only shows a field once it has been DEFINED for the pool; the value on the object is a separate step.
+// This sample does both.
 //
 // Run it:
 //
@@ -319,8 +319,8 @@ func customFields(url, user, password, vmName string) {
 	check(err)
 	pool := pools[0]
 
-	// XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a small
-	// XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in the UI
+	// The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document in
+	// pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows no field
 	// without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
 	guiConfig, err := xenapi.Pool.GetGuiConfig(session, pool)
 	check(err)
@@ -384,9 +384,9 @@ function Invoke-CustomFields {
     .SYNOPSIS
         Custom fields.
     .DESCRIPTION
-        Attach and read a custom name/value field on a VM -- arbitrary metadata you define. XenCenter
-        only shows a field in its UI once it has been DEFINED for the pool (Custom Fields > Edit Custom
-        Fields); the value on the object is a separate step. This sample does both.
+        Attach and read a custom name/value field on a VM -- arbitrary metadata you define. A management
+        client only shows a field once it has been DEFINED for the pool; the value on the object is a
+        separate step. This sample does both.
     .EXAMPLE
         Invoke-CustomFields -Url https://xenserver -UserName root -Password $password -VmName 'web-01'
     #>
@@ -406,9 +406,9 @@ function Invoke-CustomFields {
     if (-not $vm) { throw "No VM named '$VmName' was found." }
     $pool = Get-XenPool | Select-Object -First 1
 
-    # XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a small
-    # XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in the UI without
-    # one, no matter what value an object carries under XenCenter.CustomFields.<name>.
+    # The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document in
+    # pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows no
+    # field without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
     $previousXml = $pool.gui_config[$customFieldBaseKey]
     [xml]$doc = if ($previousXml) { $previousXml } else { "<CustomFieldDefinitions />" }
     $addedDefinition = -not ($doc.CustomFieldDefinitions.CustomFieldDefinition |
@@ -470,9 +470,9 @@ Source: [`cli/organization/custom-fields.sh`](../../cli/organization/custom-fiel
 ```bash
 # Custom fields.
 #
-# Attach and read a custom name/value field on a VM -- arbitrary metadata you define. XenCenter only
-# shows a field in its UI once it has been DEFINED for the pool (Custom Fields > Edit Custom Fields);
-# the value on the object is a separate step. This sample does both.
+# Attach and read a custom name/value field on a VM -- arbitrary metadata you define. A management client only
+# shows a field once it has been DEFINED for the pool; the value on the object is a separate step. This sample
+# does both.
 #
 # Run it:
 #   ./workflows.sh custom-fields https://xenserver root "$password"
@@ -482,9 +482,9 @@ custom_fields() {
     pool=$(first_csv "$(xe pool-list --minimal)")
     field_key="XenCenter.CustomFields.Owner"
 
-    # XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a small
-    # XML document in pool.gui-config["XenCenter.CustomFields"]; a field is invisible in the UI without
-    # one, no matter what value an object carries under XenCenter.CustomFields.<name>.
+    # The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document in
+    # pool.gui-config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows no field
+    # without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
     previous_xml=$(xe pool-param-get uuid=$pool param-name=gui-config param-key=XenCenter.CustomFields 2>/dev/null) || true
     added_definition=false
     if [[ "$previous_xml" != *'name="Owner"'* ]]; then

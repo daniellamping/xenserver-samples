@@ -24,9 +24,9 @@ Source: [`csharp/VirtualMachines/CrossPoolCopyVm.cs`](../../csharp/VirtualMachin
 /// </code>
 /// </example>
 /// <remarks>
-/// Copy a VM from one pool to another (Storage XenMotion copy) — the API behind XenCenter's cross-pool
-/// Copy. Open a session to each pool, get a receiver token from the destination with
-/// host.migrate_receive, then VM.migrate_send with copy=true on the source (which is left intact).
+/// Copy a VM from one pool to another (Storage XenMotion copy). Open a session to each pool, get a
+/// receiver token from the destination with host.migrate_receive, then VM.migrate_send with
+/// copy=true on the source (which is left intact).
 /// </remarks>
 public static void CrossPoolCopyVm(string url, string user, string password, string destUrl,
     string vmName = "db-01", string destUser = null, string destPassword = null,
@@ -91,7 +91,7 @@ public static void CrossPoolCopyVm(string url, string user, string password, str
 
 ```text
 Sent 'db-01' to the destination pool (copy); source still present: True
-  the copy on the destination: db-01 (00000001-0000-0000-f509-000000000000)
+  the copy on the destination: db-01 (00000001-0000-0000-080a-000000000000)
 OK: cross-pool-copy-vm
 ```
 

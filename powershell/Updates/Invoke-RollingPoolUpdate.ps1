@@ -42,9 +42,8 @@ function Invoke-RollingPoolUpdate {
         $hash = $pool | Invoke-XenPool -XenAction SyncUpdates -PassThru
         Write-Host "Synced updates; hash length $($hash.Length)"
 
-        # The rolling pattern behind XenCenter's automated Install Updates: apply -> evacuate and retry
-        # only if that turns out to be needed -> reboot (only if asked) -> re-enable, one host at a
-        # time, coordinator first.
+        # The rolling pattern: apply -> evacuate and retry only if that turns out to be needed ->
+        # reboot (only if asked) -> re-enable, one host at a time, coordinator first.
         $orderedHosts = @($pool.master.opaque_ref) + @(Get-XenHost |
             Where-Object { $_.opaque_ref -ne $pool.master.opaque_ref } | ForEach-Object { $_.opaque_ref })
         foreach ($xenHost in $orderedHosts | ForEach-Object { Get-XenHost -Ref $_ }) {

@@ -49,11 +49,11 @@ public static void ApplyUpdate(string url, string user, string password, string 
         Console.WriteLine($"Synced updates; hash length {hash.Length}");
 
         // Apply the synced updates to each host, coordinator first as the documentation requires.
-        // XenCenter then reads the reboot guidance to decide whether a Rolling Pool Upgrade reboot is
-        // needed. Applying a batch whose mandatory guidance needs an evacuation fails with
-        // HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are moved off first - handle that
-        // rather than assuming an update batch never needs one. (Guidance that targets VMs instead of
-        // hosts, for example restarting a VM, is not handled here.)
+        // Then read the reboot guidance to decide whether a host needs a reboot. Applying a batch
+        // whose mandatory guidance needs an evacuation fails with HOST_EVACUATION_IS_REQUIRED
+        // unless the host's resident VMs are moved off first - handle that rather than assuming
+        // an update batch never needs one. (Guidance that targets VMs instead of hosts, for
+        // example restarting a VM, is not handled here.)
         var hosts = Host.get_all_records(session);
         var master = Pool.get_master(session, pool);
         var orderedRefs = new[] { master }.Concat(hosts.Keys.Where(r => r.opaque_ref != master.opaque_ref));
@@ -167,8 +167,7 @@ def apply_update(url, username, password, repo_url, source_url):
         print("Synced updates; hash length %d" % len(hash_))
 
         # Apply the synced updates to each host, coordinator first as the documentation requires.
-        # XenCenter then reads the reboot guidance to decide whether a Rolling Pool Upgrade reboot is
-        # needed.
+        # Then read the reboot guidance to decide whether a host needs a reboot.
         hosts = session.xenapi.host.get_all_records()
         master = session.xenapi.pool.get_master(pool)
         ordered_refs = [master] + [ref for ref in hosts if ref != master]
@@ -291,8 +290,7 @@ public final class ApplyUpdate {
             System.out.println("Synced updates; hash length " + hash.length());
 
             // Apply the synced updates to each host, coordinator first as the documentation requires.
-            // XenCenter then reads the reboot guidance to decide whether a Rolling Pool Upgrade reboot is
-            // needed.
+            // Then read the reboot guidance to decide whether a host needs a reboot.
             Map<Host, Host.Record> hosts = Host.getAllRecords(conn);
             Host master = pool.getMaster(conn);
             List<Host> ordered = new ArrayList<>();
@@ -411,8 +409,7 @@ func applyUpdate(url, user, password, repoURL, sourceURL string) {
 	fmt.Printf("Synced updates; hash length %d\n", len(hash))
 
 	// Apply the synced updates to each host, coordinator first as the documentation requires.
-	// XenCenter then reads the reboot guidance to decide whether a Rolling Pool Upgrade reboot is
-	// needed.
+	// Then read the reboot guidance to decide whether a host needs a reboot.
 	hosts, err := xenapi.Host.GetAllRecords(session)
 	check(err)
 	master, err := xenapi.Pool.GetMaster(session, pool)
@@ -529,8 +526,8 @@ function Invoke-ApplyUpdate {
         Write-Host "Synced updates; hash length $($hash.Length)"
 
         # Apply the synced updates to each host, coordinator first as the documentation requires (the
-        # hash is the action's -Hash parameter). XenCenter then reads the reboot guidance to decide
-        # whether a Rolling Pool Upgrade reboot is needed.
+        # hash is the action's -Hash parameter). Then read the reboot guidance to decide whether a
+        # host needs a reboot.
         $orderedHosts = @($pool.master.opaque_ref) + @(Get-XenHost |
             Where-Object { $_.opaque_ref -ne $pool.master.opaque_ref } | ForEach-Object { $_.opaque_ref })
         foreach ($xenHost in $orderedHosts | ForEach-Object { Get-XenHost -Ref $_ }) {

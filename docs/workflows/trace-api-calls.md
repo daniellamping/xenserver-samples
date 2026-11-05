@@ -256,8 +256,8 @@ Source: [`cli/getting-started/trace-api-calls.sh`](../../cli/getting-started/tra
 
 # Send a W3C trace context with every command, so the work the pool does for them is recorded as part of
 # your application's distributed trace. xe sends $TRACEPARENT to the server as a traceparent header (or
-# take --traceparent <value>); in a traced script, export the caller's own. The Windows xe.exe that
-# ships with XenCenter does not send one.
+# take --traceparent <value>); in a traced script, export the caller's own. The Windows xe.exe does not
+# send one.
 trace_api_calls() {
     # version 00, a 16-byte trace id, the 8-byte id of the calling span, and flags 01 (sampled)
     local trace_id span_id
@@ -275,7 +275,7 @@ trace_api_calls() {
 <details><summary>Sample output</summary>
 
 ```text
-Trace 3ec72257610d0049046ce6f0b6d8093d: each command sends traceparent: 00-3ec72257610d0049046ce6f0b6d8093d-4b7b971c388a6e28-01
+Trace de205208637d0267ebfae7cfffc6f470: each command sends traceparent: 00-de205208637d0267ebfae7cfffc6f470-c3e12413edaafc5c-01
 The pool has 2 hosts
 OK: trace-api-calls
 ```

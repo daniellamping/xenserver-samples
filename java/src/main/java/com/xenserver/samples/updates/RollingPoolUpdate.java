@@ -62,9 +62,8 @@ public final class RollingPoolUpdate {
             String hash = pool.syncUpdates(conn, false, "", "");
             System.out.println("Synced updates; hash length " + hash.length());
 
-            // The rolling pattern behind XenCenter's automated Install Updates: apply -> evacuate and
-            // retry only if that turns out to be needed -> reboot (only if asked) -> re-enable, one host
-            // at a time, coordinator first.
+            // The rolling pattern: apply -> evacuate and retry only if that turns out to be needed ->
+            // reboot (only if asked) -> re-enable, one host at a time, coordinator first.
             Map<Host, Host.Record> hosts = Host.getAllRecords(conn);
             Host master = pool.getMaster(conn);
             List<Host> ordered = new ArrayList<>();

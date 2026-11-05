@@ -55,14 +55,14 @@ public final class CreateHbaSr {
             String path = firstTagText(device, "path");
             System.out.println("Discovered LUN: SCSIid " + scsiId + " on " + path);
 
-            // SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path>
-            // is for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+            // SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads like
+            // "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
             Map<String, String> dc = new java.util.HashMap<>();
             dc.put("SCSIid", scsiId);
 
             // SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is
-            // already there, and SR.create would format it. XenCenter offers to reattach that SR instead
-            // of destroying it.
+            // already there, and SR.create would format it. Reattach that SR rather than
+            // destroying it.
             org.w3c.dom.Element srListRoot =
                 parseXml(SR.probe(conn, host, dc, "lvmohba", new java.util.HashMap<>())).getDocumentElement();
             org.w3c.dom.NodeList existing = srListRoot.getElementsByTagName("SR");

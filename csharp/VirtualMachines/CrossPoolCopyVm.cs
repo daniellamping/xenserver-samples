@@ -18,9 +18,9 @@ internal static partial class Workflows
     /// </code>
     /// </example>
     /// <remarks>
-    /// Copy a VM from one pool to another (Storage XenMotion copy) — the API behind XenCenter's cross-pool
-    /// Copy. Open a session to each pool, get a receiver token from the destination with
-    /// host.migrate_receive, then VM.migrate_send with copy=true on the source (which is left intact).
+    /// Copy a VM from one pool to another (Storage XenMotion copy). Open a session to each pool, get a
+    /// receiver token from the destination with host.migrate_receive, then VM.migrate_send with
+    /// copy=true on the source (which is left intact).
     /// </remarks>
     public static void CrossPoolCopyVm(string url, string user, string password, string destUrl,
         string vmName = "db-01", string destUser = null, string destPassword = null,

@@ -55,8 +55,7 @@ func applyUpdate(url, user, password, repoURL, sourceURL string) {
 	fmt.Printf("Synced updates; hash length %d\n", len(hash))
 
 	// Apply the synced updates to each host, coordinator first as the documentation requires.
-	// XenCenter then reads the reboot guidance to decide whether a Rolling Pool Upgrade reboot is
-	// needed.
+	// Then read the reboot guidance to decide whether a host needs a reboot.
 	hosts, err := xenapi.Host.GetAllRecords(session)
 	check(err)
 	master, err := xenapi.Pool.GetMaster(session, pool)

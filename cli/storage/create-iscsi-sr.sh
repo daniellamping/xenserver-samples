@@ -65,7 +65,7 @@ create_iscsi_sr() {
 
     # The device-config is now complete enough to create from - which means it is also complete enough to
     # probe the LUN itself: an <SR> in the answer means one is already there, and sr-create would format
-    # it. XenCenter offers to reattach that SR instead of destroying it.
+    # it. Reattach that SR rather than destroying it.
     existing_xml=$(xe sr-probe type=lvmoiscsi "${dc[@]}")
     if uuid=$(xml_tag_text "$existing_xml" UUID); then
         echo "LUN $scsi_id already holds SR $uuid; creating an SR here would format it - reattach the" \

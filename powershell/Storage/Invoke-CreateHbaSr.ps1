@@ -33,12 +33,12 @@ function Invoke-CreateHbaSr {
     $path = $device.path
     Write-Host "Discovered LUN: SCSIid $scsiId on $path"
 
-    # SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-    # for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+    # SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+    # like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
     $deviceConfig = @{ SCSIid = $scsiId }
 
     # SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-    # there, and SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+    # there, and SR.create would format it. Reattach that SR rather than destroying it.
     $probe = Invoke-XenSR -Ref "OpaqueRef:NULL" -XenAction Probe -XenHost $xenHost.opaque_ref `
         -DeviceConfig $deviceConfig -Type lvmohba -SmConfig @{} -PassThru
     $existing = @(([xml]$probe).SelectNodes('/SRlist/SR'))

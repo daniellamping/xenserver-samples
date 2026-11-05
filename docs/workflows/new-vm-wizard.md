@@ -159,7 +159,7 @@ from helpers import template_by_name
 
 def new_vm_wizard(url, username, password, template_name, new_vm_name="wizard-vm"):
     """
-    Reproduce XenCenter's New VM wizard end to end: start from the named template, name the VM,
+    Create a VM the way a New VM wizard does, end to end: start from the named template, name the VM,
     choose an installation source, a home server, CPU & memory, add a disk, attach a network,
     then start it.
     """
@@ -248,7 +248,7 @@ def new_vm_wizard(url, username, password, template_name, new_vm_name="wizard-vm
 
 ```text
 Template:      Rocky Linux 8
-Created VM:    00000001-0000-0000-f209-000000000000
+Created VM:    00000001-0000-0000-f509-000000000000
 Install media: network repository
 Home server:   sdk-host1
 CPU/memory:    2 vCPUs, 2 GiB

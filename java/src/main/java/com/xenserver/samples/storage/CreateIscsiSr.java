@@ -85,7 +85,7 @@ public final class CreateIscsiSr {
 
             // The device-config is now complete enough to create from - which means it is also complete
             // enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-            // SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+            // SR.create would format it. Reattach that SR rather than destroying it.
             org.w3c.dom.Element srListRoot =
                 parseXml(SR.probe(conn, host, dc, "lvmoiscsi", new java.util.HashMap<>())).getDocumentElement();
             org.w3c.dom.NodeList existing = srListRoot.getElementsByTagName("SR");

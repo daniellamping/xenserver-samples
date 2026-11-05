@@ -2,9 +2,8 @@
 """
 XenServer Python SDK - real-world workflow examples.
 
-Each example is a self-contained function that mirrors a task you would perform in
-XenCenter, driven entirely through the XenServer Management API (XenAPI). The Python
-binding (XenAPI.py) speaks XML-RPC and is included with the SDK.
+Each example is a self-contained function for a common administration task, driven entirely through
+the XenServer Management API (XenAPI). The Python binding (XenAPI.py) speaks XML-RPC and is included with the SDK.
 
 Each workflow is a module of its own, in a package per area (getting_started/, virtual_machines/,
 storage/, ...). Its function takes the connection details (and any object it acts on, looked up by

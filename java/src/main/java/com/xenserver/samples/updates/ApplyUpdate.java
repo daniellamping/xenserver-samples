@@ -66,8 +66,7 @@ public final class ApplyUpdate {
             System.out.println("Synced updates; hash length " + hash.length());
 
             // Apply the synced updates to each host, coordinator first as the documentation requires.
-            // XenCenter then reads the reboot guidance to decide whether a Rolling Pool Upgrade reboot is
-            // needed.
+            // Then read the reboot guidance to decide whether a host needs a reboot.
             Map<Host, Host.Record> hosts = Host.getAllRecords(conn);
             Host master = pool.getMaster(conn);
             List<Host> ordered = new ArrayList<>();

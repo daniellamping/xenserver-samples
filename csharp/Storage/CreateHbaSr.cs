@@ -44,12 +44,12 @@ internal static partial class Workflows
         var path = device.Element("path")!.Value;
         Console.WriteLine($"Discovered LUN: SCSIid {scsiId} on {path}");
 
-        // SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-        // for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+        // SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+        // like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
         var dc = new Dictionary<string, string> { ["SCSIid"] = scsiId };
 
         // SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-        // there, and SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+        // there, and SR.create would format it. Reattach that SR rather than destroying it.
         var srListXml = XDocument.Parse(SR.probe(session, host, dc, "lvmohba", new Dictionary<string, string>()));
         var existing = srListXml.Descendants("SR").FirstOrDefault();
         if (existing != null)

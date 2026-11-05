@@ -1,7 +1,7 @@
 // XenServer Java SDK - real-world workflow examples.
 //
-// Each example mirrors a task you would perform in XenCenter, driven through the XenServer
-// Management API (XenAPI). The Java binding speaks JSON-RPC (Apache HttpClient 5 + Jackson).
+// Each example is a common administration task, driven through the XenServer Management API (XenAPI). The
+// Java binding speaks JSON-RPC (Apache HttpClient 5 + Jackson).
 //
 // Each workflow is a class of its own, in a package per area (gettingstarted, virtualmachines,
 // storage, ...). Its run method takes the connection details (and any object it acts on, looked up by

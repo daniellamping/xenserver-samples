@@ -25,9 +25,9 @@ type customFieldDefinition struct {
 
 // customFields - Custom fields.
 //
-// Attach and read a custom name/value field on a VM — arbitrary metadata you define. XenCenter only
-// shows a field in its UI once it has been DEFINED for the pool (Custom Fields > Edit Custom Fields);
-// the value on the object is a separate step. This sample does both.
+// Attach and read a custom name/value field on a VM — arbitrary metadata you define. A management client
+// only shows a field once it has been DEFINED for the pool; the value on the object is a separate step.
+// This sample does both.
 //
 // Run it:
 //
@@ -40,8 +40,8 @@ func customFields(url, user, password, vmName string) {
 	check(err)
 	pool := pools[0]
 
-	// XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a small
-	// XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in the UI
+	// The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document in
+	// pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows no field
 	// without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
 	guiConfig, err := xenapi.Pool.GetGuiConfig(session, pool)
 	check(err)

@@ -1,7 +1,7 @@
 <#
     XenServer PowerShell SDK - real-world workflow examples.
 
-    Each example mirrors a task you would perform in XenCenter, driven through the XenServer
+    Each example is a common administration task, driven through the XenServer
     PowerShell module (which wraps the XenAPI .NET binding and speaks JSON-RPC).
 
     Written in idiomatic PowerShell: the module's cmdlets take their object from the pipeline, so an

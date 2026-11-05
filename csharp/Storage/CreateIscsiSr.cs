@@ -77,7 +77,7 @@ internal static partial class Workflows
 
             // The device-config is now complete enough to create from - which means it is also complete
             // enough to probe the LUN itself: an <SR> in the answer means one is already there, and
-            // SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+            // SR.create would format it. Reattach that SR rather than destroying it.
             var srListXml = XDocument.Parse(SR.probe(session, host, dc, "lvmoiscsi", new Dictionary<string, string>()));
             var existing = srListXml.Descendants("SR").FirstOrDefault();
             if (existing != null)

@@ -33,11 +33,11 @@ create_hba_sr() {
     path=$(xml_tag_text "$block" path)
     echo "Discovered LUN: SCSIid $scsi_id on $path"
 
-    # SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-    # for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+    # SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+    # like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
     #
     # SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-    # there, and sr-create would format it. XenCenter offers to reattach that SR instead of destroying it.
+    # there, and sr-create would format it. Reattach that SR rather than destroying it.
     local existing_xml uuid
     existing_xml=$(xe sr-probe type=lvmohba device-config:SCSIid="$scsi_id")
     if uuid=$(xml_tag_text "$existing_xml" UUID); then

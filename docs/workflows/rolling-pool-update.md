@@ -49,11 +49,11 @@ public static void RollingPoolUpdate(string url, string user, string password, s
         Console.WriteLine($"Synced updates; hash length {hash.Length}");
 
         // Apply them host-by-host, coordinator first, so the pool never goes fully offline (the
-        // rolling pattern behind XenCenter's automated Install Updates): apply -> evacuate and retry
-        // only if that turns out to be needed -> reboot (only if asked) -> re-enable. Modern xapi
-        // (>=23.18.0) doesn't reboot a host for you: it only records pending_guidances, so only
-        // reboot (or restart the toolstack) when the applied batch actually asks for it. (Guidance
-        // that targets VMs instead of hosts, for example restarting a VM, is not handled here.)
+        // rolling pattern): apply -> evacuate and retry only if that turns out to be needed ->
+        // reboot (only if asked) -> re-enable. Modern xapi (>=23.18.0) doesn't reboot a host
+        // for you: it only records pending_guidances, so only reboot (or restart the toolstack)
+        // when the applied batch actually asks for it. (Guidance that targets VMs instead of
+        // hosts, for example restarting a VM, is not handled here.)
         var hosts = Host.get_all_records(session);
         var master = Pool.get_master(session, pool);
         var orderedRefs = new[] { master }.Concat(hosts.Keys.Where(r => r.opaque_ref != master.opaque_ref));
@@ -163,9 +163,8 @@ def rolling_pool_update(url, username, password, repo_url, source_url):
         hash_ = session.xenapi.pool.sync_updates(pool, False, "", "")
         print("Synced updates; hash length %d" % len(hash_))
 
-        # The rolling pattern behind XenCenter's automated Install Updates: apply -> evacuate and
-        # retry only if that turns out to be needed -> reboot (only if asked) -> re-enable, one host
-        # at a time, coordinator first.
+        # The rolling pattern: apply -> evacuate and retry only if that turns out to be needed ->
+        # reboot (only if asked) -> re-enable, one host at a time, coordinator first.
         hosts = session.xenapi.host.get_all_records()
         master = session.xenapi.pool.get_master(pool)
         ordered_refs = [master] + [ref for ref in hosts if ref != master]
@@ -286,9 +285,8 @@ public final class RollingPoolUpdate {
             String hash = pool.syncUpdates(conn, false, "", "");
             System.out.println("Synced updates; hash length " + hash.length());
 
-            // The rolling pattern behind XenCenter's automated Install Updates: apply -> evacuate and
-            // retry only if that turns out to be needed -> reboot (only if asked) -> re-enable, one host
-            // at a time, coordinator first.
+            // The rolling pattern: apply -> evacuate and retry only if that turns out to be needed ->
+            // reboot (only if asked) -> re-enable, one host at a time, coordinator first.
             Map<Host, Host.Record> hosts = Host.getAllRecords(conn);
             Host master = pool.getMaster(conn);
             List<Host> ordered = new ArrayList<>();
@@ -408,9 +406,8 @@ func rollingPoolUpdate(url, user, password, repoURL, sourceURL string) {
 	check(err)
 	fmt.Printf("Synced updates; hash length %d\n", len(hash))
 
-	// The rolling pattern behind XenCenter's automated Install Updates: apply -> evacuate and retry
-	// only if that turns out to be needed -> reboot (only if asked) -> re-enable, one host at a
-	// time, coordinator first.
+	// The rolling pattern: apply -> evacuate and retry only if that turns out to be needed ->
+	// reboot (only if asked) -> re-enable, one host at a time, coordinator first.
 	hosts, err := xenapi.Host.GetAllRecords(session)
 	check(err)
 	master, err := xenapi.Pool.GetMaster(session, pool)
@@ -525,9 +522,8 @@ function Invoke-RollingPoolUpdate {
         $hash = $pool | Invoke-XenPool -XenAction SyncUpdates -PassThru
         Write-Host "Synced updates; hash length $($hash.Length)"
 
-        # The rolling pattern behind XenCenter's automated Install Updates: apply -> evacuate and retry
-        # only if that turns out to be needed -> reboot (only if asked) -> re-enable, one host at a
-        # time, coordinator first.
+        # The rolling pattern: apply -> evacuate and retry only if that turns out to be needed ->
+        # reboot (only if asked) -> re-enable, one host at a time, coordinator first.
         $orderedHosts = @($pool.master.opaque_ref) + @(Get-XenHost |
             Where-Object { $_.opaque_ref -ne $pool.master.opaque_ref } | ForEach-Object { $_.opaque_ref })
         foreach ($xenHost in $orderedHosts | ForEach-Object { Get-XenHost -Ref $_ }) {

@@ -13,9 +13,9 @@ internal static partial class Workflows
     private const string FieldKey = CustomFieldBaseKey + "." + FieldName;
 
     /// <summary>
-    /// Attach and read a custom name/value field on a VM — arbitrary metadata you define. XenCenter only
-    /// shows a field in its UI once it has been DEFINED for the pool (Custom Fields &gt; Edit Custom
-    /// Fields); the value on the object is a separate step. This sample does both.
+    /// Attach and read a custom name/value field on a VM — arbitrary metadata you define. A management
+    /// client only shows a field once it has been DEFINED for the pool; the value on the object is a
+    /// separate step. This sample does both.
     /// </summary>
     /// <example>
     /// <code>
@@ -28,9 +28,9 @@ internal static partial class Workflows
         var vm = VmByName(session, vmName);
         var pool = Pool.get_all(session).First().opaque_ref;
 
-        // XenCenter keeps the pool's custom field DEFINITIONS (name and type, String or Date) as a
-        // small XML document in pool.gui_config["XenCenter.CustomFields"]; a field is invisible in the
-        // UI without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
+        // The pool's custom field DEFINITIONS (name and type, String or Date) live in a small XML document in
+        // pool.gui_config["XenCenter.CustomFields"] (the key keeps its historical name); a client shows no
+        // field without one, no matter what value an object carries under XenCenter.CustomFields.<name>.
         var previousXml = Pool.get_gui_config(session, pool).GetValueOrDefault(CustomFieldBaseKey);
         var doc = previousXml != null
             ? XDocument.Parse(previousXml)

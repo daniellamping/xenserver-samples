@@ -18,9 +18,9 @@ configure_ha() {
     # failure, and whether a VM is protected at all; "restart" is protected, an empty string is not.
     guest=$(first_csv "$(xe vm-list is-a-template=false is-control-domain=false is-a-snapshot=false --minimal)")
 
-    # How many host failures can the pool tolerate WITH the VMs you mean to protect? Plan for those
-    # (as XenCenter's HA wizard does): a target computed with none protected can be too high, and
-    # protecting a VM afterwards then fails HA_OPERATION_WOULD_BREAK_FAILOVER_PLAN.
+    # How many host failures can the pool tolerate WITH the VMs you mean to protect? Plan for those: a target
+    # computed with none protected can be too high, and protecting a VM afterwards then fails
+    # HA_OPERATION_WOULD_BREAK_FAILOVER_PLAN.
     ntol=$(xe pool-ha-compute-hypothetical-max-host-failures-to-tolerate vm-uuid=$guest restart-priority=restart)
     echo "Max failures: $ntol"
     xe pool-param-set uuid=$pool ha-host-failures-to-tolerate=$ntol

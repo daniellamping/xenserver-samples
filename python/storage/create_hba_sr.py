@@ -31,12 +31,12 @@ def create_hba_sr(url, username, password, scsi_id="", sr_name="sdk-example-hba"
     path = device.find("path").text
     print("Discovered LUN: SCSIid %s on %s" % (scsi_id, path))
 
-    # SCSIid is all lvmohba needs - it is what XenCenter's New SR wizard sends. (The probe's <path> is
-    # for display: on a real host it reads like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
+    # SCSIid is all lvmohba needs. (The probe's <path> is for display: on a real host it reads
+    # like "/dev/sde [sdc] [sdg] [sdi]", one entry per path.)
     dc = {"SCSIid": scsi_id}
 
     # SCSIid alone is also enough to probe the LUN itself: an <SR> in the answer means one is already
-    # there, and SR.create would format it. XenCenter offers to reattach that SR instead of destroying it.
+    # there, and SR.create would format it. Reattach that SR rather than destroying it.
     srlist_xml = ET.fromstring(session.xenapi.SR.probe(host, dc, "lvmohba", {}))
     existing = srlist_xml.find("SR")
     if existing is not None:

@@ -20,7 +20,7 @@ import javax.net.ssl.SSLContext;
 
 /**
  * Connecting to a pool: accept the host's self-signed certificate, log in, and follow HOST_IS_SLAVE to the
- * coordinator when given a pool member - as XenCenter does.
+ * coordinator when given a pool member.
  */
 public final class PoolConnection {
     private PoolConnection() {
@@ -33,8 +33,8 @@ public final class PoolConnection {
             return login(http, url, user, password);
         } catch (Types.HostIsSlave e) {
             // A pool member names the coordinator's address; reconnect there (assuming the coordinator
-            // is up), exactly as XenCenter does when you add a member server. SDKs before CA-432633 read
-            // that address as "" under JSON-RPC: say so rather than connecting to "https://".
+            // is up). SDKs before CA-432633 read that address as "" under JSON-RPC: say so rather than
+            // connecting to "https://".
             if (e.masterIPAddress == null || e.masterIPAddress.isEmpty())
                 throw new CoordinatorUnknown(url);
             return login(http, "https://" + e.masterIPAddress, user, password);

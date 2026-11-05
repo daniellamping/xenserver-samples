@@ -41,11 +41,11 @@ internal static partial class Workflows
             Console.WriteLine($"Synced updates; hash length {hash.Length}");
 
             // Apply the synced updates to each host, coordinator first as the documentation requires.
-            // XenCenter then reads the reboot guidance to decide whether a Rolling Pool Upgrade reboot is
-            // needed. Applying a batch whose mandatory guidance needs an evacuation fails with
-            // HOST_EVACUATION_IS_REQUIRED unless the host's resident VMs are moved off first - handle that
-            // rather than assuming an update batch never needs one. (Guidance that targets VMs instead of
-            // hosts, for example restarting a VM, is not handled here.)
+            // Then read the reboot guidance to decide whether a host needs a reboot. Applying a batch
+            // whose mandatory guidance needs an evacuation fails with HOST_EVACUATION_IS_REQUIRED
+            // unless the host's resident VMs are moved off first - handle that rather than assuming
+            // an update batch never needs one. (Guidance that targets VMs instead of hosts, for
+            // example restarting a VM, is not handled here.)
             var hosts = Host.get_all_records(session);
             var master = Pool.get_master(session, pool);
             var orderedRefs = new[] { master }.Concat(hosts.Keys.Where(r => r.opaque_ref != master.opaque_ref));
