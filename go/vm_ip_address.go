@@ -27,20 +27,21 @@ func vmIpAddress(url, user, password, timeoutStr, intervalStr string) {
 		// A running guest reports its IP in VM_guest_metrics.networks, keyed "<vif device>/ip".
 		vms, err := xenapi.VM.GetAllRecords(session)
 		check(err)
+		// Not every running VM has one (no guest tools, no NIC, still booting), so look at each until one
+		// does.
 		var vm xenapi.VMRecord
-		found := false
+		var ip string
 		for _, r := range vms {
-			if r.PowerState == xenapi.VMPowerStateRunning && !r.IsATemplate && !r.IsControlDomain &&
-				r.GuestMetrics != xenapi.VMGuestMetricsRef("OpaqueRef:NULL") {
-				vm, found = r, true
+			if r.PowerState != xenapi.VMPowerStateRunning || r.IsATemplate || r.IsControlDomain ||
+				r.GuestMetrics == xenapi.VMGuestMetricsRef("OpaqueRef:NULL") {
+				continue
+			}
+			gm, err := xenapi.VMGuestMetrics.GetRecord(session, r.GuestMetrics)
+			check(err)
+			if ip = gm.Networks["0/ip"]; ip != "" {
+				vm = r
 				break
 			}
-		}
-		var ip string
-		if found {
-			gm, err := xenapi.VMGuestMetrics.GetRecord(session, vm.GuestMetrics)
-			check(err)
-			ip = gm.Networks["0/ip"]
 		}
 		if ip != "" {
 			fmt.Printf("  %s: %s\n", vm.NameLabel, ip)

@@ -26,17 +26,22 @@ internal static partial class Workflows
         var deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
         while (true)
         {
-            // A running guest reports its IP in networks, keyed "<vif device>/ip" (e.g. "0/ip").
-            var vm = VM.get_all_records(session).Values.FirstOrDefault(v =>
-                v.power_state == vm_power_state.Running && !v.is_a_template && !v.is_control_domain
-                && v.guest_metrics.opaque_ref != "OpaqueRef:NULL");
+            // A running guest reports its IP in networks, keyed "<vif device>/ip" (e.g. "0/ip"). Not every
+            // running VM has one (no guest tools, no NIC, still booting), so look at each until one does.
+            VM vm = null;
             string ip = null;
-            if (vm != null)
+            foreach (var v in VM.get_all_records(session).Values.Where(v =>
+                         v.power_state == vm_power_state.Running && !v.is_a_template && !v.is_control_domain
+                         && v.guest_metrics.opaque_ref != "OpaqueRef:NULL"))
             {
-                var networks = VM_guest_metrics.get_record(session, vm.guest_metrics).networks;
-                networks.TryGetValue("0/ip", out ip);
+                if (VM_guest_metrics.get_record(session, v.guest_metrics).networks.TryGetValue("0/ip", out ip)
+                    && !string.IsNullOrEmpty(ip))
+                {
+                    vm = v;
+                    break;
+                }
             }
-            if (!string.IsNullOrEmpty(ip))
+            if (vm != null)
             {
                 Console.WriteLine($"  {vm.name_label}: {ip}");
                 break;

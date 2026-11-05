@@ -88,8 +88,13 @@ public static CloseableHttpClient trustingHttpClient() throws Exception {
         .loadTrustMaterial((chain, authType) -> true)
         .build();
     SSLConnectionSocketFactory sslsf = new SSLConnectionSocketFactory(ssl, NoopHostnameVerifier.INSTANCE);
+    // A synchronous call blocks until the operation finishes, and checkpointing, copying or exporting a
+    // large VM can take many minutes: wait up to an hour for the answer rather than HttpClient's
+    // three-minute default. (For anything longer, use the Async form and poll the task - see
+    // WaitForTask.)
     PoolingHttpClientConnectionManager cm = PoolingHttpClientConnectionManagerBuilder.create()
         .setSSLSocketFactory(sslsf)
+        .setDefaultConnectionConfig(ConnectionConfig.custom().setSocketTimeout(Timeout.ofHours(1)).build())
         .build();
     return HttpClients.custom().setConnectionManager(cm).build();
 }
