@@ -307,7 +307,7 @@ choose_lun() {
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created iSCSI SR: 00000001-0000-0000-b60a-000000000000 (200 GiB)
+Created iSCSI SR: 00000001-0000-0000-7e0a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 
@@ -432,7 +432,7 @@ def _choose_lun(luns, scsi_id):
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created SR: 00000001-0000-0000-690a-000000000000 (200 GiB)
+Created SR: 00000001-0000-0000-7b0a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 
@@ -576,7 +576,7 @@ private static XElement ChooseLun(List<XElement> luns, string scsiId)
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created SR: 00000001-0000-0000-b30a-000000000000 (200 GiB)
+Created SR: 00000001-0000-0000-b00a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 
@@ -796,7 +796,7 @@ func chooseLUN(luns []map[string]string, scsiID string) map[string]string {
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created SR: 00000001-0000-0000-6c0a-000000000000 (200 GiB)
+Created SR: 00000001-0000-0000-b30a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 
@@ -965,7 +965,7 @@ public final class CreateIscsiSr {
 ```text
 Discovered IQN: iqn.2009-01.com.example:target-0
 Discovered LUN 0 (SCSIid 360a980004265656d5f4a2d63764e5734)
-Created SR: 00000001-0000-0000-080b-000000000000 (200 GiB)
+Created SR: 00000001-0000-0000-5a0a-000000000000 (200 GiB)
 OK: create-iscsi-sr
 ```
 

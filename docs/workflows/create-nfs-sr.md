@@ -129,7 +129,7 @@ def create_nfs_sr(url, username, password, nfs_server, nfs_path, sr_name="sdk-ex
 <details><summary>Example output</summary>
 
 ```text
-Created SR: 00000001-0000-0000-bb0a-000000000000
+Created SR: 00000001-0000-0000-aa0a-000000000000
 OK: create-nfs-sr
 ```
 

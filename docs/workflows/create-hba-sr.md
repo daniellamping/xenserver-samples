@@ -233,7 +233,7 @@ def create_hba_sr(url, username, password, scsi_id="", sr_name="sdk-example-hba"
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-f20a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-e40a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -309,7 +309,7 @@ public static void CreateHbaSr(string url, string user, string password, string 
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-770a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-be0a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -392,7 +392,7 @@ func createHbaSr(url, user, password, scsiID, srName string) {
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-f50a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-e70a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
@@ -498,7 +498,7 @@ public final class CreateHbaSr {
 
 ```text
 Discovered LUN: SCSIid 360a980004265656d5f4a2d63764e5736 on /dev/sdb [sdc]
-Created SR: 00000001-0000-0000-9d0a-000000000000 (512 GiB)
+Created SR: 00000001-0000-0000-c10a-000000000000 (512 GiB)
 OK: create-hba-sr
 ```
 
