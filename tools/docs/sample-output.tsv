@@ -32,6 +32,7 @@ cli	create-network	99b128a3a5c9	Created network: 00000001-0000-0000-6f0a-0000000
 cli	create-nfs-sr	27941c9292c4	Created SR: 00000001-0000-0000-8a0a-000000000000\nOK: create-nfs-sr
 cli	create-smb-sr	44b81e37035b	Created SMB SR: 00000001-0000-0000-be0a-000000000000 (512 GiB)\nOK: create-smb-sr
 cli	create-vm	f5010ca0dbc1	Created VM: 00000001-0000-0000-f209-000000000000\nis-a-template = false\nOK: create-vm
+cli	create-vm-full	47b66eae9d74	power-state: running\nvCPUs:       2\nOK: create-vm-full
 cli	create-vm-with-vgpu	e3fe9f7cac7c	Created vGPU: 00000001-0000-0000-890a-000000000000 of type GRID K100\nOK: create-vm-with-vgpu
 cli	cross-pool-copy-vm	d29cc80128f2	Sent 'db-01' to localhost (copy); source still present: True\n  the copy on the destination: not found (nothing to tidy up)\nOK: cross-pool-copy-vm
 cli	custom-fields	731b15e58b41	Field defined: true\nOwner = Platform Team\nOK: custom-fields
@@ -65,7 +66,6 @@ cli	manage-vm-disks	44df179e8110	Disk attached:  true\nAfter unplug:   false\nRe
 cli	manage-vm-groups	692da674fd5a	Created group:  00000001-0000-0000-160a-000000000000\nGroup members:  0\nOK: manage-vm-groups
 cli	manage-vm-media	812d7dda5828	Adding a DVD drive to db-01\n  drive 1 is empty: true\n  inserting ubuntu-22.04.4-live-server-amd64.iso\n  drive now holds ubuntu-22.04.4-live-server-amd64.iso (empty=false)\n  after eject, empty=true\nOK: manage-vm-media
 cli	manage-vtpm	ad61d97f5181	Attaching a vTPM to secure-01\n  unique to this VM:   false\n  protected:           false\n  VM now has 1 vTPM(s)\n  can add another:     false\n  after removal:       0 vTPM(s)\nOK: manage-vtpm
-cli	new-vm-wizard	47b66eae9d74	power-state: running\nvCPUs:       2\nOK: new-vm-wizard
 cli	pool-properties	075f9da1770e	Pool: 'sdk-pool'\nRenamed to: 'xe-pool-renamed'\nOK: pool-properties
 cli	pool-tags	330f7951a026	Pool tags: sdk-managed\nOK: pool-tags
 cli	pvs-accelerator	e5da69b5abcd	Site: Provisioning Services\n  cache:  sdk-host1  20 GiB on Local storage\n  cache:  sdk-host2  20 GiB on Local storage\n  server: 203.0.113.50  ports 6910-6930\n  server: 203.0.113.51  ports 6910-6930\n  1 of 4 VM(s) accelerated\nOK: pvs-accelerator
@@ -126,6 +126,7 @@ csharp	create-network	59ad844ddc1e	Created network: 00000001-0000-0000-c30a-0000
 csharp	create-nfs-sr	df27329d8ffa	Created SR: 00000001-0000-0000-a90a-000000000000\nOK: create-nfs-sr
 csharp	create-smb-sr	dae249f0260c	Created SR: 00000001-0000-0000-700a-000000000000 (512 GiB)\nOK: create-smb-sr
 csharp	create-vm	1e1a0da34dd9	Using template: Rocky Linux 8\nCloned new VM: 00000001-0000-0000-ee09-000000000000\nProvisioned. is_a_template = False\nCleaned up the example VM.\nOK: create-vm
+csharp	create-vm-full	d71fb802d322	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-ed09-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nCleaned up the example VM.\nOK: create-vm-full
 csharp	create-vm-with-vgpu	4414d3a0dbc4	Using vGPU type: GRID K100 (256 MB framebuffer)\nCreated vGPU: 00000001-0000-0000-540a-000000000000\nVM now has 1 vGPU(s); type = GRID K100\nCleaned up the example VM and its vGPU.\nOK: create-vm-with-vgpu
 csharp	cross-pool-copy-vm	a24184f28187	Sent 'db-01' to the destination pool (copy); source still present: True\n  the copy on the destination: db-01 (00000001-0000-0000-080a-000000000000)\nOK: cross-pool-copy-vm
 csharp	custom-fields	91a3fcc0653d	Field defined: True\nCustom field Owner = Platform Team\nOK: custom-fields
@@ -160,7 +161,6 @@ csharp	manage-vm-disks	ea38433e371c	Disk attached:  True\nAfter unplug:   False\
 csharp	manage-vm-groups	51d9dcc0193b	Created group:  00000001-0000-0000-050a-000000000000\nGroup members:  1\n  web-01\nOK: manage-vm-groups
 csharp	manage-vm-media	5b2672a0f798	Adding a DVD drive to db-01\n  drive 1 is empty: True\n  inserting debian-12.5.0-amd64-netinst.iso\n  drive now holds debian-12.5.0-amd64-netinst.iso (empty=False)\n  after eject, empty=True\nOK: manage-vm-media
 csharp	manage-vtpm	4a79d80ceefe	Attaching a vTPM to secure-01\n  persistence backend: xapi\n  unique to this VM:   False\n  VM now has 1 vTPM(s)\n  can add another:     False\n  after removal:       0 vTPM(s)\nOK: manage-vtpm
-csharp	new-vm-wizard	d71fb802d322	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-ed09-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nCleaned up the example VM.\nOK: new-vm-wizard
 csharp	pool-properties	3d34786494a5	Pool:       'sdk-pool'\nDefault SR: Shared NFS\nRenamed to: 'sdk-pool-renamed'\nOK: pool-properties
 csharp	pool-tags	90d21a3cdf61	Pool tags: sdk-managed\nOK: pool-tags
 csharp	pvs-accelerator	b7f299de912b	Site: Provisioning Services\n  cache:  sdk-host1  20 GiB on Local storage\n  cache:  sdk-host2  20 GiB on Local storage\n  server: 203.0.113.50  ports 6910-6930\n  server: 203.0.113.51  ports 6910-6930\n  1 of 4 VM(s) accelerated\nOK: pvs-accelerator
@@ -221,6 +221,7 @@ go	create-network	b6c0675f9bf1	Created network: 00000001-0000-0000-cb0a-00000000
 go	create-nfs-sr	44a07ea926da	Created SR: 00000001-0000-0000-4b0a-000000000000\nOK: create-nfs-sr
 go	create-smb-sr	fef04776710e	Created SR: 00000001-0000-0000-100b-000000000000 (512 GiB)\nOK: create-smb-sr
 go	create-vm	eb681628829f	Using template: Rocky Linux 8\nCloned new VM: 00000001-0000-0000-eb09-000000000000\nProvisioned. is_a_template = false\nCleaned up the example VM.\nOK: create-vm
+go	create-vm-full	873e13ac27dd	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-f609-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nCleaned up the example VM.\nOK: create-vm-full
 go	create-vm-with-vgpu	565e18dee787	Using vGPU type: GRID K100 (256 MB framebuffer)\nCreated vGPU: 00000001-0000-0000-800a-000000000000\nVM now has 1 vGPU(s); type = GRID K100\nCleaned up the example VM and its vGPU.\nOK: create-vm-with-vgpu
 go	cross-pool-copy-vm	a03bff308ae7	Sent 'db-01' to the destination pool (copy); source still present: true\n  the copy on the destination: db-01 (00000001-0000-0000-fe09-000000000000)\nOK: cross-pool-copy-vm
 go	custom-fields	c100d46ed98a	Field defined: true\nCustom field Owner = Platform Team\nOK: custom-fields
@@ -255,7 +256,6 @@ go	manage-vm-disks	de55f6d4d730	Disk attached:  true\nAfter unplug:   false\nRes
 go	manage-vm-groups	a08550b9e622	Created group:  00000001-0000-0000-1a0a-000000000000\nGroup members:  1\n  web-01\nOK: manage-vm-groups
 go	manage-vm-media	5d94b7c803db	Adding a DVD drive to db-01\n  drive 1 is empty: true\n  inserting Windows_Server_2022.iso\n  drive now holds Windows_Server_2022.iso (empty=false)\n  after eject, empty=true\nOK: manage-vm-media
 go	manage-vtpm	253fc0e7f16a	Attaching a vTPM to secure-01\n  persistence backend: xapi\n  unique to this VM:   false\n  VM now has 1 vTPM(s)\n  can add another:     false\n  after removal:       0 vTPM(s)\nOK: manage-vtpm
-go	new-vm-wizard	873e13ac27dd	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-f609-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nCleaned up the example VM.\nOK: new-vm-wizard
 go	pool-properties	9abb4fa2fb99	Pool:       'sdk-pool'\nDefault SR: Shared NFS\nRenamed to: 'sdk-pool-renamed'\nOK: pool-properties
 go	pool-tags	15247f5d3d97	Pool tags: sdk-managed\nOK: pool-tags
 go	pvs-accelerator	397fa10de1ae	Site: Provisioning Services\n  cache:  sdk-host1  20 GiB on Local storage\n  cache:  sdk-host2  20 GiB on Local storage\n  server: 203.0.113.50  ports 6910-6930\n  server: 203.0.113.51  ports 6910-6930\n  1 of 4 VM(s) accelerated\nOK: pvs-accelerator
@@ -316,6 +316,7 @@ java	create-network	cc8bb283f0e4	Created network: 00000001-0000-0000-150b-000000
 java	create-nfs-sr	76ae835e8f08	Created SR: 00000001-0000-0000-ac0a-000000000000\nOK: create-nfs-sr
 java	create-smb-sr	4d2234f94e12	Created SR: 00000001-0000-0000-740a-000000000000 (512 GiB)\nOK: create-smb-sr
 java	create-vm	2d5d5dd3dfdb	Using template: Rocky Linux 8\nCloned new VM: 00000001-0000-0000-eb09-000000000000\nProvisioned. is_a_template = false\nCleaned up the example VM.\nOK: create-vm
+java	create-vm-full	851339a7ed41	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-f709-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nCleaned up the example VM.\nOK: create-vm-full
 java	create-vm-with-vgpu	4238162c9b7f	Using vGPU type: GRID K100 (256 MB framebuffer)\nCreated vGPU: 00000001-0000-0000-520a-000000000000\nVM now has 1 vGPU(s); type = GRID K100\nCleaned up the example VM and its vGPU.\nOK: create-vm-with-vgpu
 java	cross-pool-copy-vm	7ad5b7c32990	Sent 'db-01' to the destination pool (copy); source still present: true\n  the copy on the destination: db-01 (00000001-0000-0000-110a-000000000000)\nOK: cross-pool-copy-vm
 java	custom-fields	2c2fed394755	Field defined: true\nCustom field Owner = Platform Team\nOK: custom-fields
@@ -350,7 +351,6 @@ java	manage-vm-disks	d026d2e21842	Disk attached:  true\nAfter unplug:   false\nR
 java	manage-vm-groups	5d996e8be825	Created group:  00000001-0000-0000-120a-000000000000\nGroup members:  1\n  web-01\nOK: manage-vm-groups
 java	manage-vm-media	7c94fafa18d7	Adding a DVD drive to db-01\n  drive 11 is empty: true\n  inserting Windows_Server_2022.iso\n  drive now holds Windows_Server_2022.iso (empty=false)\n  after eject, empty=true\nOK: manage-vm-media
 java	manage-vtpm	6d603bf932ab	Attaching a vTPM to secure-01\n  persistence backend: xapi\n  unique to this VM:   false\n  VM now has 1 vTPM(s)\n  can add another:     false\n  after removal:       0 vTPM(s)\nOK: manage-vtpm
-java	new-vm-wizard	851339a7ed41	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-f709-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nCleaned up the example VM.\nOK: new-vm-wizard
 java	pool-properties	8ccee6a1128d	Pool:       'sdk-pool'\nDefault SR: Shared NFS\nRenamed to: 'sdk-pool-renamed'\nOK: pool-properties
 java	pool-tags	80a3b9c142ba	Pool tags: sdk-managed\nOK: pool-tags
 java	pvs-accelerator	1f1e06988777	Site: Provisioning Services\n  cache:  sdk-host2  20 GiB on Local storage\n  cache:  sdk-host1  20 GiB on Local storage\n  server: 203.0.113.50  ports 6910-6930\n  server: 203.0.113.51  ports 6910-6930\n  1 of 4 VM(s) accelerated\nOK: pvs-accelerator
@@ -410,6 +410,7 @@ powershell	create-network	5c1cfd49b688	Created network: 00000001-0000-0000-1a0b-
 powershell	create-nfs-sr	5ba7fbe8e7fa	Created SR: 00000001-0000-0000-d80a-000000000000\nOK: create-nfs-sr
 powershell	create-smb-sr	5f0a983f5d9b	Created SR: 00000001-0000-0000-df0a-000000000000 (512 GiB)\nOK: create-smb-sr
 powershell	create-vm	6d8470b52a68	Using template: Rocky Linux 8\nCloned new VM: 00000001-0000-0000-ee09-000000000000\nProvisioned. is_a_template = False\nCleaned up the example VM.\nOK: create-vm
+powershell	create-vm-full	bd3c1c1c3181	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-f509-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nOK: create-vm-full
 powershell	create-vm-with-vgpu	f71360a9f483	Using vGPU type: GRID K100 (256 MB framebuffer)\nCreated vGPU: 00000001-0000-0000-8c0a-000000000000\nVM now has 1 vGPU(s); type = GRID K100\nCleaned up the example VM and its vGPU.\nOK: create-vm-with-vgpu
 powershell	cross-pool-copy-vm	cfc5386d9ba7	Sent 'db-01' to the destination pool (copy); source still present: True\n  the copy on the destination: db-01 (00000001-0000-0000-080a-000000000000)\nOK: cross-pool-copy-vm
 powershell	custom-fields	7880bdacc117	Field defined: True\nCustom field Owner = Platform Team\nOK: custom-fields
@@ -444,7 +445,6 @@ powershell	manage-vm-disks	240c733bc1f1	Disk attached:  True\nAfter unplug:   Fa
 powershell	manage-vm-groups	392382441240	Created group:  00000001-0000-0000-180a-000000000000\nGroup members:  1\n  web-01\nOK: manage-vm-groups
 powershell	manage-vm-media	5deb4820e096	Adding a DVD drive to db-01\n  drive 1 is empty: True\n  inserting debian-12.5.0-amd64-netinst.iso\n  drive now holds debian-12.5.0-amd64-netinst.iso (empty=False)\n  after eject, empty=True\nOK: manage-vm-media
 powershell	manage-vtpm	448391bb506a	Attaching a vTPM to secure-01\n  persistence backend: xapi\n  unique to this VM:   False\n  VM now has 1 vTPM(s)\n  can add another:     False\n  after removal:       0 vTPM(s)\nOK: manage-vtpm
-powershell	new-vm-wizard	bd3c1c1c3181	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-f509-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nOK: new-vm-wizard
 powershell	pool-properties	d3a210c86933	Pool:       'sdk-pool'\nDefault SR: Shared NFS\nRenamed to: 'sdk-pool-renamed'\nOK: pool-properties
 powershell	pool-tags	1a7b5a55cdf4	Pool tags: sdk-managed\nOK: pool-tags
 powershell	pvs-accelerator	239378cc4466	Site: Provisioning Services\n  cache:  sdk-host1  20 GiB on Local storage\n  cache:  sdk-host2  20 GiB on Local storage\n  server: 203.0.113.50  ports 6910-6930\n  server: 203.0.113.51  ports 6910-6930\n  1 of 4 VM(s) accelerated\nOK: pvs-accelerator
@@ -505,6 +505,7 @@ python	create-network	006c69cb2cda	Created network: 00000001-0000-0000-6e0a-0000
 python	create-nfs-sr	404d8bdc40dc	Created SR: 00000001-0000-0000-bb0a-000000000000\nOK: create-nfs-sr
 python	create-smb-sr	aa42179d019a	Created SR: 00000001-0000-0000-0c0b-000000000000 (512 GiB)\nOK: create-smb-sr
 python	create-vm	0452b63703b0	Using template: Rocky Linux 8\nCloned new VM: 00000001-0000-0000-f009-000000000000\nProvisioned. is_a_template = False\nCleaned up the example VM.\nOK: create-vm
+python	create-vm-full	c39ff195c25c	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-f509-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nCleaned up the example VM.\nOK: create-vm-full
 python	create-vm-with-vgpu	15c489410541	Using vGPU type: GRID K100 (256 MB framebuffer)\nCreated vGPU: 00000001-0000-0000-780a-000000000000\nVM now has 1 vGPU(s); type = GRID K100\nCleaned up the example VM and its vGPU.\nOK: create-vm-with-vgpu
 python	cross-pool-copy-vm	9923dbde8481	Sent 'db-01' to the destination pool (copy); source still present: True\n  the copy on the destination: db-01 (00000001-0000-0000-ea09-000000000000)\nOK: cross-pool-copy-vm
 python	custom-fields	2d9bda58ef38	Field defined: True\nCustom field Owner = Platform Team\nOK: custom-fields
@@ -539,7 +540,6 @@ python	manage-vm-disks	a6aa2a5b106b	Disk attached:  True\nAfter unplug:   False\
 python	manage-vm-groups	cdd43e9fabca	Created group:  00000001-0000-0000-150a-000000000000\nGroup members:  1\n  web-01\nOK: manage-vm-groups
 python	manage-vm-media	67240df17dfd	Adding a DVD drive to db-01\n  drive 1 is empty: True\n  inserting Windows_Server_2022.iso\n  drive now holds Windows_Server_2022.iso (empty=False)\n  after eject, empty=True\nOK: manage-vm-media
 python	manage-vtpm	8762f0326a1b	Attaching a vTPM to secure-01\n  persistence backend: xapi\n  unique to this VM:   False\n  VM now has 1 vTPM(s)\n  can add another:     False\n  after removal:       0 vTPM(s)\nOK: manage-vtpm
-python	new-vm-wizard	c39ff195c25c	Template:      Rocky Linux 8\nCreated VM:    00000001-0000-0000-f509-000000000000\nInstall media: network repository\nHome server:   sdk-host1\nCPU/memory:    2 vCPUs, 2 GiB\nStorage:       24 GiB disk on Shared NFS\nNetworking:    NIC on Pool-wide network associated with eth0\n--- Result ---\npower state:   Running\nvCPUs:         2\ndisks:         1, NICs: 1\nCleaned up the example VM.\nOK: new-vm-wizard
 python	pool-properties	7e170fb6f26f	Pool:       'sdk-pool'\nDefault SR: Shared NFS\nRenamed to: 'sdk-pool-renamed'\nOK: pool-properties
 python	pool-tags	ac96dc675472	Pool tags: sdk-managed\nOK: pool-tags
 python	pvs-accelerator	520199ed2d82	Site: Provisioning Services\n  cache:  sdk-host1  20 GiB on Local storage\n  cache:  sdk-host2  20 GiB on Local storage\n  server: 203.0.113.50  ports 6910-6930\n  server: 203.0.113.51  ports 6910-6930\n  1 of 4 VM(s) accelerated\nOK: pvs-accelerator
